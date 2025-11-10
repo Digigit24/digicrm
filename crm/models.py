@@ -20,7 +20,8 @@ class ActivityTypeEnum(models.TextChoices):
 class LeadStatus(models.Model):
     """Lead Status model for managing pipeline stages"""
     id = models.BigAutoField(primary_key=True)
-    name = models.TextField(unique=True)
+    tenant_id = models.UUIDField(db_index=True)
+    name = models.TextField()
     order_index = models.IntegerField()
     color_hex = models.TextField(null=True, blank=True)
     is_won = models.BooleanField(default=False)
@@ -33,12 +34,17 @@ class LeadStatus(models.Model):
         db_table = 'lead_statuses'
         ordering = ['order_index']
         indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_statuses_tenant_id'),
             models.Index(fields=['order_index'], name='idx_lead_statuses_order_index'),
         ]
         constraints = [
             models.CheckConstraint(
                 check=~(models.Q(is_won=True) & models.Q(is_lost=True)),
                 name='lead_statuses_won_lost_check'
+            ),
+            models.UniqueConstraint(
+                fields=['tenant_id', 'name'],
+                name='unique_lead_status_per_tenant'
             )
         ]
 
@@ -49,6 +55,7 @@ class LeadStatus(models.Model):
 class Lead(models.Model):
     """Main Lead model for CRM"""
     id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
     name = models.TextField(default='Unnamed')
     phone = models.TextField()
     email = models.TextField(null=True, blank=True)
@@ -70,7 +77,7 @@ class Lead(models.Model):
     value_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     value_currency = models.TextField(null=True, blank=True)
     source = models.TextField(null=True, blank=True)
-    owner_user_id = models.UUIDField(null=True, blank=True)
+    owner_user_id = models.UUIDField(db_index=True)
     last_contacted_at = models.DateTimeField(null=True, blank=True)
     next_follow_up_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
@@ -86,6 +93,7 @@ class Lead(models.Model):
     class Meta:
         db_table = 'leads'
         indexes = [
+            models.Index(fields=['tenant_id'], name='idx_leads_tenant_id'),
             models.Index(fields=['status'], name='idx_leads_status_id'),
             models.Index(fields=['priority'], name='idx_leads_priority'),
             models.Index(fields=['owner_user_id'], name='idx_leads_owner_user_id'),
@@ -99,6 +107,7 @@ class Lead(models.Model):
 class LeadActivity(models.Model):
     """Activity tracking for leads"""
     id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
     lead = models.ForeignKey(
         Lead,
         on_delete=models.CASCADE,
@@ -108,7 +117,7 @@ class LeadActivity(models.Model):
     type = models.CharField(max_length=20, choices=ActivityTypeEnum.choices)
     content = models.TextField(null=True, blank=True)
     happened_at = models.DateTimeField()
-    by_user_id = models.UUIDField(null=True, blank=True)
+    by_user_id = models.UUIDField(db_index=True)
     meta = models.JSONField(null=True, blank=True)
     file_url = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -117,9 +126,11 @@ class LeadActivity(models.Model):
         db_table = 'lead_activities'
         ordering = ['-happened_at']
         indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_activities_tenant_id'),
             models.Index(fields=['lead'], name='idx_lead_activities_lead_id'),
             models.Index(fields=['type'], name='idx_lead_activities_type'),
             models.Index(fields=['happened_at'], name='idx_lead_activities__at'),
+            models.Index(fields=['by_user_id'], name='idx_lead_activities_by_user_id'),
         ]
 
     def __str__(self):
@@ -129,6 +140,7 @@ class LeadActivity(models.Model):
 class LeadOrder(models.Model):
     """Order/position of leads within a status (for kanban boards)"""
     id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
     lead = models.ForeignKey(
         Lead,
         on_delete=models.CASCADE,
@@ -149,6 +161,7 @@ class LeadOrder(models.Model):
         db_table = 'lead_orders'
         unique_together = [['lead', 'status']]
         indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_orders_tenant_id'),
             models.Index(fields=['status', 'position'], name='idx_lead_orders_status_id_pos'),
             models.Index(fields=['lead'], name='idx_lead_orders_lead_id'),
         ]

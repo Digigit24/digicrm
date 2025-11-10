@@ -12,6 +12,7 @@ class TaskStatusEnum(models.TextChoices):
 class Task(models.Model):
     """Task model for managing lead-related tasks"""
     id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
     lead = models.ForeignKey(
         Lead,
         on_delete=models.CASCADE,
@@ -31,8 +32,9 @@ class Task(models.Model):
         default=PriorityEnum.MEDIUM
     )
     due_date = models.DateTimeField(null=True, blank=True)
-    assignee_user_id = models.UUIDField(null=True, blank=True)
-    reporter_user_id = models.UUIDField(null=True, blank=True)
+    assignee_user_id = models.UUIDField(db_index=True, null=True, blank=True)
+    reporter_user_id = models.UUIDField(db_index=True, null=True, blank=True)
+    owner_user_id = models.UUIDField(db_index=True)
     checklist = models.JSONField(null=True, blank=True)
     attachments_count = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -42,10 +44,13 @@ class Task(models.Model):
     class Meta:
         db_table = 'tasks'
         indexes = [
+            models.Index(fields=['tenant_id'], name='idx_tasks_tenant_id'),
             models.Index(fields=['lead'], name='idx_tasks_lead_id'),
             models.Index(fields=['status'], name='idx_tasks_status'),
             models.Index(fields=['priority'], name='idx_tasks_priority'),
             models.Index(fields=['assignee_user_id'], name='idx_tasks_assignee'),
+            models.Index(fields=['reporter_user_id'], name='idx_tasks_reporter'),
+            models.Index(fields=['owner_user_id'], name='idx_tasks_owner_user_id'),
         ]
 
     def __str__(self):

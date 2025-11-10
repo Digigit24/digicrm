@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'drf_spectacular',
     
     # Local apps - order matters for migrations
+    'common',
     'crm',
     'meetings',
     'payments',
@@ -45,6 +46,7 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'common.middleware.JWTAuthenticationMiddleware',  # Add JWT middleware
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
@@ -122,6 +124,10 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# JWT Settings (must match SuperAdmin)
+JWT_SECRET_KEY = config('JWT_SECRET_KEY', default='your-jwt-secret-key-change-in-production')
+JWT_ALGORITHM = config('JWT_ALGORITHM', default='HS256')
+
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', default=False, cast=bool)
 CORS_ALLOWED_ORIGINS = config(
@@ -129,6 +135,49 @@ CORS_ALLOWED_ORIGINS = config(
     default='http://localhost:3000,http://localhost:8000',
     cast=Csv()
 )
+
+
+# Allow credentials (cookies, authorization headers, etc.)
+CORS_ALLOW_CREDENTIALS = True
+
+# Allow all headers (including custom tenant headers)
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    # Custom tenant headers
+    'x-tenant-id',
+    'x-tenant-slug',
+    'tenanttoken',
+]
+
+
+
+# Allow common HTTP methods
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
+# Expose headers to the browser
+CORS_EXPOSE_HEADERS = [
+    'content-type',
+    'x-tenant-id',
+    'x-tenant-slug',
+]
+
+# Cache preflight requests for 1 hour
+CORS_PREFLIGHT_MAX_AGE = 3600
 
 # REST Framework Settings
 REST_FRAMEWORK = {
