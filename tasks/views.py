@@ -3,6 +3,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from .models import Task
 from .serializers import TaskSerializer, TaskListSerializer
+from common.mixins import TenantViewSetMixin
 
 
 @extend_schema_view(
@@ -13,7 +14,7 @@ from .serializers import TaskSerializer, TaskListSerializer
     partial_update=extend_schema(description='Partially update a task'),
     destroy=extend_schema(description='Delete a task'),
 )
-class TaskViewSet(viewsets.ModelViewSet):
+class TaskViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Tasks
     """

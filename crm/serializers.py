@@ -1,8 +1,9 @@
 from rest_framework import serializers
 from .models import Lead, LeadStatus, LeadActivity, LeadOrder
+from common.mixins import TenantMixin
 
 
-class LeadStatusSerializer(serializers.ModelSerializer):
+class LeadStatusSerializer(TenantMixin):
     """Serializer for LeadStatus model"""
     
     class Meta:
@@ -14,7 +15,7 @@ class LeadStatusSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
-class LeadActivitySerializer(serializers.ModelSerializer):
+class LeadActivitySerializer(TenantMixin):
     """Serializer for LeadActivity model"""
     
     class Meta:
@@ -26,7 +27,7 @@ class LeadActivitySerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
-class LeadOrderSerializer(serializers.ModelSerializer):
+class LeadOrderSerializer(TenantMixin):
     """Serializer for LeadOrder model"""
     
     class Meta:
@@ -35,7 +36,7 @@ class LeadOrderSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'updated_at']
 
 
-class LeadSerializer(serializers.ModelSerializer):
+class LeadSerializer(TenantMixin):
     """Serializer for Lead model"""
     status_name = serializers.CharField(source='status.name', read_only=True)
     activities = LeadActivitySerializer(many=True, read_only=True)
@@ -52,7 +53,7 @@ class LeadSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
-class LeadListSerializer(serializers.ModelSerializer):
+class LeadListSerializer(TenantMixin):
     """Lightweight serializer for listing leads"""
     status_name = serializers.CharField(source='status.name', read_only=True)
     

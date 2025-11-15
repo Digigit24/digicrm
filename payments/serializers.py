@@ -1,8 +1,9 @@
 from rest_framework import serializers
 from .models import Payment
+from common.mixins import TenantMixin
 
 
-class PaymentSerializer(serializers.ModelSerializer):
+class PaymentSerializer(TenantMixin):
     """Serializer for Payment model"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
     
@@ -16,7 +17,7 @@ class PaymentSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
-class PaymentListSerializer(serializers.ModelSerializer):
+class PaymentListSerializer(TenantMixin):
     """Lightweight serializer for listing payments"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
     

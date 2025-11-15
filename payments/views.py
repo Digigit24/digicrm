@@ -3,6 +3,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from .models import Payment
 from .serializers import PaymentSerializer, PaymentListSerializer
+from common.mixins import TenantViewSetMixin
 
 
 @extend_schema_view(
@@ -13,7 +14,7 @@ from .serializers import PaymentSerializer, PaymentListSerializer
     partial_update=extend_schema(description='Partially update a payment'),
     destroy=extend_schema(description='Delete a payment'),
 )
-class PaymentViewSet(viewsets.ModelViewSet):
+class PaymentViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Payments
     """

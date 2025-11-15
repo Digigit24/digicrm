@@ -45,7 +45,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         auth_header = request.META.get('HTTP_AUTHORIZATION')
         if not auth_header:
             return JsonResponse(
-                {'error': 'Authorization header required'}, 
+                {'error': 'Authorization header required'},
                 status=401
             )
         
@@ -54,12 +54,12 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
             scheme, token = auth_header.split(' ', 1)
             if scheme.lower() != 'bearer':
                 return JsonResponse(
-                    {'error': 'Invalid authorization scheme. Use Bearer token'}, 
+                    {'error': 'Invalid authorization scheme. Use Bearer token'},
                     status=401
                 )
         except ValueError:
             return JsonResponse(
-                {'error': 'Invalid authorization header format'}, 
+                {'error': 'Invalid authorization header format'},
                 status=401
             )
         
@@ -71,7 +71,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
             
             if not secret_key:
                 return JsonResponse(
-                    {'error': 'JWT_SECRET_KEY not configured'}, 
+                    {'error': 'JWT_SECRET_KEY not configured'},
                     status=500
                 )
             
@@ -80,25 +80,25 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
             
         except jwt.ExpiredSignatureError:
             return JsonResponse(
-                {'error': 'Token has expired'}, 
+                {'error': 'Token has expired'},
                 status=401
             )
         except jwt.InvalidTokenError as e:
             return JsonResponse(
-                {'error': f'Invalid token: {str(e)}'}, 
+                {'error': f'Invalid token: {str(e)}'},
                 status=401
             )
         
         # Validate required fields in payload
         required_fields = [
-            'user_id', 'email', 'tenant_id', 'tenant_slug', 
+            'user_id', 'email', 'tenant_id', 'tenant_slug',
             'is_super_admin', 'permissions', 'enabled_modules'
         ]
         
         for field in required_fields:
             if field not in payload:
                 return JsonResponse(
-                    {'error': f'Missing required field in token: {field}'}, 
+                    {'error': f'Missing required field in token: {field}'},
                     status=401
                 )
         
@@ -106,7 +106,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         enabled_modules = payload.get('enabled_modules', [])
         if 'crm' not in enabled_modules:
             return JsonResponse(
-                {'error': 'CRM module not enabled for this user'}, 
+                {'error': 'CRM module not enabled for this user'},
                 status=403
             )
         
@@ -119,7 +119,24 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         request.permissions = payload['permissions']
         request.enabled_modules = payload['enabled_modules']
         
+        # Check for additional tenant headers as fallback/override
+        tenant_token_header = request.META.get('HTTP_TENANTTOKEN')
+        x_tenant_id_header = request.META.get('HTTP_X_TENANT_ID')
+        x_tenant_slug_header = request.META.get('HTTP_X_TENANT_SLUG')
+        
+        # If tenanttoken header is provided, use it to override tenant_id
+        if tenant_token_header:
+            request.tenant_id = tenant_token_header
+            
+        # If x-tenant-id header is provided, use it to override tenant_id
+        if x_tenant_id_header:
+            request.tenant_id = x_tenant_id_header
+            
+        # If x-tenant-slug header is provided, use it to override tenant_slug
+        if x_tenant_slug_header:
+            request.tenant_slug = x_tenant_slug_header
+        
         # Store tenant_id in thread-local storage for database routing
-        set_current_tenant_id(payload['tenant_id'])
+        set_current_tenant_id(request.tenant_id)
         
         return None

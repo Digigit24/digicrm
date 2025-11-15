@@ -1,8 +1,9 @@
 from rest_framework import serializers
 from .models import Task
+from common.mixins import TenantMixin
 
 
-class TaskSerializer(serializers.ModelSerializer):
+class TaskSerializer(TenantMixin):
     """Serializer for Task model"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
     
@@ -17,7 +18,7 @@ class TaskSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at', 'completed_at']
 
 
-class TaskListSerializer(serializers.ModelSerializer):
+class TaskListSerializer(TenantMixin):
     """Lightweight serializer for listing tasks"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
     

@@ -3,6 +3,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from .models import Meeting
 from .serializers import MeetingSerializer, MeetingListSerializer
+from common.mixins import TenantViewSetMixin
 
 
 @extend_schema_view(
@@ -13,7 +14,7 @@ from .serializers import MeetingSerializer, MeetingListSerializer
     partial_update=extend_schema(description='Partially update a meeting'),
     destroy=extend_schema(description='Delete a meeting'),
 )
-class MeetingViewSet(viewsets.ModelViewSet):
+class MeetingViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Meetings
     """

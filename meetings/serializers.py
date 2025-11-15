@@ -1,8 +1,9 @@
 from rest_framework import serializers
 from .models import Meeting
+from common.mixins import TenantMixin
 
 
-class MeetingSerializer(serializers.ModelSerializer):
+class MeetingSerializer(TenantMixin):
     """Serializer for Meeting model"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
     
@@ -25,7 +26,7 @@ class MeetingSerializer(serializers.ModelSerializer):
         return data
 
 
-class MeetingListSerializer(serializers.ModelSerializer):
+class MeetingListSerializer(TenantMixin):
     """Lightweight serializer for listing meetings"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
     

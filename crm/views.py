@@ -6,6 +6,7 @@ from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
     LeadActivitySerializer, LeadOrderSerializer
 )
+from common.mixins import TenantViewSetMixin
 
 
 @extend_schema_view(
@@ -16,7 +17,7 @@ from .serializers import (
     partial_update=extend_schema(description='Partially update a lead status'),
     destroy=extend_schema(description='Delete a lead status'),
 )
-class LeadStatusViewSet(viewsets.ModelViewSet):
+class LeadStatusViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Statuses
     """
@@ -37,7 +38,7 @@ class LeadStatusViewSet(viewsets.ModelViewSet):
     partial_update=extend_schema(description='Partially update a lead'),
     destroy=extend_schema(description='Delete a lead'),
 )
-class LeadViewSet(viewsets.ModelViewSet):
+class LeadViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Leads with comprehensive filtering
     """
@@ -76,7 +77,7 @@ class LeadViewSet(viewsets.ModelViewSet):
     partial_update=extend_schema(description='Partially update a lead activity'),
     destroy=extend_schema(description='Delete a lead activity'),
 )
-class LeadActivityViewSet(viewsets.ModelViewSet):
+class LeadActivityViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Activities
     """
@@ -102,7 +103,7 @@ class LeadActivityViewSet(viewsets.ModelViewSet):
     partial_update=extend_schema(description='Partially update a lead order'),
     destroy=extend_schema(description='Delete a lead order'),
 )
-class LeadOrderViewSet(viewsets.ModelViewSet):
+class LeadOrderViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Orders (Kanban board positioning)
     """
