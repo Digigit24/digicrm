@@ -1,0 +1,160 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block extrastyle %}{{ block.super }}
+<link rel="stylesheet" href="{% static "admin/css/dashboard.css" %}">
+<style>
+    .tenant-info {
+        background: #f8f9fa;
+        padding: 15px;
+        border-radius: 5px;
+        margin-bottom: 20px;
+        border-left: 4px solid #007bff;
+    }
+
+    .tenant-info h2 {
+        margin-top: 0;
+        color: #333;
+        font-size: 18px;
+    }
+
+    .tenant-info .info-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 15px;
+        margin-top: 10px;
+    }
+
+    .tenant-info .info-item {
+        background: white;
+        padding: 10px;
+        border-radius: 4px;
+        border: 1px solid #e0e0e0;
+    }
+
+    .tenant-info .info-label {
+        font-weight: bold;
+        color: #666;
+        font-size: 12px;
+        text-transform: uppercase;
+        margin-bottom: 5px;
+    }
+
+    .tenant-info .info-value {
+        color: #333;
+        font-size: 16px;
+    }
+
+    .module-badge {
+        display: inline-block;
+        background: #007bff;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 3px;
+        font-size: 11px;
+        margin-right: 5px;
+        margin-bottom: 5px;
+    }
+</style>
+{% endblock %}
+
+{% block coltype %}colMS{% endblock %}
+
+{% block bodyclass %}{{ block.super }} dashboard{% endblock %}
+
+{% block breadcrumbs %}{% endblock %}
+
+{% block nav-sidebar %}{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    {% if tenant_name %}
+    <div class="tenant-info">
+        <h2>
+            <i class="fas fa-building"></i> Tenant Information
+        </h2>
+        <div class="info-grid">
+            <div class="info-item">
+                <div class="info-label">Tenant Name</div>
+                <div class="info-value">{{ tenant_name }}</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">User Email</div>
+                <div class="info-value">{{ user_email }}</div>
+            </div>
+            <div class="info-item">
+                <div class="info-label">Tenant ID</div>
+                <div class="info-value" style="font-size: 12px;">{{ tenant_id }}</div>
+            </div>
+        </div>
+        {% if enabled_modules %}
+        <div style="margin-top: 15px;">
+            <div class="info-label">Enabled Modules</div>
+            <div style="margin-top: 5px;">
+                {% for module in enabled_modules %}
+                <span class="module-badge">{{ module|upper }}</span>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {% if app_list %}
+        {% for app in app_list %}
+            <div class="app-{{ app.app_label }} module">
+                <table>
+                    <caption>
+                        <a href="{{ app.app_url }}" class="section" title="{% blocktranslate with name=app.name %}Models in the {{ name }} application{% endblocktranslate %}">{{ app.name }}</a>
+                    </caption>
+                    {% for model in app.models %}
+                        <tr class="model-{{ model.object_name|lower }}">
+                            {% if model.admin_url %}
+                                <th scope="row"><a href="{{ model.admin_url }}"{% if model.add_url %} class="addlink"{% endif %}>{{ model.name }}</a></th>
+                            {% else %}
+                                <th scope="row">{{ model.name }}</th>
+                            {% endif %}
+
+                            {% if model.add_url %}
+                                <td><a href="{{ model.add_url }}" class="addlink">{% translate 'Add' %}</a></td>
+                            {% else %}
+                                <td>&nbsp;</td>
+                            {% endif %}
+
+                            {% if model.admin_url %}
+                                {% if model.view_only %}
+                                    <td><a href="{{ model.admin_url }}" class="viewlink">{% translate 'View' %}</a></td>
+                                {% else %}
+                                    <td><a href="{{ model.admin_url }}" class="changelink">{% translate 'Change' %}</a></td>
+                                {% endif %}
+                            {% else %}
+                                <td>&nbsp;</td>
+                            {% endif %}
+                        </tr>
+                    {% endfor %}
+                </table>
+            </div>
+        {% endfor %}
+    {% else %}
+        <p>{% translate "You don't have permission to view or edit anything." %}</p>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block sidebar %}
+<div id="content-related">
+    <div class="module" id="recent-actions-module">
+        <h2>{% translate 'Welcome' %}</h2>
+        <p>
+            {% if is_tenant_admin %}
+                You are logged in as a tenant administrator. You can manage your tenant's data from here.
+            {% else %}
+                Welcome to the DigiCRM administration area.
+            {% endif %}
+        </p>
+        <p style="color: #666; font-size: 12px; margin-top: 15px;">
+            <strong>Note:</strong> Recent actions are not tracked for tenant users.
+        </p>
+    </div>
+</div>
+{% endblock %}

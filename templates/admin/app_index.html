@@ -1,0 +1,10 @@
+{% extends "admin/index.html" %}
+
+{% block title %}{{ app_list.0.name }} {% translate 'administration' %}{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+    &rsaquo; {{ app_list.0.name }}
+</div>
+{% endblock %}

@@ -34,10 +34,12 @@ class TenantUser:
     
     def get_username(self):
         return self.username
-    
+
+    @property
     def is_anonymous(self):
         return False
-    
+
+    @property
     def is_authenticated(self):
         return True
     
@@ -167,10 +169,21 @@ class SuperAdminAuthBackend(BaseBackend):
     def get_user(self, user_id):
         """
         Get user by ID - required by Django auth system
+        Reconstructs user from session data
         """
-        # In a session-based system, we need to reconstruct the user
-        # This is typically called when loading user from session
-        return None  # We'll handle this in the middleware
+        try:
+            # Get request from thread local storage
+            from .middleware import get_current_request
+            request = get_current_request()
+
+            if request and hasattr(request, 'session'):
+                user_data = request.session.get('user_data')
+                if user_data and str(user_data.get('user_id')) == str(user_id):
+                    return TenantUser(user_data)
+        except Exception as e:
+            logger.debug(f"Could not reconstruct user from session: {e}")
+
+        return None
 
 
 class JWTAuthBackend(BaseBackend):
@@ -203,6 +216,18 @@ class JWTAuthBackend(BaseBackend):
     
     def get_user(self, user_id):
         """
-        Get user by ID
+        Get user by ID - reconstructs from session
         """
+        try:
+            # Get request from thread local storage
+            from .middleware import get_current_request
+            request = get_current_request()
+
+            if request and hasattr(request, 'session'):
+                user_data = request.session.get('user_data')
+                if user_data and str(user_data.get('user_id')) == str(user_id):
+                    return TenantUser(user_data)
+        except Exception as e:
+            logger.debug(f"Could not reconstruct user from session: {e}")
+
         return None

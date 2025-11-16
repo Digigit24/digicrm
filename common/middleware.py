@@ -5,7 +5,7 @@ from django.conf import settings
 from django.http import JsonResponse
 from django.utils.deprecation import MiddlewareMixin
 
-# Thread-local storage for tenant_id (for future database routing)
+# Thread-local storage for tenant_id and request (for future database routing)
 _thread_locals = threading.local()
 
 
@@ -19,6 +19,16 @@ def set_current_tenant_id(tenant_id):
     _thread_locals.tenant_id = tenant_id
 
 
+def get_current_request():
+    """Get the current request from thread-local storage"""
+    return getattr(_thread_locals, 'request', None)
+
+
+def set_current_request(request):
+    """Set the current request in thread-local storage"""
+    _thread_locals.request = request
+
+
 class JWTAuthenticationMiddleware(MiddlewareMixin):
     """
     Middleware to validate JWT tokens from SuperAdmin and set request attributes
@@ -26,6 +36,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
     
     # Public paths that don't require authentication
     PUBLIC_PATHS = [
+        '/',  # Root URL (redirects to admin)
         '/api/docs/',
         '/api/schema/',
         '/admin',   # Allow all admin paths - custom admin site handles auth
@@ -38,7 +49,10 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
     
     def process_request(self, request):
         """Process incoming request and validate JWT token"""
-        
+
+        # Store request in thread-local storage for authentication backends
+        set_current_request(request)
+
         # Skip validation for public paths
         if any(request.path.startswith(path) for path in self.PUBLIC_PATHS):
             return None
