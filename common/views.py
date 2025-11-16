@@ -86,7 +86,8 @@ class TokenLoginView(View):
                 secret_key = getattr(settings, 'JWT_SECRET_KEY')
                 algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
                 
-                payload = jwt.decode(access_token, secret_key, algorithms=[algorithm])
+                # Add leeway for clock skew tolerance (30 seconds)
+                payload = jwt.decode(access_token, secret_key, algorithms=[algorithm], leeway=30)
                 
                 # Check if CRM module is enabled
                 enabled_modules = payload.get('enabled_modules', [])
@@ -196,7 +197,8 @@ def superadmin_proxy_login_view(request):
                     
                     logger.info(f"Decoding JWT with secret key: {secret_key[:10]}...")
                     
-                    payload = jwt.decode(access_token, secret_key, algorithms=[algorithm])
+                    # Add leeway for clock skew tolerance (30 seconds)
+                    payload = jwt.decode(access_token, secret_key, algorithms=[algorithm], leeway=30)
                     
                     logger.info(f"JWT payload: {payload}")
                     

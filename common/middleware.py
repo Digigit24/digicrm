@@ -91,8 +91,8 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
                     status=500
                 )
             
-            # Decode JWT token
-            payload = jwt.decode(token, secret_key, algorithms=[algorithm])
+            # Decode JWT token with leeway for clock skew tolerance (30 seconds)
+            payload = jwt.decode(token, secret_key, algorithms=[algorithm], leeway=30)
             
         except jwt.ExpiredSignatureError:
             return JsonResponse(
