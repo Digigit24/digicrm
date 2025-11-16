@@ -97,18 +97,23 @@ class TokenLoginView(View):
                 
                 # Create user and login
                 from .auth_backends import TenantUser
+                from django.contrib.auth import login as auth_login
+
                 user = TenantUser(payload)
-                
-                # Store in session
+
+                # Store additional data in session
                 request.session['jwt_token'] = access_token
                 request.session['tenant_id'] = payload.get('tenant_id')
                 request.session['tenant_slug'] = payload.get('tenant_slug')
                 request.session['user_data'] = payload
-                
-                # Set session as authenticated
-                request.session['_auth_user_id'] = str(user.id)
-                request.session['_auth_user_backend'] = 'common.auth_backends.SuperAdminAuthBackend'
-                
+
+                # Use Django's login function to properly set up authentication
+                user.backend = 'common.auth_backends.JWTAuthBackend'
+                auth_login(request, user)
+
+                # Ensure session is saved
+                request.session.save()
+
                 return JsonResponse({
                     'success': True,
                     'message': f'Successfully authenticated for tenant {payload.get("tenant_slug")}',
@@ -222,19 +227,25 @@ def superadmin_proxy_login_view(request):
                     
                     # Create user and login
                     from .auth_backends import TenantUser
+                    from django.contrib.auth import login as auth_login
+
                     user = TenantUser(user_payload)
-                    
-                    # Store in session
+
+                    # Store additional data in session before login
                     request.session['jwt_token'] = access_token
                     request.session['tenant_id'] = user_data.get('tenant')
                     request.session['tenant_slug'] = user_data.get('tenant_name')
                     request.session['user_data'] = user_payload
-                    
-                    # Set session as authenticated
-                    request.session['_auth_user_id'] = str(user.id)
-                    request.session['_auth_user_backend'] = 'common.auth_backends.SuperAdminAuthBackend'
-                    
-                    logger.info(f"Session data set: user_id={user.id}, tenant_id={user_data.get('tenant')}")
+
+                    # Use Django's login function to properly set up authentication
+                    # We need to set the backend manually since we're not using authenticate()
+                    user.backend = 'common.auth_backends.SuperAdminAuthBackend'
+                    auth_login(request, user)
+
+                    # Ensure session is saved
+                    request.session.save()
+
+                    logger.info(f"User logged in: user_id={user.id}, tenant_id={user_data.get('tenant')}, session_key={request.session.session_key}")
                     
                     return JsonResponse({
                         'success': True,

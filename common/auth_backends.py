@@ -34,10 +34,12 @@ class TenantUser:
     
     def get_username(self):
         return self.username
-    
+
+    @property
     def is_anonymous(self):
         return False
-    
+
+    @property
     def is_authenticated(self):
         return True
     
