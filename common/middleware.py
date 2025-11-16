@@ -28,7 +28,9 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
     PUBLIC_PATHS = [
         '/api/docs/',
         '/api/schema/',
-        '/admin/',
+        '/admin',   # Allow all admin paths - custom admin site handles auth
+        '/auth/',   # Allow all auth endpoints
+        '/static/',  # Allow static files (CSS, JS, images)
         '/health/',
         '/api/schema.json',
         '/api/schema.yaml',

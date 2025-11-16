@@ -1,9 +1,9 @@
 from django.contrib import admin
+from common.admin_site import tenant_admin_site, TenantModelAdmin
 from .models import Task
 
 
-@admin.register(Task)
-class TaskAdmin(admin.ModelAdmin):
+class TaskAdmin(TenantModelAdmin):
     """Admin interface for Task"""
     list_display = [
         'title', 'lead', 'status', 'priority', 'assignee_user_id',
@@ -35,3 +35,7 @@ class TaskAdmin(admin.ModelAdmin):
             'classes': ('collapse',)
         }),
     )
+
+
+# Register with tenant admin site
+tenant_admin_site.register(Task, TaskAdmin)

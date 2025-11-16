@@ -1,9 +1,9 @@
 from django.contrib import admin
+from common.admin_site import tenant_admin_site, TenantModelAdmin
 from .models import Lead, LeadStatus, LeadActivity, LeadOrder
 
 
-@admin.register(LeadStatus)
-class LeadStatusAdmin(admin.ModelAdmin):
+class LeadStatusAdmin(TenantModelAdmin):
     """Admin interface for LeadStatus"""
     list_display = ['name', 'order_index', 'color_hex', 'is_won', 'is_lost', 'is_active']
     list_filter = ['is_won', 'is_lost', 'is_active']
@@ -19,8 +19,7 @@ class LeadActivityInline(admin.TabularInline):
     readonly_fields = ['created_at']
 
 
-@admin.register(Lead)
-class LeadAdmin(admin.ModelAdmin):
+class LeadAdmin(TenantModelAdmin):
     """Admin interface for Lead"""
     list_display = [
         'name', 'phone', 'email', 'company', 'status',
@@ -53,8 +52,7 @@ class LeadAdmin(admin.ModelAdmin):
     )
 
 
-@admin.register(LeadActivity)
-class LeadActivityAdmin(admin.ModelAdmin):
+class LeadActivityAdmin(TenantModelAdmin):
     """Admin interface for LeadActivity"""
     list_display = ['lead', 'type', 'happened_at', 'by_user_id', 'created_at']
     list_filter = ['type', 'happened_at']
@@ -63,10 +61,16 @@ class LeadActivityAdmin(admin.ModelAdmin):
     readonly_fields = ['created_at']
 
 
-@admin.register(LeadOrder)
-class LeadOrderAdmin(admin.ModelAdmin):
+class LeadOrderAdmin(TenantModelAdmin):
     """Admin interface for LeadOrder"""
     list_display = ['lead', 'status', 'position', 'board_id', 'updated_at']
     list_filter = ['status', 'board_id']
     search_fields = ['lead__name', 'status__name']
     readonly_fields = ['updated_at']
+
+
+# Register models with the custom tenant admin site
+tenant_admin_site.register(LeadStatus, LeadStatusAdmin)
+tenant_admin_site.register(Lead, LeadAdmin)
+tenant_admin_site.register(LeadActivity, LeadActivityAdmin)
+tenant_admin_site.register(LeadOrder, LeadOrderAdmin)

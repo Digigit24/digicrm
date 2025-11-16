@@ -1,9 +1,9 @@
 from django.contrib import admin
+from common.admin_site import tenant_admin_site, TenantModelAdmin
 from .models import Payment
 
 
-@admin.register(Payment)
-class PaymentAdmin(admin.ModelAdmin):
+class PaymentAdmin(TenantModelAdmin):
     """Admin interface for Payment"""
     list_display = [
         'lead', 'type', 'amount', 'currency', 'status',
@@ -32,3 +32,7 @@ class PaymentAdmin(admin.ModelAdmin):
             'classes': ('collapse',)
         }),
     )
+
+
+# Register with tenant admin site
+tenant_admin_site.register(Payment, PaymentAdmin)

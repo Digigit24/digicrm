@@ -1,0 +1,420 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" type="text/css" href="{% static "admin/css/login.css" %}">
+{{ form.media }}
+<style>
+    .login-container {
+        max-width: 500px;
+        margin: 50px auto;
+        padding: 30px;
+        background: white;
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    
+    .login-header {
+        text-align: center;
+        margin-bottom: 30px;
+    }
+    
+    .login-header h1 {
+        color: #333;
+        margin-bottom: 10px;
+    }
+    
+    .login-header p {
+        color: #666;
+        font-size: 14px;
+    }
+    
+    .login-methods {
+        margin-bottom: 30px;
+    }
+    
+    .method-section {
+        margin-bottom: 25px;
+        padding: 20px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+    }
+    
+    .method-title {
+        font-weight: bold;
+        margin-bottom: 15px;
+        color: #333;
+    }
+    
+    .superadmin-login {
+        background-color: #f8f9fa;
+    }
+    
+    .token-login {
+        background-color: #e3f2fd;
+    }
+    
+    .form-row {
+        margin-bottom: 15px;
+    }
+    
+    .form-row label {
+        display: block;
+        margin-bottom: 5px;
+        font-weight: bold;
+        color: #333;
+    }
+    
+    .form-row input[type="text"],
+    .form-row input[type="password"],
+    .form-row textarea {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 14px;
+    }
+    
+    .btn {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+        text-decoration: none;
+        display: inline-block;
+        text-align: center;
+    }
+    
+    .btn-primary {
+        background-color: #007bff;
+        color: white;
+    }
+    
+    .btn-primary:hover {
+        background-color: #0056b3;
+    }
+    
+    .btn-secondary {
+        background-color: #6c757d;
+        color: white;
+    }
+    
+    .btn-secondary:hover {
+        background-color: #545b62;
+    }
+    
+    .alert {
+        padding: 12px;
+        margin-bottom: 20px;
+        border-radius: 4px;
+    }
+    
+    .alert-success {
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+    }
+    
+    .alert-error {
+        background-color: #f8d7da;
+        border: 1px solid #f5c6cb;
+        color: #721c24;
+    }
+    
+    .help-text {
+        font-size: 12px;
+        color: #666;
+        margin-top: 5px;
+    }
+    
+    .divider {
+        text-align: center;
+        margin: 20px 0;
+        position: relative;
+    }
+    
+    .divider::before {
+        content: '';
+        position: absolute;
+        top: 50%;
+        left: 0;
+        right: 0;
+        height: 1px;
+        background: #ddd;
+    }
+    
+    .divider span {
+        background: white;
+        padding: 0 15px;
+        color: #666;
+        font-size: 14px;
+    }
+    
+    #token-result,
+    #superadmin-result {
+        margin-top: 15px;
+        padding: 10px;
+        border-radius: 4px;
+        display: none;
+    }
+    
+    .loading {
+        opacity: 0.6;
+        pointer-events: none;
+    }
+</style>
+{% endblock %}
+
+{% block bodyclass %}{{ block.super }} login{% endblock %}
+
+{% block usertools %}{% endblock %}
+
+{% block nav-global %}{% endblock %}
+
+{% block content %}
+<div class="login-container">
+    <div class="login-header">
+        <h1>{% trans 'DigiCRM Admin Login' %}</h1>
+        <p>{% trans 'Login using your SuperAdmin credentials or JWT token' %}</p>
+    </div>
+
+    {% if messages %}
+        {% for message in messages %}
+            <div class="alert alert-{{ message.tags }}">
+                {{ message }}
+            </div>
+        {% endfor %}
+    {% endif %}
+
+    <div class="login-methods">
+        <!-- SuperAdmin Login Method -->
+        <div class="method-section superadmin-login">
+            <div class="method-title">
+                <i class="fas fa-user"></i> Login with SuperAdmin Credentials
+            </div>
+            
+            <form id="superadmin-form">
+                {% csrf_token %}
+                <div class="form-row">
+                    <label for="id_username">{% trans 'Email:' %}</label>
+                    <input type="text" name="username" id="id_username" required>
+                    <div class="help-text">Enter your SuperAdmin email address</div>
+                </div>
+                
+                <div class="form-row">
+                    <label for="id_password">{% trans 'Password:' %}</label>
+                    <input type="password" name="password" id="id_password" required>
+                    <div class="help-text">Enter your SuperAdmin password</div>
+                </div>
+                
+                <div class="form-row">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-sign-in-alt"></i> {% trans 'Log in' %}
+                    </button>
+                    <a href="{{ superadmin_url }}" target="_blank" class="btn btn-secondary">
+                        <i class="fas fa-external-link-alt"></i> {% trans 'Open SuperAdmin' %}
+                    </a>
+                </div>
+                
+                <div id="superadmin-result"></div>
+            </form>
+        </div>
+
+        <div class="divider">
+            <span>{% trans 'OR' %}</span>
+        </div>
+
+        <!-- Token Login Method -->
+        <div class="method-section token-login">
+            <div class="method-title">
+                <i class="fas fa-key"></i> Login with JWT Token
+            </div>
+            
+            <form id="token-form">
+                {% csrf_token %}
+                <div class="form-row">
+                    <label for="jwt_token">{% trans 'JWT Access Token:' %}</label>
+                    <textarea name="jwt_token" id="jwt_token" rows="4" placeholder="Paste your JWT access token here..."></textarea>
+                    <div class="help-text">
+                        Get your token from <a href="{{ superadmin_url }}" target="_blank">{{ superadmin_url }}</a>
+                    </div>
+                </div>
+                
+                <div class="form-row">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-key"></i> {% trans 'Login with Token' %}
+                    </button>
+                </div>
+                
+                <div id="token-result"></div>
+            </form>
+        </div>
+    </div>
+
+    <div style="text-align: center; margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
+        <p style="color: #666; font-size: 12px;">
+            {% trans 'Need help?' %} 
+            <a href="{{ superadmin_url }}/support" target="_blank">{% trans 'Contact Support' %}</a>
+        </p>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Handle SuperAdmin login
+    const superadminForm = document.getElementById('superadmin-form');
+    const superadminResult = document.getElementById('superadmin-result');
+    
+    superadminForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+        
+        const email = document.getElementById('id_username').value.trim();
+        const password = document.getElementById('id_password').value.trim();
+        
+        if (!email || !password) {
+            showSuperadminResult('Please enter both email and password', 'error');
+            return;
+        }
+        
+        // Show loading state
+        const submitBtn = superadminForm.querySelector('button[type="submit"]');
+        const originalText = submitBtn.innerHTML;
+        submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Authenticating...';
+        submitBtn.disabled = true;
+        
+        // Get CSRF token
+        const csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+        
+        // Make API call to our proxy endpoint
+        fetch('/auth/superadmin-login/', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': csrfToken,
+            },
+            body: JSON.stringify({
+                email: email,
+                password: password
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                showSuperadminResult(data.message, 'success');
+                setTimeout(() => {
+                    window.location.href = data.redirect_url || '/admin/';
+                }, 1000);
+            } else {
+                showSuperadminResult(data.error || 'Authentication failed', 'error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            let errorMessage = 'Network error. Please try again.';
+            
+            if (error.message.includes('HTTP 401')) {
+                errorMessage = 'Invalid credentials. Please check your email and password.';
+            } else if (error.message.includes('HTTP 403')) {
+                errorMessage = 'CRM module not enabled for your account.';
+            } else if (error.message.includes('HTTP')) {
+                errorMessage = 'Server error. Please try again later.';
+            }
+            
+            showSuperadminResult(errorMessage, 'error');
+        })
+        .finally(() => {
+            // Restore button state
+            submitBtn.innerHTML = originalText;
+            submitBtn.disabled = false;
+        });
+    });
+    
+    // Handle token login
+    const tokenForm = document.getElementById('token-form');
+    const tokenResult = document.getElementById('token-result');
+    
+    tokenForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+        
+        const token = document.getElementById('jwt_token').value.trim();
+        if (!token) {
+            showTokenResult('Please enter a JWT token', 'error');
+            return;
+        }
+        
+        // Show loading state
+        const submitBtn = tokenForm.querySelector('button[type="submit"]');
+        const originalText = submitBtn.innerHTML;
+        submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Authenticating...';
+        submitBtn.disabled = true;
+        
+        // Get CSRF token
+        const csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+        
+        // Send token to backend
+        fetch('/auth/token-login/', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': csrfToken,
+            },
+            body: JSON.stringify({
+                access_token: token
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                showTokenResult(data.message, 'success');
+                setTimeout(() => {
+                    window.location.href = data.redirect_url || '/admin/';
+                }, 1000);
+            } else {
+                showTokenResult(data.error || 'Authentication failed', 'error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            showTokenResult('Network error. Please try again.', 'error');
+        })
+        .finally(() => {
+            // Restore button state
+            submitBtn.innerHTML = originalText;
+            submitBtn.disabled = false;
+        });
+    });
+    
+    function showSuperadminResult(message, type) {
+        superadminResult.className = `alert alert-${type}`;
+        superadminResult.textContent = message;
+        superadminResult.style.display = 'block';
+        
+        // Auto-hide success messages
+        if (type === 'success') {
+            setTimeout(() => {
+                superadminResult.style.display = 'none';
+            }, 3000);
+        }
+    }
+    
+    function showTokenResult(message, type) {
+        tokenResult.className = `alert alert-${type}`;
+        tokenResult.textContent = message;
+        tokenResult.style.display = 'block';
+        
+        // Auto-hide success messages
+        if (type === 'success') {
+            setTimeout(() => {
+                tokenResult.style.display = 'none';
+            }, 3000);
+        }
+    }
+    
+    // Auto-focus on first input
+    const firstInput = document.getElementById('id_username');
+    if (firstInput) {
+        firstInput.focus();
+    }
+});
+</script>
+{% endblock %}

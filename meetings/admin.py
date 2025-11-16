@@ -1,9 +1,9 @@
 from django.contrib import admin
+from common.admin_site import tenant_admin_site, TenantModelAdmin
 from .models import Meeting
 
 
-@admin.register(Meeting)
-class MeetingAdmin(admin.ModelAdmin):
+class MeetingAdmin(TenantModelAdmin):
     """Admin interface for Meeting"""
     list_display = ['title', 'lead', 'location', 'start_at', 'end_at', 'created_at']
     list_filter = ['start_at', 'created_at']
@@ -26,3 +26,7 @@ class MeetingAdmin(admin.ModelAdmin):
             'classes': ('collapse',)
         }),
     )
+
+
+# Register with tenant admin site
+tenant_admin_site.register(Meeting, MeetingAdmin)

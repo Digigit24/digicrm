@@ -1,12 +1,18 @@
-from rest_framework import viewsets, filters
+from rest_framework import viewsets, filters, status
+from rest_framework.decorators import action
+from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
+from django.db.models import Count, Q
 from .models import Lead, LeadStatus, LeadActivity, LeadOrder
 from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
     LeadActivitySerializer, LeadOrderSerializer
 )
 from common.mixins import TenantViewSetMixin
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @extend_schema_view(
@@ -67,6 +73,87 @@ class LeadViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         if self.action == 'list':
             return LeadListSerializer
         return LeadSerializer
+
+    @extend_schema(
+        description='Get leads organized by status for kanban board view',
+        responses={200: {
+            'type': 'object',
+            'properties': {
+                'statuses': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'id': {'type': 'integer'},
+                            'name': {'type': 'string'},
+                            'color_hex': {'type': 'string'},
+                            'order_index': {'type': 'integer'},
+                            'is_won': {'type': 'boolean'},
+                            'is_lost': {'type': 'boolean'},
+                            'lead_count': {'type': 'integer'},
+                            'leads': {
+                                'type': 'array',
+                                'items': {'$ref': '#/components/schemas/LeadList'}
+                            }
+                        }
+                    }
+                }
+            }
+        }}
+    )
+    @action(detail=False, methods=['get'])
+    def kanban(self, request):
+        """
+        Get leads organized by status for kanban board view
+        Returns all statuses with their associated leads
+        """
+        try:
+            logger.info(f"Kanban view requested by tenant: {request.tenant_id}")
+            
+            # Get all active statuses for the tenant, ordered by order_index
+            statuses = LeadStatus.objects.filter(
+                tenant_id=request.tenant_id,
+                is_active=True
+            ).order_by('order_index')
+            
+            kanban_data = []
+            
+            for status in statuses:
+                # Get leads for this status
+                leads = Lead.objects.filter(
+                    tenant_id=request.tenant_id,
+                    status=status
+                ).select_related('status').order_by('-created_at')
+                
+                # Serialize the leads
+                leads_serializer = LeadListSerializer(leads, many=True)
+                
+                # Build status data
+                status_data = {
+                    'id': status.id,
+                    'name': status.name,
+                    'color_hex': status.color_hex,
+                    'order_index': status.order_index,
+                    'is_won': status.is_won,
+                    'is_lost': status.is_lost,
+                    'lead_count': leads.count(),
+                    'leads': leads_serializer.data
+                }
+                
+                kanban_data.append(status_data)
+            
+            logger.info(f"Kanban data prepared for {len(kanban_data)} statuses")
+            
+            return Response({
+                'statuses': kanban_data
+            })
+            
+        except Exception as e:
+            logger.error(f"Error in kanban view: {str(e)}")
+            return Response(
+                {'error': 'Failed to fetch kanban data'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 @extend_schema_view(

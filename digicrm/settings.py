@@ -58,7 +58,7 @@ ROOT_URLCONF = 'digicrm.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -124,9 +124,24 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# Authentication backends
+AUTHENTICATION_BACKENDS = [
+    'common.auth_backends.SuperAdminAuthBackend',
+    'common.auth_backends.JWTAuthBackend',
+    # Remove ModelBackend since we don't have auth_user table
+]
+
 # JWT Settings (must match SuperAdmin)
 JWT_SECRET_KEY = config('JWT_SECRET_KEY', default='your-jwt-secret-key-change-in-production')
 JWT_ALGORITHM = config('JWT_ALGORITHM', default='HS256')
+
+# SuperAdmin URL
+SUPERADMIN_URL = config('SUPERADMIN_URL', default='https://admin.celiyo.com')
+
+# Session settings for admin
+SESSION_COOKIE_AGE = 3600 * 8  # 8 hours
+SESSION_SAVE_EVERY_REQUEST = True
+SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', default=False, cast=bool)
