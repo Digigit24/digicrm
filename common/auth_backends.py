@@ -144,7 +144,7 @@ class SuperAdminAuthBackend(BaseBackend):
         
         try:
             # Call SuperAdmin login API
-            superadmin_url = getattr(settings, 'SUPERADMIN_URL', 'http://127.0.0.1:8003')
+            superadmin_url = getattr(settings, 'SUPERADMIN_URL', 'https://admin.celiyo.com')
             login_url = f"{superadmin_url}/api/auth/login/"
             
             response = requests.post(login_url, json={
