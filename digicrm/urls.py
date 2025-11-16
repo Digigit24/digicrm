@@ -4,6 +4,8 @@ URL configuration for digicrm project.
 from django.urls import path, include
 from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import RedirectView
+from django.conf import settings
+from django.conf.urls.static import static
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularRedocView,
@@ -35,3 +37,7 @@ urlpatterns = [
     path('api/payments/', include('payments.urls')),
     path('api/tasks/', include('tasks.urls')),
 ]
+
+# Serve static files in development
+if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
