@@ -219,6 +219,11 @@ REST_FRAMEWORK = {
         'rest_framework.renderers.JSONRenderer',
         'rest_framework.renderers.BrowsableAPIRenderer',
     ],
+    # Use custom authentication that works with JWT middleware
+    # This prevents SessionAuthentication from interfering with POST requests
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'common.authentication.JWTRequestAuthentication',
+    ],
 }
 
 # drf-spectacular Settings

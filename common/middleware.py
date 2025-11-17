@@ -1,9 +1,12 @@
 import jwt
 import json
+import logging
 import threading
 from django.conf import settings
 from django.http import JsonResponse
 from django.utils.deprecation import MiddlewareMixin
+
+logger = logging.getLogger(__name__)
 
 # Thread-local storage for tenant_id and request (for future database routing)
 _thread_locals = threading.local()
@@ -151,8 +154,14 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         # If x-tenant-slug header is provided, use it to override tenant_slug
         if x_tenant_slug_header:
             request.tenant_slug = x_tenant_slug_header
-        
+
         # Store tenant_id in thread-local storage for database routing
         set_current_tenant_id(request.tenant_id)
-        
+
+        # Log tenant context for debugging
+        logger.debug(
+            f"Tenant context set: method={request.method}, path={request.path}, "
+            f"tenant_id={request.tenant_id}, tenant_slug={request.tenant_slug}"
+        )
+
         return None
