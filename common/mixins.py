@@ -13,25 +13,39 @@ class TenantMixin(serializers.ModelSerializer):
     def create(self, validated_data):
         """Override create to automatically set tenant_id from request"""
         request = self.context.get('request')
-        if request and hasattr(request, 'tenant_id'):
-            tenant_id = request.tenant_id
-            if tenant_id is None:
-                logger.error(
-                    f"Tenant ID is None in request for {request.method} {request.path}"
-                )
-                raise ValidationError({
-                    'tenant_id': 'Tenant ID is required but was not found in request'
-                })
-            validated_data['tenant_id'] = tenant_id
-            logger.debug(f"Creating object with tenant_id: {tenant_id}")
-        else:
+        
+        if not request:
+            logger.error("No request found in serializer context")
+            raise ValidationError({
+                'tenant_id': 'Request context is required but was not found'
+            })
+        
+        # Check for tenant_id in request (set by middleware from headers)
+        tenant_id = getattr(request, 'tenant_id', None)
+        
+        if tenant_id is None:
+            # Log available headers for debugging
+            headers = {k: v for k, v in request.META.items() if k.startswith('HTTP_')}
             logger.error(
-                f"Request does not have tenant_id attribute for {request.method if request else 'unknown'} "
-                f"{request.path if request else 'unknown'}"
+                f"Tenant ID not found in request for {request.method} {request.path}. "
+                f"Available headers: {headers}"
             )
             raise ValidationError({
-                'tenant_id': 'Tenant context is required but was not found'
+                'tenant_id': 'Tenant ID is required but was not found in request headers'
             })
+        
+        # Ensure tenant_id is not empty string
+        if not tenant_id or tenant_id.strip() == '':
+            logger.error(
+                f"Tenant ID is empty in request for {request.method} {request.path}"
+            )
+            raise ValidationError({
+                'tenant_id': 'Tenant ID cannot be empty'
+            })
+        
+        validated_data['tenant_id'] = tenant_id
+        logger.debug(f"Creating object with tenant_id: {tenant_id}")
+        
         return super().create(validated_data)
     
     def update(self, instance, validated_data):
@@ -52,28 +66,62 @@ class TenantViewSetMixin:
     def get_queryset(self):
         """Filter queryset by tenant_id from request"""
         queryset = super().get_queryset()
-        if hasattr(self.request, 'tenant_id'):
-            return queryset.filter(tenant_id=self.request.tenant_id)
-        return queryset
+        
+        if not hasattr(self, 'request') or not self.request:
+            logger.warning("No request found in ViewSet get_queryset, returning unfiltered queryset")
+            return queryset
+        
+        # Check for tenant_id in request (set by middleware from headers)
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        
+        if tenant_id is None:
+            logger.warning(
+                f"Tenant ID not found in get_queryset for {self.request.method} {self.request.path}, "
+                f"returning unfiltered queryset"
+            )
+            return queryset
+        
+        # Ensure tenant_id is not empty string
+        if not tenant_id or tenant_id.strip() == '':
+            logger.warning(
+                f"Tenant ID is empty in get_queryset for {self.request.method} {self.request.path}, "
+                f"returning unfiltered queryset"
+            )
+            return queryset
+        
+        logger.debug(f"Filtering queryset by tenant_id: {tenant_id}")
+        return queryset.filter(tenant_id=tenant_id)
     
     def perform_create(self, serializer):
         """Ensure tenant_id is set when creating objects"""
-        if hasattr(self.request, 'tenant_id'):
-            tenant_id = self.request.tenant_id
-            if tenant_id is None:
-                logger.error(
-                    f"Tenant ID is None in perform_create for {self.request.method} {self.request.path}"
-                )
-                raise ValidationError({
-                    'tenant_id': 'Tenant ID is required but was not found in request'
-                })
-            logger.debug(f"Performing create with tenant_id: {tenant_id}")
-            serializer.save(tenant_id=tenant_id)
-        else:
+        if not hasattr(self, 'request') or not self.request:
+            logger.error("No request found in ViewSet")
+            raise ValidationError({
+                'tenant_id': 'Request context is required but was not found'
+            })
+        
+        # Check for tenant_id in request (set by middleware from headers)
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        
+        if tenant_id is None:
+            # Log available headers for debugging
+            headers = {k: v for k, v in self.request.META.items() if k.startswith('HTTP_')}
             logger.error(
-                f"Request does not have tenant_id attribute in perform_create for "
-                f"{self.request.method} {self.request.path}"
+                f"Tenant ID not found in perform_create for {self.request.method} {self.request.path}. "
+                f"Available headers: {headers}"
             )
             raise ValidationError({
-                'tenant_id': 'Tenant context is required but was not found'
+                'tenant_id': 'Tenant ID is required but was not found in request headers'
             })
+        
+        # Ensure tenant_id is not empty string
+        if not tenant_id or tenant_id.strip() == '':
+            logger.error(
+                f"Tenant ID is empty in perform_create for {self.request.method} {self.request.path}"
+            )
+            raise ValidationError({
+                'tenant_id': 'Tenant ID cannot be empty'
+            })
+        
+        logger.debug(f"Performing create with tenant_id: {tenant_id}")
+        serializer.save(tenant_id=tenant_id)
