@@ -159,9 +159,14 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         set_current_tenant_id(request.tenant_id)
 
         # Log tenant context for debugging
-        logger.debug(
-            f"Tenant context set: method={request.method}, path={request.path}, "
-            f"tenant_id={request.tenant_id}, tenant_slug={request.tenant_slug}"
+        logger.info(
+            f"JWT Middleware - Tenant context set: method={request.method}, path={request.path}, "
+            f"tenant_id={request.tenant_id}, tenant_slug={request.tenant_slug}, "
+            f"user_id={request.user_id}"
         )
+        
+        # Debug: Verify the attribute is actually set
+        logger.debug(f"JWT Middleware - hasattr(request, 'tenant_id'): {hasattr(request, 'tenant_id')}")
+        logger.debug(f"JWT Middleware - getattr(request, 'tenant_id', 'NOT_FOUND'): {getattr(request, 'tenant_id', 'NOT_FOUND')}")
 
         return None
