@@ -309,6 +309,10 @@ class HasCRMPermission:
         Returns:
             bool: True if permission granted
         """
+        # Super admins bypass all permission checks
+        if getattr(request, 'is_super_admin', False):
+            return True
+
         # Check if request has permissions attribute (set by JWT middleware)
         if not hasattr(request, 'permissions'):
             return False
@@ -424,6 +428,10 @@ class CRMPermissionMixin:
         Returns:
             bool: True if permission granted
         """
+        # Super admins bypass all permission checks
+        if getattr(request, 'is_super_admin', False):
+            return True
+
         if not hasattr(request, 'permissions'):
             return False
 
