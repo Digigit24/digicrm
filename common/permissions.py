@@ -336,9 +336,15 @@ class HasCRMPermission:
             logger.debug(f"Permission denied: No permissions attribute on request for {permission_key}")
             return False
 
-        # Get the permission value from nested structure
-        permission_value = get_nested_permission(request.permissions, permission_key)
-        logger.debug(f"Permission value for {permission_key}: {permission_value}")
+        # Get the permission value - support both flat and nested structures
+        # First try flat key (e.g., 'crm.leads.view' as direct dict key)
+        if permission_key in request.permissions:
+            permission_value = request.permissions[permission_key]
+            logger.debug(f"Permission value for {permission_key} (flat): {permission_value}")
+        else:
+            # Fall back to nested structure lookup
+            permission_value = get_nested_permission(request.permissions, permission_key)
+            logger.debug(f"Permission value for {permission_key} (nested): {permission_value}")
 
         # If permission not found, deny access
         if permission_value is None:
@@ -464,7 +470,13 @@ class CRMPermissionMixin:
         if not hasattr(request, 'permissions'):
             return False
 
-        permission_value = get_nested_permission(request.permissions, permission_key)
+        # Get the permission value - support both flat and nested structures
+        # First try flat key (e.g., 'crm.leads.view' as direct dict key)
+        if permission_key in request.permissions:
+            permission_value = request.permissions[permission_key]
+        else:
+            # Fall back to nested structure lookup
+            permission_value = get_nested_permission(request.permissions, permission_key)
 
         # If permission not found, deny access
         if permission_value is None:
