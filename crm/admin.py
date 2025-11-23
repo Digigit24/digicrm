@@ -82,7 +82,7 @@ class LeadCustomFieldForm(forms.ModelForm):
 
     class Meta:
         model = LeadCustomField
-        fields = '__all__'
+        exclude = ['id']  # Exclude id field to prevent conflicts
         widgets = {
             'options': forms.Textarea(attrs={
                 'rows': 4,
