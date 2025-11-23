@@ -346,7 +346,7 @@ LOGGING = {
             'propagate': False,
         },
         'common': {
-            'handlers': ['console', 'file_info', 'file_error'],
+            'handlers': ['console', 'file_debug', 'file_info', 'file_error'],
             'level': 'DEBUG',
             'propagate': False,
         },
