@@ -1,6 +1,7 @@
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Count, Q
@@ -10,6 +11,7 @@ from .serializers import (
     LeadActivitySerializer, LeadOrderSerializer
 )
 from common.mixins import TenantViewSetMixin
+from common.permissions import CRMPermissionMixin, get_nested_permission
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,12 +25,14 @@ logger = logging.getLogger(__name__)
     partial_update=extend_schema(description='Partially update a lead status'),
     destroy=extend_schema(description='Delete a lead status'),
 )
-class LeadStatusViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class LeadStatusViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Statuses
+    Requires: crm.statuses permissions
     """
     queryset = LeadStatus.objects.all()
     serializer_class = LeadStatusSerializer
+    permission_resource = 'statuses'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['is_won', 'is_lost', 'is_active']
     search_fields = ['name']
@@ -44,16 +48,19 @@ class LeadStatusViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     partial_update=extend_schema(description='Partially update a lead'),
     destroy=extend_schema(description='Delete a lead'),
 )
-class LeadViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Leads with comprehensive filtering
+    Requires: crm.leads permissions
     """
     queryset = Lead.objects.select_related('status').prefetch_related('activities')
+    permission_resource = 'leads'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = {
         'status': ['exact'],
         'priority': ['exact'],
         'owner_user_id': ['exact'],
+        'assigned_to': ['exact', 'isnull'],
         'created_at': ['gte', 'lte', 'exact'],
         'updated_at': ['gte', 'lte'],
         'next_follow_up_at': ['gte', 'lte', 'isnull'],
@@ -106,28 +113,50 @@ class LeadViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         """
         Get leads organized by status for kanban board view
         Returns all statuses with their associated leads
+        Requires: crm.leads.view permission
         """
         try:
+            # Check permission for viewing leads
+            if not self._has_crm_permission(request, 'crm.leads.view'):
+                raise PermissionDenied({
+                    "error": "Permission denied",
+                    "detail": "You don't have permission to view leads"
+                })
+
             logger.info(f"Kanban view requested by tenant: {request.tenant_id}")
-            
+
             # Get all active statuses for the tenant, ordered by order_index
             statuses = LeadStatus.objects.filter(
                 tenant_id=request.tenant_id,
                 is_active=True
             ).order_by('order_index')
-            
+
             kanban_data = []
-            
+
+            # Get view permission to filter leads accordingly
+            view_permission = get_nested_permission(
+                getattr(request, 'permissions', {}),
+                'crm.leads.view'
+            )
+
             for status in statuses:
                 # Get leads for this status
                 leads = Lead.objects.filter(
                     tenant_id=request.tenant_id,
                     status=status
-                ).select_related('status').order_by('-created_at')
-                
+                ).select_related('status')
+
+                # Filter leads based on permission scope
+                if isinstance(view_permission, str):
+                    if view_permission == "own":
+                        leads = leads.filter(owner_user_id=request.user_id)
+                    # "all" and "team" show all tenant leads
+
+                leads = leads.order_by('-created_at')
+
                 # Serialize the leads
                 leads_serializer = LeadListSerializer(leads, many=True)
-                
+
                 # Build status data
                 status_data = {
                     'id': status.id,
@@ -139,15 +168,17 @@ class LeadViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                     'lead_count': leads.count(),
                     'leads': leads_serializer.data
                 }
-                
+
                 kanban_data.append(status_data)
-            
+
             logger.info(f"Kanban data prepared for {len(kanban_data)} statuses")
-            
+
             return Response({
                 'statuses': kanban_data
             })
-            
+
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"Error in kanban view: {str(e)}")
             return Response(
@@ -164,12 +195,14 @@ class LeadViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     partial_update=extend_schema(description='Partially update a lead activity'),
     destroy=extend_schema(description='Delete a lead activity'),
 )
-class LeadActivityViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Activities
+    Requires: crm.activities permissions
     """
     queryset = LeadActivity.objects.select_related('lead')
     serializer_class = LeadActivitySerializer
+    permission_resource = 'activities'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = {
         'lead': ['exact'],
@@ -181,6 +214,59 @@ class LeadActivityViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     ordering_fields = ['happened_at', 'created_at']
     ordering = ['-happened_at']
 
+    def get_queryset(self):
+        """Override to filter by by_user_id instead of owner_user_id"""
+        queryset = TenantViewSetMixin.get_queryset(self)
+
+        if not hasattr(self, 'request') or not self.request:
+            return queryset
+
+        # Get view permission
+        view_permission_key = f"crm.{self.permission_resource}.view"
+        permission_value = get_nested_permission(
+            getattr(self.request, 'permissions', {}),
+            view_permission_key
+        )
+
+        # If no permission found, return empty queryset
+        if permission_value is None:
+            return queryset.none()
+
+        # Handle boolean permissions
+        if isinstance(permission_value, bool):
+            return queryset if permission_value else queryset.none()
+
+        # Handle scope-based permissions
+        if isinstance(permission_value, str):
+            if permission_value == "all":
+                return queryset
+            elif permission_value == "team":
+                return queryset
+            elif permission_value == "own":
+                # Filter by creator (by_user_id) instead of owner_user_id
+                return queryset.filter(by_user_id=self.request.user_id)
+
+        return queryset
+
+    def check_object_permissions(self, request, obj):
+        """Override to check activity permissions based on by_user_id instead of owner_user_id"""
+        from rest_framework.exceptions import PermissionDenied
+
+        # Call parent's check_permissions (skipping CRMPermissionMixin's check_object_permissions)
+        viewsets.ModelViewSet.check_object_permissions(self, request, obj)
+
+        # For update/delete operations, check with activity creator
+        if self.action in ['update', 'partial_update', 'destroy', 'retrieve']:
+            permission_key = self.get_permission_key(self.action)
+
+            if permission_key:
+                creator_id = getattr(obj, 'by_user_id', None)
+                if not self._has_crm_permission(request, permission_key, creator_id):
+                    raise PermissionDenied({
+                        "error": "Permission denied",
+                        "detail": f"You don't have permission to {self.action} this activity"
+                    })
+
 
 @extend_schema_view(
     list=extend_schema(description='List all lead orders'),
@@ -190,13 +276,35 @@ class LeadActivityViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     partial_update=extend_schema(description='Partially update a lead order'),
     destroy=extend_schema(description='Delete a lead order'),
 )
-class LeadOrderViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Orders (Kanban board positioning)
+    Requires: crm.leads permissions (same as leads since orders control lead positioning)
     """
     queryset = LeadOrder.objects.select_related('lead', 'status')
     serializer_class = LeadOrderSerializer
+    permission_resource = 'leads'  # Use leads permissions since this controls lead positioning
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['lead', 'status', 'board_id']
     ordering_fields = ['position', 'updated_at']
     ordering = ['status', 'position']
+
+    def check_object_permissions(self, request, obj):
+        """Override to check order permissions based on lead ownership"""
+        from rest_framework.exceptions import PermissionDenied
+
+        # Call parent's check_permissions (skipping CRMPermissionMixin's check_object_permissions)
+        viewsets.ModelViewSet.check_object_permissions(self, request, obj)
+
+        # For update/delete operations, check with lead owner
+        if self.action in ['update', 'partial_update', 'destroy', 'retrieve']:
+            permission_key = self.get_permission_key(self.action)
+
+            if permission_key:
+                # Check against the lead's owner
+                owner_id = getattr(obj.lead, 'owner_user_id', None) if hasattr(obj, 'lead') else None
+                if not self._has_crm_permission(request, permission_key, owner_id):
+                    raise PermissionDenied({
+                        "error": "Permission denied",
+                        "detail": f"You don't have permission to {self.action} this lead order"
+                    })

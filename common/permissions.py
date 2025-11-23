@@ -160,15 +160,177 @@ class PermissionRequiredMixin:
 def has_module_access(request, module_name):
     """
     Check if user has access to a specific module
-    
+
     Args:
         request: Django request object with JWT attributes
         module_name: Name of the module (e.g., 'crm', 'whatsapp')
-    
+
     Returns:
         bool: True if module is enabled, False otherwise
     """
     if not hasattr(request, 'enabled_modules'):
         return False
-    
+
     return module_name in request.enabled_modules
+
+
+def get_nested_permission(permissions, path):
+    """
+    Get nested permission value from permissions dictionary
+
+    Args:
+        permissions: Nested permissions dictionary
+        path: Dot-separated path (e.g., 'crm.leads.view')
+
+    Returns:
+        Permission value or None if not found
+    """
+    keys = path.split('.')
+    current = permissions
+
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return None
+
+    return current
+
+
+class CRMPermissionMixin:
+    """
+    Mixin for CRM ViewSets to add permission checking
+    Handles nested permission structure from JWT
+    """
+    # Map of actions to permission keys
+    # Should be overridden in each ViewSet
+    permission_resource = None  # e.g., 'leads', 'activities', 'payments', 'statuses'
+
+    permission_action_map = {
+        'list': 'view',
+        'retrieve': 'view',
+        'create': 'create',
+        'update': 'edit',
+        'partial_update': 'edit',
+        'destroy': 'delete',
+    }
+
+    def get_permission_key(self, action):
+        """Get the permission key for the current action"""
+        if not self.permission_resource:
+            return None
+
+        permission_action = self.permission_action_map.get(action)
+        if not permission_action:
+            return None
+
+        return f"crm.{self.permission_resource}.{permission_action}"
+
+    def check_permissions(self, request):
+        """Override to check CRM permissions"""
+        super().check_permissions(request)
+
+        # Get permission key for current action
+        permission_key = self.get_permission_key(self.action)
+
+        if permission_key:
+            if not self._has_crm_permission(request, permission_key):
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied({
+                    "error": "Permission denied",
+                    "detail": f"You don't have permission to {self.action} {self.permission_resource}"
+                })
+
+    def check_object_permissions(self, request, obj):
+        """Override to check object-level CRM permissions"""
+        super().check_object_permissions(request, obj)
+
+        # For update/delete operations, check with resource owner
+        if self.action in ['update', 'partial_update', 'destroy', 'retrieve']:
+            permission_key = self.get_permission_key(self.action)
+
+            if permission_key:
+                owner_id = getattr(obj, 'owner_user_id', None)
+                if not self._has_crm_permission(request, permission_key, owner_id):
+                    from rest_framework.exceptions import PermissionDenied
+                    raise PermissionDenied({
+                        "error": "Permission denied",
+                        "detail": f"You don't have permission to {self.action} this {self.permission_resource}"
+                    })
+
+    def get_queryset(self):
+        """Override to filter queryset based on view permissions"""
+        queryset = super().get_queryset()
+
+        if not hasattr(self, 'request') or not self.request:
+            return queryset
+
+        # Get view permission
+        view_permission_key = f"crm.{self.permission_resource}.view"
+        permission_value = get_nested_permission(
+            getattr(self.request, 'permissions', {}),
+            view_permission_key
+        )
+
+        # If no permission found, return empty queryset
+        if permission_value is None:
+            return queryset.none()
+
+        # Handle boolean permissions
+        if isinstance(permission_value, bool):
+            return queryset if permission_value else queryset.none()
+
+        # Handle scope-based permissions
+        if isinstance(permission_value, str):
+            if permission_value == "all":
+                return queryset
+            elif permission_value == "team":
+                # For now, return all tenant resources (team logic can be added later)
+                return queryset
+            elif permission_value == "own":
+                # Filter by owner - only show user's own resources
+                if hasattr(queryset.model, 'owner_user_id'):
+                    return queryset.filter(owner_user_id=self.request.user_id)
+                return queryset
+
+        return queryset
+
+    def _has_crm_permission(self, request, permission_key, resource_owner_id=None):
+        """
+        Internal method to check CRM permissions
+
+        Args:
+            request: Django request object
+            permission_key: Full permission key (e.g., 'crm.leads.view')
+            resource_owner_id: UUID of resource owner (for 'own' scope checks)
+
+        Returns:
+            bool: True if permission granted
+        """
+        if not hasattr(request, 'permissions'):
+            return False
+
+        permission_value = get_nested_permission(request.permissions, permission_key)
+
+        # If permission not found, deny access
+        if permission_value is None:
+            return False
+
+        # Handle boolean permissions
+        if isinstance(permission_value, bool):
+            return permission_value
+
+        # Handle scope-based permissions
+        if isinstance(permission_value, str):
+            if permission_value == "all":
+                return True
+            elif permission_value == "team":
+                # For now, return True for team scope
+                return True
+            elif permission_value == "own":
+                # Check if resource belongs to the user
+                if resource_owner_id is None:
+                    return True  # If no owner specified, allow (for create operations)
+                return str(resource_owner_id) == str(request.user_id)
+
+        return False

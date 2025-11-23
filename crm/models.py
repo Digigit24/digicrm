@@ -78,6 +78,8 @@ class Lead(models.Model):
     value_currency = models.TextField(null=True, blank=True)
     source = models.TextField(null=True, blank=True)
     owner_user_id = models.UUIDField(db_index=True)
+    assigned_to = models.UUIDField(db_index=True, null=True, blank=True)
+    metadata = models.JSONField(null=True, blank=True, help_text='Custom fields for storing dynamic key-value pairs')
     last_contacted_at = models.DateTimeField(null=True, blank=True)
     next_follow_up_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
@@ -97,6 +99,7 @@ class Lead(models.Model):
             models.Index(fields=['status'], name='idx_leads_status_id'),
             models.Index(fields=['priority'], name='idx_leads_priority'),
             models.Index(fields=['owner_user_id'], name='idx_leads_owner_user_id'),
+            models.Index(fields=['assigned_to'], name='idx_leads_assigned_to'),
             models.Index(fields=['phone'], name='idx_leads_phone'),
         ]
 
