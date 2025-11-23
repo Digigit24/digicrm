@@ -5,10 +5,14 @@ from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Count, Q
-from .models import Lead, LeadStatus, LeadActivity, LeadOrder
+from .models import (
+    Lead, LeadStatus, LeadActivity, LeadOrder,
+    LeadCustomField, LeadFieldVisibility
+)
 from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
-    LeadActivitySerializer, LeadOrderSerializer
+    LeadActivitySerializer, LeadOrderSerializer,
+    LeadCustomFieldSerializer, LeadFieldVisibilitySerializer
 )
 from common.mixins import TenantViewSetMixin
 from common.permissions import CRMPermissionMixin, get_nested_permission
@@ -308,3 +312,49 @@ class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
                         "error": "Permission denied",
                         "detail": f"You don't have permission to {self.action} this lead order"
                     })
+
+
+@extend_schema_view(
+    list=extend_schema(description='List all custom fields for leads'),
+    retrieve=extend_schema(description='Retrieve a specific custom field'),
+    create=extend_schema(description='Create a new custom field'),
+    update=extend_schema(description='Update a custom field'),
+    partial_update=extend_schema(description='Partially update a custom field'),
+    destroy=extend_schema(description='Delete a custom field'),
+)
+class LeadCustomFieldViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
+    """
+    ViewSet for managing Lead Custom Fields
+    Requires: crm.settings permissions (admin-level)
+    """
+    queryset = LeadCustomField.objects.all()
+    serializer_class = LeadCustomFieldSerializer
+    permission_resource = 'settings'  # Requires admin settings permission
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['field_type', 'is_required', 'is_active']
+    search_fields = ['field_name', 'field_label', 'help_text']
+    ordering_fields = ['display_order', 'field_label', 'created_at']
+    ordering = ['display_order', 'field_label']
+
+
+@extend_schema_view(
+    list=extend_schema(description='List field visibility settings'),
+    retrieve=extend_schema(description='Retrieve a specific field visibility setting'),
+    create=extend_schema(description='Create a new field visibility setting'),
+    update=extend_schema(description='Update a field visibility setting'),
+    partial_update=extend_schema(description='Partially update a field visibility setting'),
+    destroy=extend_schema(description='Delete a field visibility setting'),
+)
+class LeadFieldVisibilityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
+    """
+    ViewSet for managing Lead Field Visibility
+    Requires: crm.settings permissions (admin-level)
+    """
+    queryset = LeadFieldVisibility.objects.all()
+    serializer_class = LeadFieldVisibilitySerializer
+    permission_resource = 'settings'  # Requires admin settings permission
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['is_visible']
+    search_fields = ['field_name']
+    ordering_fields = ['display_order', 'field_name']
+    ordering = ['display_order', 'field_name']

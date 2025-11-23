@@ -171,3 +171,89 @@ class LeadOrder(models.Model):
 
     def __str__(self):
         return f"{self.lead.name} - {self.status.name} - Position: {self.position}"
+
+
+class FieldTypeEnum(models.TextChoices):
+    TEXT = 'TEXT', 'Text'
+    NUMBER = 'NUMBER', 'Number'
+    EMAIL = 'EMAIL', 'Email'
+    PHONE = 'PHONE', 'Phone'
+    DATE = 'DATE', 'Date'
+    DATETIME = 'DATETIME', 'Date Time'
+    DROPDOWN = 'DROPDOWN', 'Dropdown'
+    MULTISELECT = 'MULTISELECT', 'Multi Select'
+    CHECKBOX = 'CHECKBOX', 'Checkbox'
+    URL = 'URL', 'URL'
+    TEXTAREA = 'TEXTAREA', 'Text Area'
+
+
+class LeadCustomField(models.Model):
+    """Custom field definitions for leads per tenant"""
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    field_name = models.TextField(help_text='Internal field name (key)')
+    field_label = models.TextField(help_text='Display label for the field')
+    field_type = models.CharField(
+        max_length=20,
+        choices=FieldTypeEnum.choices,
+        default=FieldTypeEnum.TEXT
+    )
+    is_required = models.BooleanField(default=False)
+    default_value = models.TextField(null=True, blank=True)
+    options = models.JSONField(
+        null=True,
+        blank=True,
+        help_text='Options for dropdown/multiselect fields (array of strings)'
+    )
+    placeholder = models.TextField(null=True, blank=True)
+    help_text = models.TextField(null=True, blank=True)
+    display_order = models.IntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'lead_custom_fields'
+        ordering = ['display_order', 'field_label']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_custom_fields_tenant'),
+            models.Index(fields=['tenant_id', 'is_active'], name='idx_lead_custom_fields_active'),
+            models.Index(fields=['display_order'], name='idx_lead_custom_fields_order'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tenant_id', 'field_name'],
+                name='unique_custom_field_per_tenant'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.field_label} ({self.field_type})"
+
+
+class LeadFieldVisibility(models.Model):
+    """Controls visibility of standard Lead model fields per tenant"""
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    field_name = models.TextField(help_text='Standard field name from Lead model')
+    is_visible = models.BooleanField(default=True)
+    display_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'lead_field_visibility'
+        ordering = ['display_order', 'field_name']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_field_vis_tenant'),
+            models.Index(fields=['tenant_id', 'is_visible'], name='idx_lead_field_vis_visible'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tenant_id', 'field_name'],
+                name='unique_field_visibility_per_tenant'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.field_name} - {'Visible' if self.is_visible else 'Hidden'}"
