@@ -53,15 +53,20 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
     def process_request(self, request):
         """Process incoming request and validate JWT token"""
 
+        logger.debug(f"JWT Middleware - process_request called for path: {request.path}")
+
         # Store request in thread-local storage for authentication backends
         set_current_request(request)
 
         # Skip validation for public paths
         if any(request.path.startswith(path) for path in self.PUBLIC_PATHS):
+            logger.debug(f"JWT Middleware - Skipping public path: {request.path}")
             return None
-        
+
         # Get Authorization header
         auth_header = request.META.get('HTTP_AUTHORIZATION')
+        logger.debug(f"JWT Middleware - Authorization header present: {bool(auth_header)}")
+
         if not auth_header:
             return JsonResponse(
                 {'error': 'Authorization header required'},
