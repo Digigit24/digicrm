@@ -2,6 +2,9 @@ from functools import wraps
 from django.http import JsonResponse
 from rest_framework.response import Response
 from rest_framework.authentication import BaseAuthentication
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class JWTAuthentication(BaseAuthentication):
@@ -21,7 +24,18 @@ class JWTAuthentication(BaseAuthentication):
         """
         # Check if JWT middleware has set the user_id
         if not hasattr(request, 'user_id'):
+            logger.debug("JWTAuthentication: No user_id attribute on request")
             return None
+
+        # Debug log the JWT attributes set by middleware
+        jwt_data = {
+            'user_id': getattr(request, 'user_id', None),
+            'tenant_id': getattr(request, 'tenant_id', None),
+            'is_super_admin': getattr(request, 'is_super_admin', None),
+            'permissions': getattr(request, 'permissions', None),
+            'enabled_modules': getattr(request, 'enabled_modules', None),
+        }
+        logger.debug(f"JWTAuthentication - Decoded JWT attributes: {jwt_data}")
 
         # Return a tuple of (user, auth)
         # We use user_id as the user object since we don't use Django's User model
@@ -310,40 +324,55 @@ class HasCRMPermission:
             bool: True if permission granted
         """
         # Super admins bypass all permission checks
-        if getattr(request, 'is_super_admin', False):
+        is_super_admin = getattr(request, 'is_super_admin', False)
+        logger.debug(f"Permission check - Key: {permission_key}, is_super_admin: {is_super_admin}, resource_owner: {resource_owner_id}")
+
+        if is_super_admin:
+            logger.debug(f"Permission granted: Super admin bypass for {permission_key}")
             return True
 
         # Check if request has permissions attribute (set by JWT middleware)
         if not hasattr(request, 'permissions'):
+            logger.debug(f"Permission denied: No permissions attribute on request for {permission_key}")
             return False
 
         # Get the permission value from nested structure
         permission_value = get_nested_permission(request.permissions, permission_key)
+        logger.debug(f"Permission value for {permission_key}: {permission_value}")
 
         # If permission not found, deny access
         if permission_value is None:
+            logger.debug(f"Permission denied: Permission key {permission_key} not found in JWT")
             return False
 
         # Handle boolean permissions (simple true/false)
         if isinstance(permission_value, bool):
+            logger.debug(f"Permission {'granted' if permission_value else 'denied'}: Boolean value for {permission_key}")
             return permission_value
 
         # Handle scope-based permissions (all, team, own)
         if isinstance(permission_value, str):
             if permission_value == "all":
+                logger.debug(f"Permission granted: 'all' scope for {permission_key}")
                 return True
             elif permission_value == "team":
                 # For now, allow team scope (team logic can be added later)
+                logger.debug(f"Permission granted: 'team' scope for {permission_key}")
                 return True
             elif permission_value == "own":
                 # Check if resource belongs to the user
                 if resource_owner_id is None:
                     # No owner specified, allow (for create operations)
+                    logger.debug(f"Permission granted: 'own' scope for {permission_key} (no owner specified)")
                     return True
                 # Check if the resource owner matches the current user
-                return str(resource_owner_id) == str(getattr(request, 'user_id', None))
+                user_id = getattr(request, 'user_id', None)
+                matches = str(resource_owner_id) == str(user_id)
+                logger.debug(f"Permission {'granted' if matches else 'denied'}: 'own' scope - owner: {resource_owner_id}, user: {user_id}")
+                return matches
 
         # Unknown permission type, deny access
+        logger.debug(f"Permission denied: Unknown permission type '{type(permission_value)}' for {permission_key}")
         return False
 
 
