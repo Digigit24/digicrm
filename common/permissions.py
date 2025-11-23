@@ -197,10 +197,134 @@ def get_nested_permission(permissions, path):
     return current
 
 
+class HasCRMPermission:
+    """
+    DRF Permission class for CRM module
+    Works with JWT permissions set by middleware
+
+    Usage in ViewSet:
+        permission_classes = [HasCRMPermission]
+        permission_resource = 'leads'  # or 'activities', 'statuses', etc.
+    """
+
+    # Map DRF actions to permission types
+    ACTION_PERMISSION_MAP = {
+        'list': 'view',
+        'retrieve': 'view',
+        'create': 'create',
+        'update': 'edit',
+        'partial_update': 'edit',
+        'destroy': 'delete',
+    }
+
+    def has_permission(self, request, view):
+        """
+        Check if user has permission to perform the action on the resource
+        """
+        # Get the resource and action from the view
+        resource = getattr(view, 'permission_resource', None)
+        if not resource:
+            # No permission resource defined, allow by default
+            return True
+
+        # Get the action (list, create, retrieve, etc.)
+        action = view.action
+        if not action:
+            # No action defined, allow by default
+            return True
+
+        # Map action to permission type
+        permission_type = self.ACTION_PERMISSION_MAP.get(action)
+        if not permission_type:
+            # Unknown action, allow by default (custom actions should handle their own perms)
+            return True
+
+        # Build permission key
+        permission_key = f"crm.{resource}.{permission_type}"
+
+        # Check permission
+        return self._check_permission(request, permission_key)
+
+    def has_object_permission(self, request, view, obj):
+        """
+        Check if user has permission to perform the action on this specific object
+        """
+        # Get the resource and action from the view
+        resource = getattr(view, 'permission_resource', None)
+        if not resource:
+            return True
+
+        action = view.action
+        if not action:
+            return True
+
+        # Map action to permission type
+        permission_type = self.ACTION_PERMISSION_MAP.get(action)
+        if not permission_type:
+            return True
+
+        # Build permission key
+        permission_key = f"crm.{resource}.{permission_type}"
+
+        # Get the owner ID from the object
+        owner_id = getattr(obj, 'owner_user_id', None)
+
+        # Check permission with owner context
+        return self._check_permission(request, permission_key, owner_id)
+
+    def _check_permission(self, request, permission_key, resource_owner_id=None):
+        """
+        Internal method to check permissions using JWT data
+
+        Args:
+            request: Django request object with JWT attributes
+            permission_key: Full permission key (e.g., 'crm.leads.view')
+            resource_owner_id: UUID of resource owner (for 'own' scope checks)
+
+        Returns:
+            bool: True if permission granted
+        """
+        # Check if request has permissions attribute (set by JWT middleware)
+        if not hasattr(request, 'permissions'):
+            return False
+
+        # Get the permission value from nested structure
+        permission_value = get_nested_permission(request.permissions, permission_key)
+
+        # If permission not found, deny access
+        if permission_value is None:
+            return False
+
+        # Handle boolean permissions (simple true/false)
+        if isinstance(permission_value, bool):
+            return permission_value
+
+        # Handle scope-based permissions (all, team, own)
+        if isinstance(permission_value, str):
+            if permission_value == "all":
+                return True
+            elif permission_value == "team":
+                # For now, allow team scope (team logic can be added later)
+                return True
+            elif permission_value == "own":
+                # Check if resource belongs to the user
+                if resource_owner_id is None:
+                    # No owner specified, allow (for create operations)
+                    return True
+                # Check if the resource owner matches the current user
+                return str(resource_owner_id) == str(getattr(request, 'user_id', None))
+
+        # Unknown permission type, deny access
+        return False
+
+
 class CRMPermissionMixin:
     """
     Mixin for CRM ViewSets to add permission checking
     Handles nested permission structure from JWT
+
+    DEPRECATED: Use HasCRMPermission permission class instead
+    This mixin is kept for backwards compatibility
     """
     # Map of actions to permission keys
     # Should be overridden in each ViewSet
@@ -225,38 +349,6 @@ class CRMPermissionMixin:
             return None
 
         return f"crm.{self.permission_resource}.{permission_action}"
-
-    def check_permissions(self, request):
-        """Override to check CRM permissions"""
-        super().check_permissions(request)
-
-        # Get permission key for current action
-        permission_key = self.get_permission_key(self.action)
-
-        if permission_key:
-            if not self._has_crm_permission(request, permission_key):
-                from rest_framework.exceptions import PermissionDenied
-                raise PermissionDenied({
-                    "error": "Permission denied",
-                    "detail": f"You don't have permission to {self.action} {self.permission_resource}"
-                })
-
-    def check_object_permissions(self, request, obj):
-        """Override to check object-level CRM permissions"""
-        super().check_object_permissions(request, obj)
-
-        # For update/delete operations, check with resource owner
-        if self.action in ['update', 'partial_update', 'destroy', 'retrieve']:
-            permission_key = self.get_permission_key(self.action)
-
-            if permission_key:
-                owner_id = getattr(obj, 'owner_user_id', None)
-                if not self._has_crm_permission(request, permission_key, owner_id):
-                    from rest_framework.exceptions import PermissionDenied
-                    raise PermissionDenied({
-                        "error": "Permission denied",
-                        "detail": f"You don't have permission to {self.action} this {self.permission_resource}"
-                    })
 
     def get_queryset(self):
         """Override to filter queryset based on view permissions"""
