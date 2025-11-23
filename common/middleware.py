@@ -87,15 +87,16 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
             # Get JWT settings from Django settings
             secret_key = getattr(settings, 'JWT_SECRET_KEY', None)
             algorithm = getattr(settings, 'JWT_ALGORITHM', 'HS256')
-            
+
             if not secret_key:
                 return JsonResponse(
                     {'error': 'JWT_SECRET_KEY not configured'},
                     status=500
                 )
-            
+
             # Decode JWT token with leeway for clock skew tolerance (30 seconds)
             payload = jwt.decode(token, secret_key, algorithms=[algorithm], leeway=30)
+            logger.debug(f"JWT Middleware - Token decoded successfully. Payload keys: {list(payload.keys())}")
             
         except jwt.ExpiredSignatureError:
             return JsonResponse(
@@ -123,12 +124,17 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         
         # Check if CRM module is enabled
         enabled_modules = payload.get('enabled_modules', [])
+        logger.debug(f"JWT Middleware - Enabled modules: {enabled_modules}")
+        logger.debug(f"JWT Middleware - Is super admin: {payload.get('is_super_admin')}")
+        logger.debug(f"JWT Middleware - Permissions: {payload.get('permissions')}")
+
         if 'crm' not in enabled_modules:
+            logger.warning(f"JWT Middleware - CRM module not enabled. enabled_modules={enabled_modules}")
             return JsonResponse(
                 {'error': 'CRM module not enabled for this user'},
                 status=403
             )
-        
+
         # Set request attributes from JWT payload
         request.user_id = payload['user_id']
         request.email = payload['email']
@@ -137,6 +143,9 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         request.is_super_admin = payload['is_super_admin']
         request.permissions = payload['permissions']
         request.enabled_modules = payload['enabled_modules']
+
+        logger.debug(f"JWT Middleware - Request attributes set: user_id={request.user_id}, is_super_admin={request.is_super_admin}")
+        logger.debug(f"JWT Middleware - hasattr(request, 'permissions'): {hasattr(request, 'permissions')}")
         
         # Check for additional tenant headers as fallback/override
         tenant_token_header = request.META.get('HTTP_TENANTTOKEN')
