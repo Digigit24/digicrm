@@ -7,12 +7,12 @@ from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Count, Q
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
-    LeadCustomField, LeadFieldVisibility
+    LeadFieldConfiguration
 )
 from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
     LeadActivitySerializer, LeadOrderSerializer,
-    LeadCustomFieldSerializer, LeadFieldVisibilitySerializer
+    LeadFieldConfigurationSerializer
 )
 from common.mixins import TenantViewSetMixin
 from common.permissions import (
@@ -297,51 +297,92 @@ class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
     ordering = ['status', 'position']
 
 
-@extend_schema_view(
-    list=extend_schema(description='List all custom fields for leads'),
-    retrieve=extend_schema(description='Retrieve a specific custom field'),
-    create=extend_schema(description='Create a new custom field'),
-    update=extend_schema(description='Update a custom field'),
-    partial_update=extend_schema(description='Partially update a custom field'),
-    destroy=extend_schema(description='Delete a custom field'),
-)
-class LeadCustomFieldViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
+# @extend_schema_view(
+#     list=extend_schema(description='List all lead field configurations'),
+#     retrieve=extend_schema(description='Retrieve a specific lead field configuration'),
+#     create=extend_schema(description='Create a new lead field configuration'),
+#     update=extend_schema(description='Update a lead field configuration'),
+#     partial_update=extend_schema(description='Partially update a lead field configuration'),
+#     destroy=extend_schema(description='Delete a lead field configuration'),
+# )
+class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Lead Custom Fields
+    ViewSet for managing Lead Field Configurations.
+    Handles both standard Lead model fields and custom fields in a unified API.
+    
+    Standard fields: Pre-defined Lead model fields (visibility, display order)
+    Custom fields: Dynamic fields stored in Lead.metadata JSON
+    
     Requires: crm.settings permissions (admin-level)
     """
-    queryset = LeadCustomField.objects.all()
-    serializer_class = LeadCustomFieldSerializer
+    queryset = LeadFieldConfiguration.objects.all()
+    serializer_class = LeadFieldConfigurationSerializer
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'settings'  # Requires admin settings permission
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['field_type', 'is_required', 'is_active']
+    filterset_fields = ['field_type', 'is_required', 'is_active', 'is_visible', 'is_standard']
     search_fields = ['field_name', 'field_label', 'help_text']
     ordering_fields = ['display_order', 'field_label', 'created_at']
     ordering = ['display_order', 'field_label']
 
+    @extend_schema(
+        description='Get field schema organized by standard and custom fields',
+        responses={200: {
+            'type': 'object',
+            'properties': {
+                'standard_fields': {
+                    'type': 'array',
+                    'items': {'$ref': '#/components/schemas/LeadFieldConfiguration'}
+                },
+                'custom_fields': {
+                    'type': 'array',
+                    'items': {'$ref': '#/components/schemas/LeadFieldConfiguration'}
+                }
+            }
+        }}
+    )
+    @action(detail=False, methods=['get'])
+    def schema(self, request):
+        """
+        Get field schema organized by standard and custom fields.
+        Returns a structured response with both standard and custom fields separated.
+        Requires: crm.settings.view permission
+        """
+        try:
+            # Check permission
+            if not self._has_crm_permission(request, 'crm.settings.view'):
+                raise PermissionDenied({
+                    "error": "Permission denied",
+                    "detail": "You don't have permission to view field configurations"
+                })
 
-@extend_schema_view(
-    list=extend_schema(description='List field visibility settings'),
-    retrieve=extend_schema(description='Retrieve a specific field visibility setting'),
-    create=extend_schema(description='Create a new field visibility setting'),
-    update=extend_schema(description='Update a field visibility setting'),
-    partial_update=extend_schema(description='Partially update a field visibility setting'),
-    destroy=extend_schema(description='Delete a field visibility setting'),
-)
-class LeadFieldVisibilityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
-    """
-    ViewSet for managing Lead Field Visibility
-    Requires: crm.settings permissions (admin-level)
-    """
-    queryset = LeadFieldVisibility.objects.all()
-    serializer_class = LeadFieldVisibilitySerializer
-    authentication_classes = [JWTAuthentication]
-    permission_classes = [HasCRMPermission]
-    permission_resource = 'settings'  # Requires admin settings permission
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['is_visible']
-    search_fields = ['field_name']
-    ordering_fields = ['display_order', 'field_name']
-    ordering = ['display_order', 'field_name']
+            logger.info(f"Field schema requested by tenant: {request.tenant_id}")
+
+            # Get all field configurations for the tenant
+            all_fields = LeadFieldConfiguration.objects.filter(
+                tenant_id=request.tenant_id,
+                is_active=True
+            ).order_by('display_order', 'field_label')
+
+            # Separate standard and custom fields
+            standard_fields = all_fields.filter(is_standard=True)
+            custom_fields = all_fields.filter(is_standard=False)
+
+            # Serialize
+            standard_serializer = LeadFieldConfigurationSerializer(standard_fields, many=True)
+            custom_serializer = LeadFieldConfigurationSerializer(custom_fields, many=True)
+
+            return Response({
+                'standard_fields': standard_serializer.data,
+                'custom_fields': custom_serializer.data
+            })
+
+        except PermissionDenied:
+            raise
+        except Exception as e:
+            logger.error(f"Error in schema view: {str(e)}")
+            return Response(
+                {'error': 'Failed to fetch field schema'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

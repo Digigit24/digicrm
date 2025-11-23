@@ -154,6 +154,16 @@ class TenantModelAdmin(admin.ModelAdmin):
     Base ModelAdmin class that automatically filters by tenant_id
     """
     
+    def get_exclude(self, request, obj=None):
+        """
+        Exclude tenant_id from the form - it will be set automatically
+        """
+        exclude = list(super().get_exclude(request, obj) or [])
+        if hasattr(self.model, 'tenant_id'):
+            if 'tenant_id' not in exclude:
+                exclude.append('tenant_id')
+        return exclude
+    
     def get_queryset(self, request):
         """
         Filter queryset by tenant_id from request

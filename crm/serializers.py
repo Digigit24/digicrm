@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
-    LeadCustomField, LeadFieldVisibility
+    LeadFieldConfiguration
 )
 from common.mixins import TenantMixin
 
@@ -71,15 +71,19 @@ class LeadListSerializer(TenantMixin):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
-class LeadCustomFieldSerializer(TenantMixin):
-    """Serializer for LeadCustomField model"""
+class LeadFieldConfigurationSerializer(TenantMixin):
+    """
+    Unified serializer for Lead field configurations.
+    Handles both standard Lead model fields and custom fields.
+    """
 
     class Meta:
-        model = LeadCustomField
+        model = LeadFieldConfiguration
         fields = [
-            'id', 'field_name', 'field_label', 'field_type', 'is_required',
-            'default_value', 'options', 'placeholder', 'help_text',
-            'display_order', 'is_active', 'created_at', 'updated_at'
+            'id', 'field_name', 'field_label', 'is_standard', 'field_type',
+            'is_visible', 'is_required', 'is_active', 'default_value',
+            'options', 'placeholder', 'help_text', 'display_order',
+            'validation_rules', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -89,51 +93,60 @@ class LeadCustomFieldSerializer(TenantMixin):
             raise serializers.ValidationError(
                 "Field name must contain only letters, numbers, and underscores"
             )
-        if value[0].isdigit():
+        if value and value[0].isdigit():
             raise serializers.ValidationError(
                 "Field name cannot start with a number"
             )
         return value.lower()
 
     def validate(self, data):
-        """Validate dropdown/multiselect fields have options"""
+        """Validate field configuration based on type and category"""
+        is_standard = data.get('is_standard', False)
         field_type = data.get('field_type')
+        field_name = data.get('field_name')
         options = data.get('options')
 
-        if field_type in ['DROPDOWN', 'MULTISELECT']:
-            if not options or not isinstance(options, list) or len(options) == 0:
+        # Standard fields validation
+        if is_standard:
+            valid_standard_fields = [
+                'name', 'phone', 'email', 'company', 'title', 'status',
+                'priority', 'value_amount', 'value_currency', 'source',
+                'owner_user_id', 'assigned_to', 'last_contacted_at',
+                'next_follow_up_at', 'notes', 'address_line1', 'address_line2',
+                'city', 'state', 'country', 'postal_code'
+            ]
+
+            if field_name and field_name not in valid_standard_fields:
                 raise serializers.ValidationError({
-                    'options': 'Dropdown and multiselect fields must have at least one option'
+                    'field_name': f"'{field_name}' is not a valid Lead model field. "
+                                f"Valid fields: {', '.join(valid_standard_fields)}"
                 })
+            
+            # Standard fields don't need field_type specified (it's predetermined)
+            # But we can allow it for informational purposes
+
+        # Custom fields validation
+        else:
+            # Custom fields must have a field_type
+            if not field_type:
+                raise serializers.ValidationError({
+                    'field_type': 'Custom fields must have a field_type specified'
+                })
+
+            # Dropdown/multiselect fields must have options
+            if field_type in ['DROPDOWN', 'MULTISELECT']:
+                if not options or not isinstance(options, list) or len(options) == 0:
+                    raise serializers.ValidationError({
+                        'options': 'Dropdown and multiselect fields must have at least one option'
+                    })
 
         return data
 
-
-class LeadFieldVisibilitySerializer(TenantMixin):
-    """Serializer for LeadFieldVisibility model"""
-
-    class Meta:
-        model = LeadFieldVisibility
-        fields = [
-            'id', 'field_name', 'is_visible', 'display_order',
-            'created_at', 'updated_at'
-        ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
-
-    def validate_field_name(self, value):
-        """Validate field_name is a valid Lead model field"""
-        valid_fields = [
-            'name', 'phone', 'email', 'company', 'title', 'status',
-            'priority', 'value_amount', 'value_currency', 'source',
-            'owner_user_id', 'assigned_to', 'last_contacted_at',
-            'next_follow_up_at', 'notes', 'address_line1', 'address_line2',
-            'city', 'state', 'country', 'postal_code'
-        ]
-
-        if value not in valid_fields:
-            raise serializers.ValidationError(
-                f"'{value}' is not a valid Lead model field. "
-                f"Valid fields: {', '.join(valid_fields)}"
-            )
-
-        return value
+    def to_representation(self, instance):
+        """Add computed fields to the representation"""
+        representation = super().to_representation(instance)
+        
+        # Add a category field for easier frontend filtering
+        representation['category'] = 'standard' if instance.is_standard else 'custom'
+        
+        return representation

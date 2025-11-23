@@ -13,8 +13,25 @@ class ActivityTypeEnum(models.TextChoices):
     EMAIL = 'EMAIL', 'Email'
     MEETING = 'MEETING', 'Meeting'
     NOTE = 'NOTE', 'Note'
+    
     SMS = 'SMS', 'SMS'
     OTHER = 'OTHER', 'Other'
+
+
+class FieldTypeEnum(models.TextChoices):
+    TEXT = 'TEXT', 'Text'
+    NUMBER = 'NUMBER', 'Number'
+    EMAIL = 'EMAIL', 'Email'
+    PHONE = 'PHONE', 'Phone'
+    DATE = 'DATE', 'Date'
+    DATETIME = 'DATETIME', 'Date Time'
+    DROPDOWN = 'DROPDOWN', 'Dropdown'
+    MULTISELECT = 'MULTISELECT', 'Multi Select'
+    CHECKBOX = 'CHECKBOX', 'Checkbox'
+    URL = 'URL', 'URL'
+    TEXTAREA = 'TEXTAREA', 'Text Area'
+    DECIMAL = 'DECIMAL', 'Decimal'
+    CURRENCY = 'CURRENCY', 'Currency'
 
 
 class LeadStatus(models.Model):
@@ -173,87 +190,80 @@ class LeadOrder(models.Model):
         return f"{self.lead.name} - {self.status.name} - Position: {self.position}"
 
 
-class FieldTypeEnum(models.TextChoices):
-    TEXT = 'TEXT', 'Text'
-    NUMBER = 'NUMBER', 'Number'
-    EMAIL = 'EMAIL', 'Email'
-    PHONE = 'PHONE', 'Phone'
-    DATE = 'DATE', 'Date'
-    DATETIME = 'DATETIME', 'Date Time'
-    DROPDOWN = 'DROPDOWN', 'Dropdown'
-    MULTISELECT = 'MULTISELECT', 'Multi Select'
-    CHECKBOX = 'CHECKBOX', 'Checkbox'
-    URL = 'URL', 'URL'
-    TEXTAREA = 'TEXTAREA', 'Text Area'
-
-
-class LeadCustomField(models.Model):
-    """Custom field definitions for leads per tenant"""
+class LeadFieldConfiguration(models.Model):
+    """
+    Unified model for managing both standard Lead fields and custom fields.
+    Standard fields are pre-defined Lead model fields with visibility/display settings.
+    Custom fields are dynamic fields stored in Lead.metadata JSON.
+    """
     id = models.BigAutoField(primary_key=True)
     tenant_id = models.UUIDField(db_index=True)
-    field_name = models.TextField(help_text='Internal field name (key)')
+    
+    # Field identification
+    field_name = models.TextField(help_text='Field name/key (must be unique per tenant)')
     field_label = models.TextField(help_text='Display label for the field')
+    
+    # Field classification
+    is_standard = models.BooleanField(
+        default=False,
+        help_text='True if this is a standard Lead model field, False if custom field'
+    )
+    
+    # Field type (only applicable for custom fields)
     field_type = models.CharField(
         max_length=20,
         choices=FieldTypeEnum.choices,
-        default=FieldTypeEnum.TEXT
+        default=FieldTypeEnum.TEXT,
+        null=True,
+        blank=True,
+        help_text='Data type for custom fields'
     )
-    is_required = models.BooleanField(default=False)
-    default_value = models.TextField(null=True, blank=True)
+    
+    # Visibility and requirements
+    is_visible = models.BooleanField(default=True, help_text='Whether field is visible in UI')
+    is_required = models.BooleanField(default=False, help_text='Whether field is required')
+    is_active = models.BooleanField(default=True, help_text='Whether field is active')
+    
+    # Field configuration
+    default_value = models.TextField(null=True, blank=True, help_text='Default value for the field')
     options = models.JSONField(
         null=True,
         blank=True,
         help_text='Options for dropdown/multiselect fields (array of strings)'
     )
-    placeholder = models.TextField(null=True, blank=True)
-    help_text = models.TextField(null=True, blank=True)
-    display_order = models.IntegerField(default=0)
-    is_active = models.BooleanField(default=True)
+    placeholder = models.TextField(null=True, blank=True, help_text='Placeholder text')
+    help_text = models.TextField(null=True, blank=True, help_text='Help text for the field')
+    
+    # Display settings
+    display_order = models.IntegerField(default=0, help_text='Order in which field appears')
+    
+    # Validation rules (JSON for flexibility)
+    validation_rules = models.JSONField(
+        null=True,
+        blank=True,
+        help_text='Custom validation rules (min, max, pattern, etc.)'
+    )
+    
+    # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = 'lead_custom_fields'
+        db_table = 'lead_field_configurations'
         ordering = ['display_order', 'field_label']
         indexes = [
-            models.Index(fields=['tenant_id'], name='idx_lead_custom_fields_tenant'),
-            models.Index(fields=['tenant_id', 'is_active'], name='idx_lead_custom_fields_active'),
-            models.Index(fields=['display_order'], name='idx_lead_custom_fields_order'),
+            models.Index(fields=['tenant_id'], name='idx_lead_field_config_tenant'),
+            models.Index(fields=['tenant_id', 'is_active'], name='idx_lead_field_config_active'),
+            models.Index(fields=['tenant_id', 'is_standard'], name='idx_lead_field_config_standard'),
+            models.Index(fields=['display_order'], name='idx_lead_field_config_order'),
         ]
         constraints = [
             models.UniqueConstraint(
                 fields=['tenant_id', 'field_name'],
-                name='unique_custom_field_per_tenant'
+                name='unique_field_config_per_tenant'
             )
         ]
 
     def __str__(self):
-        return f"{self.field_label} ({self.field_type})"
-
-
-class LeadFieldVisibility(models.Model):
-    """Controls visibility of standard Lead model fields per tenant"""
-    id = models.BigAutoField(primary_key=True)
-    tenant_id = models.UUIDField(db_index=True)
-    field_name = models.TextField(help_text='Standard field name from Lead model')
-    is_visible = models.BooleanField(default=True)
-    display_order = models.IntegerField(default=0)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = 'lead_field_visibility'
-        ordering = ['display_order', 'field_name']
-        indexes = [
-            models.Index(fields=['tenant_id'], name='idx_lead_field_vis_tenant'),
-            models.Index(fields=['tenant_id', 'is_visible'], name='idx_lead_field_vis_visible'),
-        ]
-        constraints = [
-            models.UniqueConstraint(
-                fields=['tenant_id', 'field_name'],
-                name='unique_field_visibility_per_tenant'
-            )
-        ]
-
-    def __str__(self):
-        return f"{self.field_name} - {'Visible' if self.is_visible else 'Hidden'}"
+        field_category = "Standard" if self.is_standard else "Custom"
+        return f"{field_category}: {self.field_label} ({self.field_name})"
