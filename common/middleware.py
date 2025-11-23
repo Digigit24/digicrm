@@ -59,7 +59,8 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         set_current_request(request)
 
         # Skip validation for public paths
-        if any(request.path.startswith(path) for path in self.PUBLIC_PATHS):
+        # Special case: exact match for root path '/'
+        if request.path == '/' or any(request.path.startswith(path) for path in self.PUBLIC_PATHS if path != '/'):
             logger.debug(f"JWT Middleware - Skipping public path: {request.path}")
             return None
 
