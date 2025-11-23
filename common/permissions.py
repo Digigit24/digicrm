@@ -1,6 +1,31 @@
 from functools import wraps
 from django.http import JsonResponse
 from rest_framework.response import Response
+from rest_framework.authentication import BaseAuthentication
+
+
+class JWTAuthentication(BaseAuthentication):
+    """
+    DRF Authentication class that works with JWT middleware
+
+    The JWT middleware already validates the token and sets request attributes.
+    This authentication class just marks the request as authenticated for DRF.
+    """
+
+    def authenticate(self, request):
+        """
+        Authenticate the request using JWT data from middleware
+
+        Returns:
+            tuple: (user_id, auth_data) or None if not authenticated
+        """
+        # Check if JWT middleware has set the user_id
+        if not hasattr(request, 'user_id'):
+            return None
+
+        # Return a tuple of (user, auth)
+        # We use user_id as the user object since we don't use Django's User model
+        return (request.user_id, None)
 
 
 def check_permission(request, permission_key, resource_owner_id=None, resource_team_id=None):

@@ -15,7 +15,10 @@ from .serializers import (
     LeadCustomFieldSerializer, LeadFieldVisibilitySerializer
 )
 from common.mixins import TenantViewSetMixin
-from common.permissions import CRMPermissionMixin, HasCRMPermission, get_nested_permission
+from common.permissions import (
+    CRMPermissionMixin, HasCRMPermission,
+    JWTAuthentication, get_nested_permission
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,7 @@ class LeadStatusViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVi
     """
     queryset = LeadStatus.objects.all()
     serializer_class = LeadStatusSerializer
+    authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'statuses'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -59,6 +63,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
     Requires: crm.leads permissions
     """
     queryset = Lead.objects.select_related('status').prefetch_related('activities')
+    authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'leads'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -208,6 +213,7 @@ class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Model
     """
     queryset = LeadActivity.objects.select_related('lead')
     serializer_class = LeadActivitySerializer
+    authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'activities'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -282,6 +288,7 @@ class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
     """
     queryset = LeadOrder.objects.select_related('lead', 'status')
     serializer_class = LeadOrderSerializer
+    authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'leads'  # Use leads permissions since this controls lead positioning
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
@@ -305,6 +312,7 @@ class LeadCustomFieldViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Mo
     """
     queryset = LeadCustomField.objects.all()
     serializer_class = LeadCustomFieldSerializer
+    authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'settings'  # Requires admin settings permission
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -329,6 +337,7 @@ class LeadFieldVisibilityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewset
     """
     queryset = LeadFieldVisibility.objects.all()
     serializer_class = LeadFieldVisibilitySerializer
+    authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'settings'  # Requires admin settings permission
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
