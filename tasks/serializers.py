@@ -6,14 +6,14 @@ from common.mixins import TenantMixin
 class TaskSerializer(TenantMixin):
     """Serializer for Task model"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
-    
+
     class Meta:
         model = Task
         fields = [
             'id', 'lead', 'lead_name', 'title', 'description', 'status',
             'priority', 'due_date', 'assignee_user_id', 'reporter_user_id',
-            'checklist', 'attachments_count', 'created_at', 'updated_at',
-            'completed_at'
+            'owner_user_id', 'checklist', 'attachments_count', 'created_at',
+            'updated_at', 'completed_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at', 'completed_at']
 

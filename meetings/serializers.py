@@ -6,13 +6,13 @@ from common.mixins import TenantMixin
 class MeetingSerializer(TenantMixin):
     """Serializer for Meeting model"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
-    
+
     class Meta:
         model = Meeting
         fields = [
             'id', 'lead', 'lead_name', 'title', 'location',
             'description', 'notes', 'start_at', 'end_at',
-            'created_at', 'updated_at'
+            'owner_user_id', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 

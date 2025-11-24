@@ -1,6 +1,7 @@
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from django.db.models import Q
@@ -8,6 +9,9 @@ from datetime import datetime, date, timedelta
 from .models import Meeting
 from .serializers import MeetingSerializer, MeetingListSerializer
 from common.mixins import TenantViewSetMixin
+from common.permissions import (
+    CRMPermissionMixin, HasCRMPermission, JWTAuthentication
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,11 +25,16 @@ logger = logging.getLogger(__name__)
     partial_update=extend_schema(description='Partially update a meeting'),
     destroy=extend_schema(description='Delete a meeting'),
 )
-class MeetingViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class MeetingViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Meetings
+    Requires: crm.meetings permissions
     """
     queryset = Meeting.objects.select_related('lead')
+    serializer_class = MeetingSerializer
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_resource = 'meetings'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = {
         'lead': ['exact'],
@@ -42,6 +51,22 @@ class MeetingViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         if self.action == 'list':
             return MeetingListSerializer
         return MeetingSerializer
+
+    def perform_create(self, serializer):
+        """Auto-set owner_user_id to current user if not provided"""
+        # Set owner_user_id to current user if not provided in request data
+        owner_user_id = serializer.validated_data.get('owner_user_id')
+        if not owner_user_id:
+            owner_user_id = self.request.user_id
+            logger.debug(f"Auto-setting owner_user_id to {owner_user_id}")
+
+        # Call parent which sets tenant_id, and also pass owner_user_id
+        super().perform_create(serializer)
+
+        # Update owner_user_id if it wasn't set
+        if not serializer.validated_data.get('owner_user_id'):
+            serializer.instance.owner_user_id = owner_user_id
+            serializer.instance.save()
 
     @extend_schema(
         description='Get meetings organized by date for calendar view',
@@ -94,8 +119,16 @@ class MeetingViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         """
         Get meetings organized by date for calendar view
         Supports filtering by date range or specific month
+        Requires: crm.meetings.view permission
         """
         try:
+            # Check permission for viewing meetings
+            if not self._has_crm_permission(request, 'crm.meetings.view'):
+                raise PermissionDenied({
+                    "error": "Permission denied",
+                    "detail": "You don't have permission to view meetings"
+                })
+
             logger.info(f"Calendar view requested by tenant: {request.tenant_id}")
             
             # Parse query parameters
@@ -166,7 +199,9 @@ class MeetingViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                     'end_date': (end_date - timedelta(days=1)).isoformat()
                 }
             })
-            
+
+        except PermissionDenied:
+            raise
         except Exception as e:
             logger.error(f"Error in calendar view: {str(e)}")
             return Response(
