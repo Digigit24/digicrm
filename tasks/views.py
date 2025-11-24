@@ -55,17 +55,19 @@ class TaskViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         return TaskSerializer
 
     def perform_create(self, serializer):
-        """Auto-set owner_user_id to current user if not provided"""
-        # Set owner_user_id to current user if not provided in request data
+        """Auto-set owner_user_id and tenant_id when creating tasks"""
+        # Get tenant_id from request (set by middleware)
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'tenant_id': 'Tenant ID is required'})
+
+        # Set owner_user_id to current user if not provided
         owner_user_id = serializer.validated_data.get('owner_user_id')
         if not owner_user_id:
             owner_user_id = self.request.user_id
             logger.debug(f"Auto-setting owner_user_id to {owner_user_id}")
 
-        # Call parent which sets tenant_id, and also pass owner_user_id
-        super().perform_create(serializer)
-
-        # Update owner_user_id if it wasn't set
-        if not serializer.validated_data.get('owner_user_id'):
-            serializer.instance.owner_user_id = owner_user_id
-            serializer.instance.save()
+        # Save with both tenant_id and owner_user_id
+        logger.debug(f"Creating task with tenant_id={tenant_id}, owner_user_id={owner_user_id}")
+        serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
