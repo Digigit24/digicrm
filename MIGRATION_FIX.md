@@ -82,7 +82,13 @@ CHECK (field_type IN ('TEXT', 'NUMBER', 'EMAIL', 'PHONE', 'DATE', 'DATETIME',
 ## Additional Fixes Applied
 
 ### Swagger Documentation
-Fixed the swagger/OpenAPI documentation for the `LeadFieldConfigurationViewSet` by uncommenting the `@extend_schema_view` decorator in `crm/views.py`. This ensures proper API documentation is generated for all CRUD operations on lead field configurations.
+Fixed the swagger/OpenAPI documentation for the `LeadFieldConfigurationViewSet` in `crm/views.py`.
+
+**Initial Fix:** Uncommented the `@extend_schema_view` decorator to add operation descriptions.
+
+**Final Fix:** Removed the `@extend_schema_view` decorator due to compatibility issues with some versions of drf-spectacular and replaced it with comprehensive docstring documentation. The operations are now documented in the class docstring, and drf-spectacular will automatically generate proper OpenAPI documentation from the ViewSet structure and docstrings.
+
+This ensures proper API documentation is generated for all CRUD operations on lead field configurations without decorator-related import errors.
 
 ## Verification
 

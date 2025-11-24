@@ -297,23 +297,23 @@ class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
     ordering = ['status', 'position']
 
 
-@extend_schema_view(
-    list=extend_schema(description='List all lead field configurations'),
-    retrieve=extend_schema(description='Retrieve a specific lead field configuration'),
-    create=extend_schema(description='Create a new lead field configuration'),
-    update=extend_schema(description='Update a lead field configuration'),
-    partial_update=extend_schema(description='Partially update a lead field configuration'),
-    destroy=extend_schema(description='Delete a lead field configuration'),
-)
 class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Field Configurations.
     Handles both standard Lead model fields and custom fields in a unified API.
-    
+
     Standard fields: Pre-defined Lead model fields (visibility, display order)
     Custom fields: Dynamic fields stored in Lead.metadata JSON
-    
+
     Requires: crm.settings permissions (admin-level)
+
+    Operations:
+    - list: List all lead field configurations
+    - retrieve: Retrieve a specific lead field configuration
+    - create: Create a new lead field configuration
+    - update: Update a lead field configuration
+    - partial_update: Partially update a lead field configuration
+    - destroy: Delete a lead field configuration
     """
     queryset = LeadFieldConfiguration.objects.all()
     serializer_class = LeadFieldConfigurationSerializer
