@@ -4,6 +4,12 @@ from drf_spectacular.utils import extend_schema, extend_schema_view
 from .models import Task
 from .serializers import TaskSerializer, TaskListSerializer
 from common.mixins import TenantViewSetMixin
+from common.permissions import (
+    CRMPermissionMixin, HasCRMPermission, JWTAuthentication
+)
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @extend_schema_view(
@@ -14,11 +20,16 @@ from common.mixins import TenantViewSetMixin
     partial_update=extend_schema(description='Partially update a task'),
     destroy=extend_schema(description='Delete a task'),
 )
-class TaskViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+class TaskViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Tasks
+    Requires: crm.tasks permissions
     """
     queryset = Task.objects.select_related('lead')
+    serializer_class = TaskSerializer
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_resource = 'tasks'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = {
         'lead': ['exact'],
@@ -42,3 +53,21 @@ class TaskViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         if self.action == 'list':
             return TaskListSerializer
         return TaskSerializer
+
+    def perform_create(self, serializer):
+        """Auto-set owner_user_id and tenant_id when creating tasks"""
+        # Get tenant_id from request (set by middleware)
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'tenant_id': 'Tenant ID is required'})
+
+        # Set owner_user_id to current user if not provided
+        owner_user_id = serializer.validated_data.get('owner_user_id')
+        if not owner_user_id:
+            owner_user_id = self.request.user_id
+            logger.debug(f"Auto-setting owner_user_id to {owner_user_id}")
+
+        # Save with both tenant_id and owner_user_id
+        logger.debug(f"Creating task with tenant_id={tenant_id}, owner_user_id={owner_user_id}")
+        serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
