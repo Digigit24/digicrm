@@ -326,7 +326,6 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
     search_fields = ['field_name', 'field_label', 'help_text']
     ordering_fields = ['display_order', 'field_label', 'created_at']
     ordering = ['display_order', 'field_label']
-    schema = AutoSchema()  # Explicitly use drf-spectacular AutoSchema
 
     @extend_schema(
         description='Get field schema organized by standard and custom fields',
@@ -345,11 +344,13 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
         }}
     )
     @action(detail=False, methods=['get'])
-    def schema(self, request):
+    def field_schema(self, request):
         """
         Get field schema organized by standard and custom fields.
         Returns a structured response with both standard and custom fields separated.
         Requires: crm.settings.view permission
+
+        Accessible at: /api/crm/field-configurations/field_schema/
         """
         try:
             # Check permission
@@ -383,7 +384,7 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
         except PermissionDenied:
             raise
         except Exception as e:
-            logger.error(f"Error in schema view: {str(e)}")
+            logger.error(f"Error in field_schema view: {str(e)}")
             return Response(
                 {'error': 'Failed to fetch field schema'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
