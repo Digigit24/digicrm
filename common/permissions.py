@@ -415,6 +415,10 @@ class CRMPermissionMixin:
         if not hasattr(self, 'request') or not self.request:
             return queryset
 
+        # Super admins bypass all permission checks
+        if getattr(self.request, 'is_super_admin', False):
+            return queryset
+
         # Get view permission
         view_permission_key = f"crm.{self.permission_resource}.view"
         permission_value = get_nested_permission(
