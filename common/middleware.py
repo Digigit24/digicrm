@@ -48,6 +48,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/health/',
         '/api/schema.json',
         '/api/schema.yaml',
+        '/api/logs/',  # Logs endpoint - public for monitoring
     ]
     
     def process_request(self, request):
@@ -60,9 +61,21 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
 
         # Skip validation for public paths
         # Special case: exact match for root path '/'
-        if request.path == '/' or any(request.path.startswith(path) for path in self.PUBLIC_PATHS if path != '/'):
+        if request.path == '/':
             logger.debug(f"JWT Middleware - Skipping public path: {request.path}")
             return None
+
+        # Check if request path matches any public path (handle trailing slashes)
+        request_path_normalized = request.path.rstrip('/') + '/'
+        for public_path in self.PUBLIC_PATHS:
+            if public_path == '/':
+                continue
+            # Normalize public path for comparison
+            public_path_normalized = public_path.rstrip('/') + '/'
+            # Check if request path starts with public path (or matches exactly)
+            if request_path_normalized.startswith(public_path_normalized) or request.path == public_path.rstrip('/'):
+                logger.debug(f"JWT Middleware - Skipping public path: {request.path} (matched {public_path})")
+                return None
 
         # Get Authorization header
         auth_header = request.META.get('HTTP_AUTHORIZATION')
