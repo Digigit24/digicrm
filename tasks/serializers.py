@@ -6,6 +6,7 @@ from common.mixins import TenantMixin
 class TaskSerializer(TenantMixin):
     """Serializer for Task model"""
     lead_name = serializers.CharField(source='lead.name', read_only=True)
+    owner_user_id = serializers.UUIDField(required=False, allow_null=True)
 
     class Meta:
         model = Task
