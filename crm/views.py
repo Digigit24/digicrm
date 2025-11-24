@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
+from drf_spectacular.openapi import AutoSchema
 from django.db.models import Count, Q
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
@@ -325,6 +326,7 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
     search_fields = ['field_name', 'field_label', 'help_text']
     ordering_fields = ['display_order', 'field_label', 'created_at']
     ordering = ['display_order', 'field_label']
+    schema = AutoSchema()  # Explicitly use drf-spectacular AutoSchema
 
     @extend_schema(
         description='Get field schema organized by standard and custom fields',
