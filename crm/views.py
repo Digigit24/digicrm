@@ -297,14 +297,14 @@ class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
     ordering = ['status', 'position']
 
 
-# @extend_schema_view(
-#     list=extend_schema(description='List all lead field configurations'),
-#     retrieve=extend_schema(description='Retrieve a specific lead field configuration'),
-#     create=extend_schema(description='Create a new lead field configuration'),
-#     update=extend_schema(description='Update a lead field configuration'),
-#     partial_update=extend_schema(description='Partially update a lead field configuration'),
-#     destroy=extend_schema(description='Delete a lead field configuration'),
-# )
+@extend_schema_view(
+    list=extend_schema(description='List all lead field configurations'),
+    retrieve=extend_schema(description='Retrieve a specific lead field configuration'),
+    create=extend_schema(description='Create a new lead field configuration'),
+    update=extend_schema(description='Update a lead field configuration'),
+    partial_update=extend_schema(description='Partially update a lead field configuration'),
+    destroy=extend_schema(description='Delete a lead field configuration'),
+)
 class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
     ViewSet for managing Lead Field Configurations.
