@@ -29,6 +29,12 @@ class LeadActivitySerializer(TenantMixin):
         ]
         read_only_fields = ['id', 'created_at']
 
+    def to_representation(self, instance):
+        """Custom representation to include lead_id"""
+        representation = super().to_representation(instance)
+        representation['lead_id'] = instance.lead.id if instance.lead else None
+        return representation
+
 
 class LeadOrderSerializer(TenantMixin):
     """Serializer for LeadOrder model"""
