@@ -731,23 +731,15 @@ class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Model
     ordering_fields = ['happened_at', 'created_at']
     ordering = ['-happened_at']
 
-    def create(self, request, *args, **kwargs):
-        """Override create to log data for debugging"""
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        
-        # Log the serialized data for debugging
-        logger.debug(f"Serialized LeadActivity data: {serializer.data}")
-        
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
-
     def get_queryset(self):
         """Override to filter by by_user_id instead of owner_user_id"""
         queryset = TenantViewSetMixin.get_queryset(self)
 
         if not hasattr(self, 'request') or not self.request:
+            return queryset
+
+        # Super admins bypass all permission checks
+        if getattr(self.request, 'is_super_admin', False):
             return queryset
 
         # Get view permission
