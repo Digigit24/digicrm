@@ -75,8 +75,12 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Get connections for current tenant and user"""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            return Connection.objects.none()
+
         return Connection.objects.filter(
-            tenant_id=self.request.tenant_id
+            tenant_id=tenant_id
         ).select_related('integration')
 
     def get_serializer_class(self):
@@ -389,8 +393,12 @@ class WorkflowViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Get workflows for current tenant"""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            return Workflow.objects.none()
+
         queryset = Workflow.objects.filter(
-            tenant_id=self.request.tenant_id,
+            tenant_id=tenant_id,
             is_deleted=False
         ).select_related('connection', 'connection__integration')
 
@@ -531,10 +539,14 @@ class WorkflowTriggerViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Get triggers for workflows owned by current tenant"""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            return WorkflowTrigger.objects.none()
+
         workflow_id = self.kwargs.get('workflow_pk')
         return WorkflowTrigger.objects.filter(
             workflow_id=workflow_id,
-            workflow__tenant_id=self.request.tenant_id
+            workflow__tenant_id=tenant_id
         )
 
     def get_serializer_class(self):
@@ -576,10 +588,14 @@ class WorkflowActionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Get actions for a workflow"""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            return WorkflowAction.objects.none()
+
         workflow_id = self.kwargs.get('workflow_pk')
         return WorkflowAction.objects.filter(
             workflow_id=workflow_id,
-            workflow__tenant_id=self.request.tenant_id
+            workflow__tenant_id=tenant_id
         ).prefetch_related('field_mappings')
 
     def get_serializer_class(self):
@@ -614,10 +630,14 @@ class WorkflowMappingViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         """Get mappings for a workflow action"""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            return WorkflowMapping.objects.none()
+
         action_id = self.kwargs.get('action_pk')
         return WorkflowMapping.objects.filter(
             workflow_action_id=action_id,
-            workflow_action__workflow__tenant_id=self.request.tenant_id
+            workflow_action__workflow__tenant_id=tenant_id
         )
 
     def get_serializer_class(self):
@@ -651,8 +671,12 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         """Get execution logs for current tenant"""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        if not tenant_id:
+            return ExecutionLog.objects.none()
+
         queryset = ExecutionLog.objects.filter(
-            tenant_id=self.request.tenant_id
+            tenant_id=tenant_id
         ).select_related('workflow').order_by('-started_at')
 
         # Filter by workflow if provided
