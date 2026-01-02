@@ -454,7 +454,7 @@ class WorkflowMapping(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.source_field} ’ {self.destination_field}"
+        return f"{self.source_field} -> {self.destination_field}"
 
 
 class ExecutionLog(models.Model):
