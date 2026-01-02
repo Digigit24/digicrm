@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     'meetings',
     'payments',
     'tasks',
+    'integrations',
 ]
 
 MIDDLEWARE = [
@@ -350,5 +351,58 @@ LOGGING = {
             'level': 'DEBUG',
             'propagate': False,
         },
+        'integrations': {
+            'handlers': ['console', 'file_info', 'file_error'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+    },
+}
+
+# ===========================
+# INTEGRATIONS CONFIGURATION
+# ===========================
+
+# Google OAuth Settings
+GOOGLE_CLIENT_ID = config('GOOGLE_CLIENT_ID', default='')
+GOOGLE_CLIENT_SECRET = config('GOOGLE_CLIENT_SECRET', default='')
+GOOGLE_REDIRECT_URI = config('GOOGLE_REDIRECT_URI', default='http://localhost:8000/api/integrations/connections/oauth_callback/')
+
+# Integration Encryption Key
+# Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)
+
+# ===========================
+# CELERY CONFIGURATION
+# ===========================
+
+# Celery settings
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default='redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['application/json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60  # 25 minutes
+
+# Celery Beat Schedule for periodic tasks
+CELERY_BEAT_SCHEDULE = {
+    'poll-workflow-triggers': {
+        'task': 'integrations.tasks.poll_workflow_triggers',
+        'schedule': 300.0,  # Every 5 minutes
+    },
+    'refresh-expiring-tokens': {
+        'task': 'integrations.tasks.refresh_expiring_tokens',
+        'schedule': 3600.0,  # Every hour
+    },
+    'cleanup-old-execution-logs': {
+        'task': 'integrations.tasks.cleanup_old_execution_logs',
+        'schedule': 86400.0,  # Every 24 hours
+    },
+    'check-connection-health': {
+        'task': 'integrations.tasks.check_connection_health',
+        'schedule': 86400.0,  # Every 24 hours
     },
 }

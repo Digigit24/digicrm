@@ -36,6 +36,7 @@ urlpatterns = [
     path('api/meetings/', include('meetings.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/tasks/', include('tasks.urls')),
+    path('api/integrations/', include('integrations.urls')),
 ]
 
 # Serve static files in development
