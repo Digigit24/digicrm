@@ -157,11 +157,16 @@ SESSION_EXPIRE_AT_BROWSER_CLOSE = True
 
 # CORS Settings
 CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', default=False, cast=bool)
-CORS_ALLOWED_ORIGINS = config(
+_cors_origins = config(
     'CORS_ALLOWED_ORIGINS',
     default='http://localhost:3000,http://localhost:8000',
     cast=Csv()
 )
+# Ensure all origins have a scheme (add https:// if missing)
+CORS_ALLOWED_ORIGINS = [
+    origin if origin.startswith(('http://', 'https://')) else f'https://{origin}'
+    for origin in _cors_origins
+]
 
 
 # Allow credentials (cookies, authorization headers, etc.)

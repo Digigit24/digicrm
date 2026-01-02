@@ -526,12 +526,12 @@ class ExecutionLog(models.Model):
         db_table = 'execution_logs'
         ordering = ['-started_at']
         indexes = [
-            models.Index(fields=['tenant_id'], name='idx_execution_logs_tenant'),
-            models.Index(fields=['workflow'], name='idx_execution_logs_workflow'),
-            models.Index(fields=['status'], name='idx_execution_logs_status'),
-            models.Index(fields=['started_at'], name='idx_execution_logs_started'),
-            models.Index(fields=['-started_at'], name='idx_execution_logs_started_desc'),
-            models.Index(fields=['tenant_id', 'workflow', '-started_at'], name='idx_execution_logs_lookup'),
+            models.Index(fields=['tenant_id'], name='idx_exec_logs_tenant'),
+            models.Index(fields=['workflow'], name='idx_exec_logs_workflow'),
+            models.Index(fields=['status'], name='idx_exec_logs_status'),
+            models.Index(fields=['started_at'], name='idx_exec_logs_started'),
+            models.Index(fields=['-started_at'], name='idx_exec_logs_started_desc'),
+            models.Index(fields=['tenant_id', 'workflow', '-started_at'], name='idx_exec_logs_lookup'),
         ]
 
     def __str__(self):
