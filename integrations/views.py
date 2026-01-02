@@ -66,12 +66,21 @@ class ConnectionViewSet(viewsets.ModelViewSet):
     - GET /connections/ - List user's connections
     - GET /connections/:id/ - Get connection details
     - POST /connections/initiate_oauth/ - Start OAuth flow
-    - POST /connections/oauth_callback/ - Handle OAuth callback
+    - GET /connections/oauth_callback/ - Handle OAuth callback (from Google)
+    - POST /connections/oauth_callback/ - Handle OAuth callback (from frontend)
     - POST /connections/:id/disconnect/ - Disconnect connection
     - POST /connections/:id/refresh_token/ - Refresh access token
     - GET /connections/:id/test/ - Test connection
     """
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        """
+        Allow unauthenticated access to oauth_callback GET endpoint
+        """
+        if self.action == 'oauth_callback' and self.request.method == 'GET':
+            return []
+        return super().get_permissions()
 
     def get_queryset(self):
         """Get connections for current tenant and user"""
@@ -149,10 +158,13 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['get', 'post'])
     def oauth_callback(self, request):
         """
         Handle OAuth callback and save connection.
+
+        GET /api/integrations/connections/oauth_callback/?code=...&state=...
+        (Direct redirect from Google OAuth)
 
         POST /api/integrations/connections/oauth_callback/
         {
@@ -162,24 +174,52 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             "connection_name": "My Leads Sheet" (optional)
         }
 
-        Returns: Connection details
+        Returns: Connection details or redirect to frontend
         """
-        serializer = OAuthCallbackSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        # Handle GET request (direct from Google)
+        if request.method == 'GET':
+            code = request.query_params.get('code')
+            state = request.query_params.get('state')
 
-        code = serializer.validated_data['code']
-        state = serializer.validated_data['state']
-        integration_id = serializer.validated_data['integration_id']
-        connection_name = serializer.validated_data.get('connection_name', 'Google Sheets Connection')
+            if not code or not state:
+                return Response(
+                    {"error": "Missing code or state parameter"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Get integration_id from cached state
+            cached_state = cache.get(f"oauth_state:{state}")
+            if not cached_state:
+                return Response(
+                    {"error": "Invalid or expired state. Please try connecting again."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            integration_id = cached_state.get('integration_id')
+            connection_name = 'Google Sheets Connection'
+
+        # Handle POST request (from frontend)
+        else:
+            serializer = OAuthCallbackSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+
+            code = serializer.validated_data['code']
+            state = serializer.validated_data['state']
+            integration_id = serializer.validated_data['integration_id']
+            connection_name = serializer.validated_data.get('connection_name', 'Google Sheets Connection')
 
         try:
-            # Validate state
+            # Validate state (check again for POST requests)
             cached_state = cache.get(f"oauth_state:{state}")
             if not cached_state:
                 return Response(
                     {"error": "Invalid or expired state"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+
+            # Get tenant_id and user_id from cached state (for GET) or request (for POST)
+            tenant_id = cached_state.get('tenant_id')
+            user_id = cached_state.get('user_id')
 
             # Exchange code for tokens
             oauth_handler = get_oauth_handler()
@@ -194,8 +234,8 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
             # Create connection
             connection = Connection.objects.create(
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
                 integration=integration,
                 name=connection_name,
                 status=ConnectionStatusEnum.CONNECTED,
