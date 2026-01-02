@@ -10,7 +10,7 @@ import logging
 from typing import Optional
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ class TokenEncryptor:
             # Ensure key is properly formatted for Fernet
             if len(key) != 44:  # Fernet key must be 44 bytes (base64-encoded 32 bytes)
                 # Use KDF to generate proper key
-                kdf = PBKDF2(
+                kdf = PBKDF2HMAC(
                     algorithm=hashes.SHA256(),
                     length=32,
                     salt=b'integration-salt',  # Static salt for consistency
@@ -82,7 +82,7 @@ class TokenEncryptor:
         secret = settings.SECRET_KEY.encode()
 
         # Use PBKDF2 to derive a proper encryption key
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=b'django-integrations',
