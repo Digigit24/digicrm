@@ -313,7 +313,7 @@ LOGGING = {
     'loggers': {
         'django': {
             'handlers': ['console', 'file_django'],
-            'level': 'DEBUG' if DEBUG else 'INFO',
+            'level': 'WARNING',  # Temporarily reduced to see actual errors
             'propagate': False,
         },
         'django.request': {
@@ -323,7 +323,7 @@ LOGGING = {
         },
         'django.db.backends': {
             'handlers': ['console', 'file_debug'],
-            'level': 'DEBUG' if DEBUG else 'INFO',
+            'level': 'WARNING',  # Temporarily reduced to see actual errors
             'propagate': False,
         },
         'crm': {
