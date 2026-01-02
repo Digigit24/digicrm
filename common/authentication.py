@@ -3,6 +3,7 @@ Custom DRF Authentication Classes for JWT-based authentication
 """
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
+from common.auth_backends import TenantUser
 
 
 class JWTRequestAuthentication(BaseAuthentication):
@@ -31,7 +32,7 @@ class JWTRequestAuthentication(BaseAuthentication):
             return None
 
         # JWT middleware validated the token and set attributes
-        # Return a simple user representation for DRF
+        # Return a TenantUser instance for DRF
         user_data = {
             'user_id': request.user_id,
             'email': request.email,
@@ -43,8 +44,9 @@ class JWTRequestAuthentication(BaseAuthentication):
         }
 
         # Return a tuple of (user, auth) as required by DRF
-        # We use a simple dict as the user object since we don't use Django's User model
-        return (user_data, None)
+        # Use TenantUser which has is_authenticated property
+        user = TenantUser(user_data)
+        return (user, None)
 
     def authenticate_header(self, request):
         """
