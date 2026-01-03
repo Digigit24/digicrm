@@ -40,6 +40,7 @@ from integrations.utils.oauth import get_oauth_handler, OAuthError
 from integrations.utils.encryption import encrypt_token, decrypt_token
 from integrations.services.google_sheets import create_sheets_service, GoogleSheetsError
 from integrations.services.workflow_engine import WorkflowEngine, WorkflowEngineError
+from common.authentication import JWTRequestAuthentication
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class IntegrationViewSet(viewsets.ReadOnlyModelViewSet):
     """
     queryset = Integration.objects.filter(is_active=True)
     serializer_class = IntegrationSerializer
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
@@ -71,17 +73,22 @@ class ConnectionViewSet(viewsets.ModelViewSet):
     - POST /connections/:id/refresh_token/ - Refresh access token
     - GET /connections/:id/test/ - Test connection
     """
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
         """Get connections for current tenant and user"""
         tenant_id = getattr(self.request, 'tenant_id', None)
         if not tenant_id:
+            logger.warning("get_queryset called without tenant_id")
             return Connection.objects.none()
 
-        return Connection.objects.filter(
-            tenant_id=tenant_id
+        logger.debug(f"Filtering connections for tenant_id: {tenant_id} (type: {type(tenant_id).__name__})")
+        queryset = Connection.objects.filter(
+            tenant_id=str(tenant_id)
         ).select_related('integration')
+        logger.debug(f"Found {queryset.count()} connections")
+        return queryset
 
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -115,6 +122,20 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                     {"error": "OAuth not supported for this integration type"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+
+            # Check if already connected
+            existing_connection = Connection.objects.filter(
+                tenant_id=str(request.tenant_id),
+                integration_id=integration_id,
+                status=ConnectionStatusEnum.CONNECTED
+            ).first()
+
+            if existing_connection:
+                return Response({
+                    'already_connected': True,
+                    'message': f'Already connected to {integration.name}',
+                    'connection': ConnectionDetailSerializer(existing_connection).data
+                }, status=status.HTTP_200_OK)
 
             # Generate state with tenant and user info
             state = f"{request.tenant_id}:{request.user_id}:{uuid.uuid4()}"
@@ -192,18 +213,22 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             encrypted_access_token = encrypt_token(token_data['access_token'])
             encrypted_refresh_token = encrypt_token(token_data['refresh_token']) if token_data.get('refresh_token') else None
 
-            # Create connection
-            connection = Connection.objects.create(
-                tenant_id=request.tenant_id,
-                user_id=request.user_id,
+            # Check if connection already exists and update it, otherwise create new
+            connection, created = Connection.objects.update_or_create(
+                tenant_id=str(request.tenant_id),
+                user_id=str(request.user_id),
                 integration=integration,
-                name=connection_name,
-                status=ConnectionStatusEnum.CONNECTED,
-                access_token_encrypted=encrypted_access_token,
-                refresh_token_encrypted=encrypted_refresh_token,
-                token_expires_at=token_data.get('expires_at'),
-                connected_at=timezone.now()
+                defaults={
+                    'name': connection_name,
+                    'status': ConnectionStatusEnum.CONNECTED,
+                    'access_token_encrypted': encrypted_access_token,
+                    'refresh_token_encrypted': encrypted_refresh_token,
+                    'token_expires_at': token_data.get('expires_at'),
+                    'connected_at': timezone.now()
+                }
             )
+
+            logger.info(f"Connection {'created' if created else 'updated'} for tenant {request.tenant_id}")
 
             # Clear cached state
             cache.delete(f"oauth_state:{state}")
@@ -389,6 +414,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     - GET /workflows/:id/executions/ - Get execution logs
     - GET /workflows/stats/ - Get workflow statistics
     """
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
@@ -534,6 +560,7 @@ class WorkflowTriggerViewSet(viewsets.ModelViewSet):
 
     Triggers are tied to workflows (one-to-one relationship).
     """
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = WorkflowTriggerSerializer
 
@@ -583,6 +610,7 @@ class WorkflowActionViewSet(viewsets.ModelViewSet):
 
     Actions belong to workflows and are executed in order.
     """
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = WorkflowActionSerializer
 
@@ -625,6 +653,7 @@ class WorkflowMappingViewSet(viewsets.ModelViewSet):
 
     Mappings belong to workflow actions.
     """
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = WorkflowMappingSerializer
 
@@ -667,6 +696,7 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
 
     Read-only as logs are created by the system.
     """
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
