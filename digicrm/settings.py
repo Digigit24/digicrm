@@ -373,6 +373,10 @@ GOOGLE_CLIENT_ID = config('GOOGLE_CLIENT_ID', default='')
 GOOGLE_CLIENT_SECRET = config('GOOGLE_CLIENT_SECRET', default='')
 GOOGLE_REDIRECT_URI = config('GOOGLE_REDIRECT_URI', default='http://localhost:8000/api/integrations/connections/oauth_callback/')
 
+# Frontend URL for OAuth redirects
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
+FRONTEND_OAUTH_CALLBACK_URL = config('FRONTEND_OAUTH_CALLBACK_URL', default=f"{config('FRONTEND_URL', default='http://localhost:3000')}/integrations/oauth/callback")
+
 # Integration Encryption Key
 # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)

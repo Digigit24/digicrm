@@ -180,7 +180,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    @action(detail=False, methods=['post'])
+    @action(detail=False, methods=['post', 'get'])
     def oauth_callback(self, request):
         """
         Handle OAuth callback and save connection.
@@ -195,7 +195,34 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
         Returns: Connection details
         """
-        logger.info(f"oauth_callback called with data: {request.data}")
+        # Handle GET request from Google OAuth redirect
+        if request.method == 'GET':
+            from django.shortcuts import redirect
+            from django.conf import settings as django_settings
+
+            logger.info(f"oauth_callback GET request from Google with params: {request.GET}")
+            code = request.GET.get('code')
+            state = request.GET.get('state')
+            error = request.GET.get('error')
+
+            frontend_url = getattr(django_settings, 'FRONTEND_URL', 'http://localhost:3000')
+
+            if error:
+                logger.error(f"OAuth error from Google: {error}")
+                return redirect(f"{frontend_url}/integrations?error={error}")
+
+            if not code or not state:
+                logger.error("Missing code or state in OAuth callback")
+                return redirect(f"{frontend_url}/integrations?error=missing_params")
+
+            # Redirect to frontend with code and state
+            frontend_callback_url = getattr(django_settings, 'FRONTEND_OAUTH_CALLBACK_URL', f"{frontend_url}/integrations/oauth/callback")
+            redirect_url = f"{frontend_callback_url}?code={code}&state={state}"
+            logger.info(f"Redirecting to frontend: {redirect_url}")
+            return redirect(redirect_url)
+
+        # Handle POST request from frontend with authorization code
+        logger.info(f"oauth_callback POST called with data: {request.data}")
         logger.info(f"Request tenant_id: {getattr(request, 'tenant_id', 'NOT_FOUND')}, user_id: {getattr(request, 'user_id', 'NOT_FOUND')}")
 
         serializer = OAuthCallbackSerializer(data=request.data)
