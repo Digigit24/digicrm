@@ -20,6 +20,15 @@ useEffect(() => {
     try {
       toast.loading('Completing connection...', { id: 'oauth-callback' });
 
+      // Get Google Sheets integration ID from the integrations list
+      const googleSheetsIntegration = integrationsData?.results?.find(
+        (int) => int.type === 'GOOGLE_SHEETS' || int.name.toLowerCase().includes('google')
+      );
+
+      if (!googleSheetsIntegration) {
+        throw new Error('Google Sheets integration not found');
+      }
+
       // Call the backend oauth_callback endpoint
       const response = await fetch('/api/integrations/connections/oauth_callback/', {
         method: 'POST',
@@ -30,7 +39,7 @@ useEffect(() => {
         body: JSON.stringify({
           code,
           state,
-          integration_id: 1, // Google Sheets integration ID
+          integration_id: googleSheetsIntegration.id,
           connection_name: 'Google Sheets Connection',
         }),
       });
