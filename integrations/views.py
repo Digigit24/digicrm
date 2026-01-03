@@ -524,6 +524,42 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @action(detail=True, methods=['get'], url_path='sheet-columns')
+    def sheet_columns(self, request, pk=None):
+        """
+        Fetch header row/columns for a specific sheet in a spreadsheet.
+
+        GET /api/integrations/connections/:id/sheet-columns/?spreadsheet_id=xxx&sheet_name=Sheet1
+        """
+        connection = self.get_object()
+        spreadsheet_id = request.query_params.get('spreadsheet_id')
+        sheet_name = request.query_params.get('sheet_name')
+
+        if not spreadsheet_id or not sheet_name:
+            return Response(
+                {"error": "spreadsheet_id and sheet_name query parameters are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            sheets_service = create_sheets_service(connection)
+            sheet_data = sheets_service.read_sheet_data(
+                spreadsheet_id=spreadsheet_id,
+                sheet_name=sheet_name,
+                range_notation="1:1",  # header row only
+                include_headers=True
+            )
+
+            headers = sheet_data.get('headers', [])
+            return Response({"headers": headers})
+
+        except GoogleSheetsError as e:
+            logger.error(f"Failed to fetch sheet columns: {e}")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     @action(detail=True, methods=['get'], url_path='spreadsheets/(?P<spreadsheet_id>[^/.]+)/sheets')
     def sheets(self, request, pk=None, spreadsheet_id=None):
         """
@@ -630,8 +666,15 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         trigger_data = serializer.validated_data.get('trigger_data')
+        reset_last_processed = serializer.validated_data.get('reset_last_processed', False)
 
         try:
+            # Optionally reset last processed record to force full read
+            if reset_last_processed and hasattr(workflow, 'trigger'):
+                workflow.trigger.last_processed_record = None
+                workflow.trigger.last_checked_at = None
+                workflow.trigger.save(update_fields=['last_processed_record', 'last_checked_at', 'updated_at'])
+
             engine = WorkflowEngine(workflow)
 
             if trigger_data:
@@ -657,6 +700,12 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            logger.exception(f"Workflow test crashed: {e}")
+            return Response(
+                {"error": "Workflow test failed unexpectedly", "detail": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
     @action(detail=True, methods=['post'])

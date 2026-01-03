@@ -360,6 +360,11 @@ class SheetListSerializer(serializers.Serializer):
 class TestWorkflowSerializer(serializers.Serializer):
     """Serializer for testing a workflow manually"""
     trigger_data = serializers.JSONField(required=False, help_text="Optional test data to use")
+    reset_last_processed = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Reset last_processed_record before test to read all rows"
+    )
 
 
 class WorkflowStatsSerializer(serializers.Serializer):
