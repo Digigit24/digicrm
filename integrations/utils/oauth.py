@@ -180,8 +180,12 @@ class GoogleOAuthHandler:
             expires_at = None
             expires_in = None
             if credentials.expiry:
-                expires_at = credentials.expiry
-                expires_in = int((credentials.expiry - timezone.now()).total_seconds())
+                # Ensure credentials.expiry is timezone-aware
+                if credentials.expiry.tzinfo is None:
+                    expires_at = timezone.make_aware(credentials.expiry)
+                else:
+                    expires_at = credentials.expiry
+                expires_in = int((expires_at - timezone.now()).total_seconds())
 
             token_data = {
                 'access_token': credentials.token,
@@ -246,8 +250,12 @@ class GoogleOAuthHandler:
             expires_at = None
             expires_in = None
             if credentials.expiry:
-                expires_at = credentials.expiry
-                expires_in = int((credentials.expiry - timezone.now()).total_seconds())
+                # Ensure credentials.expiry is timezone-aware
+                if credentials.expiry.tzinfo is None:
+                    expires_at = timezone.make_aware(credentials.expiry)
+                else:
+                    expires_at = credentials.expiry
+                expires_in = int((expires_at - timezone.now()).total_seconds())
 
             token_data = {
                 'access_token': credentials.token,
