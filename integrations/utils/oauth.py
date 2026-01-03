@@ -38,7 +38,10 @@ class GoogleOAuthHandler:
     """
 
     # Google OAuth scopes needed for Google Sheets
+    # Note: 'openid' is required when requesting userinfo scopes
+    # Google adds it automatically, so we include it to prevent scope validation errors
     SCOPES = [
+        'openid',
         'https://www.googleapis.com/auth/spreadsheets.readonly',
         'https://www.googleapis.com/auth/drive.readonly',
         'https://www.googleapis.com/auth/userinfo.email',
