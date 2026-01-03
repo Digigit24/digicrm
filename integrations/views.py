@@ -195,6 +195,9 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
         Returns: Connection details
         """
+        logger.info(f"oauth_callback called with data: {request.data}")
+        logger.info(f"Request tenant_id: {getattr(request, 'tenant_id', 'NOT_FOUND')}, user_id: {getattr(request, 'user_id', 'NOT_FOUND')}")
+
         serializer = OAuthCallbackSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -205,25 +208,34 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
         try:
             # Validate state
+            logger.info(f"Checking cached state for: oauth_state:{state}")
             cached_state = cache.get(f"oauth_state:{state}")
+            logger.info(f"Cached state data: {cached_state}")
+
             if not cached_state:
+                logger.error("State validation failed - state not found in cache")
                 return Response(
                     {"error": "Invalid or expired state"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
             # Exchange code for tokens
+            logger.info(f"Exchanging code for tokens...")
             oauth_handler = get_oauth_handler()
             token_data = oauth_handler.exchange_code_for_tokens(code, state)
+            logger.info(f"Token exchange successful, expires_at: {token_data.get('expires_at')}")
 
             # Get integration
             integration = Integration.objects.get(id=integration_id)
+            logger.info(f"Found integration: {integration.name}")
 
             # Encrypt tokens
             encrypted_access_token = encrypt_token(token_data['access_token'])
             encrypted_refresh_token = encrypt_token(token_data['refresh_token']) if token_data.get('refresh_token') else None
+            logger.info("Tokens encrypted successfully")
 
             # Check if connection already exists and update it, otherwise create new
+            logger.info(f"Creating/updating connection for tenant={request.tenant_id}, user={request.user_id}, integration={integration.id}")
             connection, created = Connection.objects.update_or_create(
                 tenant_id=request.tenant_id,
                 user_id=request.user_id,
@@ -238,7 +250,14 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 }
             )
 
-            logger.info(f"Connection {'created' if created else 'updated'}: id={connection.id}, tenant={connection.tenant_id}, user={connection.user_id}")
+            logger.info(f"Connection {'created' if created else 'updated'}: id={connection.id}, tenant={connection.tenant_id} (type={type(connection.tenant_id).__name__}), user={connection.user_id}")
+
+            # Verify connection was saved
+            verify_conn = Connection.objects.filter(id=connection.id).first()
+            if verify_conn:
+                logger.info(f"Connection verified in database: id={verify_conn.id}, status={verify_conn.status}")
+            else:
+                logger.error(f"Connection NOT found in database after save!")
 
             # Clear cached state
             cache.delete(f"oauth_state:{state}")
@@ -249,16 +268,23 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             )
 
         except Integration.DoesNotExist:
+            logger.error(f"Integration not found: {integration_id}")
             return Response(
                 {"error": "Integration not found"},
                 status=status.HTTP_404_NOT_FOUND
             )
 
         except OAuthError as e:
-            logger.error(f"OAuth callback failed: {e}")
+            logger.error(f"OAuth callback failed: {e}", exc_info=True)
             return Response(
                 {"error": str(e)},
                 status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error in oauth_callback: {e}", exc_info=True)
+            return Response(
+                {"error": f"Internal error: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
     @action(detail=True, methods=['post'])
