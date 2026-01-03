@@ -494,6 +494,36 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @action(detail=True, methods=['get'], url_path='sheets')
+    def list_sheets(self, request, pk=None):
+        """
+        List sheets in a spreadsheet (alternative endpoint with query param).
+
+        GET /api/integrations/connections/:id/sheets/?spreadsheet_id=xxx
+        """
+        connection = self.get_object()
+        spreadsheet_id = request.query_params.get('spreadsheet_id')
+
+        if not spreadsheet_id:
+            return Response(
+                {"error": "spreadsheet_id query parameter is required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            sheets_service = create_sheets_service(connection)
+            sheets = sheets_service.list_sheets(spreadsheet_id)
+
+            serializer = SheetListSerializer(sheets, many=True)
+            return Response(serializer.data)
+
+        except GoogleSheetsError as e:
+            logger.error(f"Failed to list sheets: {e}")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
     @action(detail=True, methods=['get'], url_path='spreadsheets/(?P<spreadsheet_id>[^/.]+)/sheets')
     def sheets(self, request, pk=None, spreadsheet_id=None):
         """
