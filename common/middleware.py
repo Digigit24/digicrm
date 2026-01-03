@@ -49,9 +49,8 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/schema.json',
         '/api/schema.yaml',
         '/api/logs/',  # Logs endpoint - public for monitoring
-        '/api/integrations/connections/oauth_callback/',  # OAuth callback from Google (GET only)
     ]
-    
+
     def process_request(self, request):
         """Process incoming request and validate JWT token"""
 
@@ -59,6 +58,17 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
 
         # Store request in thread-local storage for authentication backends
         set_current_request(request)
+
+        # Skip validation for public paths
+        # Special case: exact match for root path '/'
+        if request.path == '/':
+            logger.debug(f"JWT Middleware - Skipping public path: {request.path}")
+            return None
+
+        # Special case: OAuth callback GET requests (from Google redirect)
+        if request.path == '/api/integrations/connections/oauth_callback/' and request.method == 'GET':
+            logger.debug(f"JWT Middleware - Skipping OAuth callback GET request")
+            return None
 
         # Skip validation for public paths
         # Special case: exact match for root path '/'
