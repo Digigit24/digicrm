@@ -70,12 +70,6 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
             logger.debug(f"JWT Middleware - Skipping OAuth callback GET request")
             return None
 
-        # Skip validation for public paths
-        # Special case: exact match for root path '/'
-        if request.path == '/':
-            logger.debug(f"JWT Middleware - Skipping public path: {request.path}")
-            return None
-
         # Check if request path matches any public path (handle trailing slashes)
         request_path_normalized = request.path.rstrip('/') + '/'
         for public_path in self.PUBLIC_PATHS:
