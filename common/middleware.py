@@ -49,6 +49,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/schema.json',
         '/api/schema.yaml',
         '/api/logs/',  # Logs endpoint - public for monitoring
+        '/api/integrations/connections/oauth_callback/',  # OAuth callback from Google (GET only)
     ]
     
     def process_request(self, request):
