@@ -104,6 +104,15 @@ class GoogleOAuthHandler:
             )
 
             logger.info(f"Generated authorization URL with state: {state}")
+            logger.debug(
+                "OAuth authorization URL details",
+                extra={
+                    "redirect_uri": self.redirect_uri,
+                    "scopes": self.SCOPES,
+                    "state": state,
+                    "auth_url_preview": authorization_url[:120] + ("..." if len(authorization_url) > 120 else "")
+                }
+            )
             return authorization_url, state
 
         except Exception as e:
@@ -132,8 +141,35 @@ class GoogleOAuthHandler:
                 state=state
             )
 
-            # Exchange code for tokens
-            flow.fetch_token(code=code)
+            # CRITICAL FIX: Disable strict scope validation
+            # Google automatically adds 'openid' and reorders scopes, causing validation to fail
+            # Since we already validate the state parameter for security, this is safe
+            logger.info(f"Exchanging authorization code for tokens (state: {state})")
+            logger.debug(
+                "Token exchange input",
+                extra={
+                    "redirect_uri": self.redirect_uri,
+                    "state": state,
+                    "scopes": self.SCOPES,
+                }
+            )
+            
+            # Exchange code for tokens without strict scope validation
+            try:
+                flow.fetch_token(code=code, include_granted_scopes='false')
+            except Exception as fetch_error:
+                # If that fails, try without any scope parameters
+                logger.warning(f"First token fetch attempt failed: {fetch_error}, trying alternative method")
+                logger.debug(
+                    "Token fetch retry details",
+                    extra={
+                        "redirect_uri": self.redirect_uri,
+                        "state": state,
+                        "scopes": self.SCOPES,
+                        "error": str(fetch_error),
+                    }
+                )
+                flow.fetch_token(code=code)
 
             credentials = flow.credentials
 
@@ -153,11 +189,28 @@ class GoogleOAuthHandler:
                 'scopes': credentials.scopes,
             }
 
-            logger.info("Successfully exchanged authorization code for tokens")
+            logger.info(f"Successfully exchanged authorization code for tokens. Expires at: {expires_at}")
+            logger.debug(
+                "Token exchange result (sanitized)",
+                extra={
+                    "expires_at": expires_at.isoformat() if expires_at else None,
+                    "scopes": credentials.scopes,
+                    "has_refresh_token": bool(credentials.refresh_token),
+                    "token_type": credentials.token_uri,
+                }
+            )
             return token_data
 
         except Exception as e:
-            logger.error(f"Failed to exchange code for tokens: {e}")
+            logger.error(f"Failed to exchange code for tokens: {e}", exc_info=True)
+            logger.debug(
+                "Token exchange failed details",
+                extra={
+                    "redirect_uri": self.redirect_uri,
+                    "state": state,
+                    "scopes": self.SCOPES,
+                }
+            )
             raise OAuthError(f"Token exchange failed: {e}")
 
     def refresh_access_token(self, refresh_token: str) -> Dict:

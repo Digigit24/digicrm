@@ -196,6 +196,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
         Returns: Connection details
         """
         # Handle GET request from Google OAuth redirect
+        # Handle GET request from Google OAuth redirect
         if request.method == 'GET':
             from django.shortcuts import redirect
             from django.conf import settings as django_settings
@@ -209,17 +210,64 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
             if error:
                 logger.error(f"OAuth error from Google: {error}")
-                return redirect(f"{frontend_url}/integrations?error={error}")
+                return redirect(f"{frontend_url}/integrations?oauth_error={error}")
 
             if not code or not state:
                 logger.error("Missing code or state in OAuth callback")
-                return redirect(f"{frontend_url}/integrations?error=missing_params")
+                return redirect(f"{frontend_url}/integrations?oauth_error=missing_params")
 
-            # Redirect to frontend with code and state
-            frontend_callback_url = getattr(django_settings, 'FRONTEND_OAUTH_CALLBACK_URL', f"{frontend_url}/integrations/oauth/callback")
-            redirect_url = f"{frontend_callback_url}?code={code}&state={state}"
-            logger.info(f"Redirecting to frontend: {redirect_url}")
-            return redirect(redirect_url)
+            try:
+                # EXCHANGE CODE HERE IN GET REQUEST
+                logger.info(f"Exchanging code in GET request...")
+                
+                # Get cached state
+                cached_state = cache.get(f"oauth_state:{state}")
+                if not cached_state:
+                    logger.error("State validation failed")
+                    return redirect(f"{frontend_url}/integrations?oauth_error=invalid_state")
+                
+                tenant_id = cached_state['tenant_id']
+                user_id = cached_state['user_id']
+                integration_id = cached_state['integration_id']
+                
+                # Exchange code for tokens
+                oauth_handler = get_oauth_handler()
+                token_data = oauth_handler.exchange_code_for_tokens(code, state)
+                logger.info(f"Token exchange successful")
+                
+                # Get integration
+                integration = Integration.objects.get(id=integration_id)
+                
+                # Encrypt tokens
+                encrypted_access_token = encrypt_token(token_data['access_token'])
+                encrypted_refresh_token = encrypt_token(token_data['refresh_token']) if token_data.get('refresh_token') else None
+                
+                # Create/update connection
+                connection, created = Connection.objects.update_or_create(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    integration=integration,
+                    defaults={
+                        'name': 'Google Sheets',
+                        'status': ConnectionStatusEnum.CONNECTED,
+                        'access_token_encrypted': encrypted_access_token,
+                        'refresh_token_encrypted': encrypted_refresh_token,
+                        'token_expires_at': token_data.get('expires_at'),
+                        'connected_at': timezone.now()
+                    }
+                )
+                
+                logger.info(f"Connection {'created' if created else 'updated'}: {connection.id}")
+                
+                # Clear cached state
+                cache.delete(f"oauth_state:{state}")
+                
+                # Redirect to frontend with success
+                return redirect(f"{frontend_url}/integrations?oauth_success=true&connection_name={connection.name}")
+                
+            except Exception as e:
+                logger.error(f"OAuth callback failed: {e}", exc_info=True)
+                return redirect(f"{frontend_url}/integrations?oauth_error={str(e)}")
 
         # Handle POST request from frontend with authorization code
         logger.info(f"oauth_callback POST called with data: {request.data}")
