@@ -691,6 +691,23 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         serializer = ExecutionLogListSerializer(logs, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=['get'])
+    def mappings(self, request, pk=None):
+        """
+        Get all field mappings for a workflow.
+
+        GET /api/integrations/workflows/:id/mappings/
+        """
+        workflow = self.get_object()
+
+        # Get all mappings from all actions in this workflow
+        mappings = WorkflowMapping.objects.filter(
+            workflow_action__workflow=workflow
+        ).select_related('workflow_action')
+
+        serializer = WorkflowMappingSerializer(mappings, many=True)
+        return Response(serializer.data)
+
     @action(detail=False, methods=['get'])
     def stats(self, request):
         """
