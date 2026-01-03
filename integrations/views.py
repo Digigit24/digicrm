@@ -691,22 +691,56 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         serializer = ExecutionLogListSerializer(logs, many=True)
         return Response(serializer.data)
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get', 'post'])
     def mappings(self, request, pk=None):
         """
-        Get all field mappings for a workflow.
+        Get or create field mappings for a workflow.
 
         GET /api/integrations/workflows/:id/mappings/
+        POST /api/integrations/workflows/:id/mappings/
         """
         workflow = self.get_object()
 
-        # Get all mappings from all actions in this workflow
-        mappings = WorkflowMapping.objects.filter(
-            workflow_action__workflow=workflow
-        ).select_related('workflow_action')
+        if request.method == 'GET':
+            # Get all mappings from all actions in this workflow
+            mappings = WorkflowMapping.objects.filter(
+                workflow_action__workflow=workflow
+            ).select_related('workflow_action')
 
-        serializer = WorkflowMappingSerializer(mappings, many=True)
-        return Response(serializer.data)
+            serializer = WorkflowMappingSerializer(mappings, many=True)
+            return Response(serializer.data)
+
+        elif request.method == 'POST':
+            # Create a new mapping
+            # Expect workflow_action_id in the request data
+            action_id = request.data.get('workflow_action_id')
+
+            if not action_id:
+                return Response(
+                    {"error": "workflow_action_id is required"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # Verify action belongs to this workflow
+            try:
+                action = WorkflowAction.objects.get(
+                    id=action_id,
+                    workflow=workflow
+                )
+            except WorkflowAction.DoesNotExist:
+                return Response(
+                    {"error": "Action not found or does not belong to this workflow"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            serializer = WorkflowMappingCreateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            mapping = serializer.save(workflow_action_id=action_id)
+
+            return Response(
+                WorkflowMappingSerializer(mapping).data,
+                status=status.HTTP_201_CREATED
+            )
 
     @action(detail=False, methods=['get'])
     def stats(self, request):
