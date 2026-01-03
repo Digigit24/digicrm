@@ -176,18 +176,18 @@ class GoogleOAuthHandler:
 
             credentials = flow.credentials
 
-            # Calculate expiration time
+            # Calculate expiration time and expires_in
             expires_at = None
+            expires_in = None
             if credentials.expiry:
                 expires_at = credentials.expiry
-            elif credentials.expires_in:
-                expires_at = timezone.now() + timedelta(seconds=credentials.expires_in)
+                expires_in = int((credentials.expiry - timezone.now()).total_seconds())
 
             token_data = {
                 'access_token': credentials.token,
                 'refresh_token': credentials.refresh_token,
                 'token_type': 'Bearer',
-                'expires_in': credentials.expires_in,
+                'expires_in': expires_in,
                 'expires_at': expires_at,
                 'scopes': credentials.scopes,
             }
@@ -242,18 +242,18 @@ class GoogleOAuthHandler:
             request = Request()
             credentials.refresh(request)
 
-            # Calculate expiration
+            # Calculate expiration and expires_in
             expires_at = None
+            expires_in = None
             if credentials.expiry:
                 expires_at = credentials.expiry
-            elif credentials.expires_in:
-                expires_at = timezone.now() + timedelta(seconds=credentials.expires_in)
+                expires_in = int((credentials.expiry - timezone.now()).total_seconds())
 
             token_data = {
                 'access_token': credentials.token,
                 'refresh_token': credentials.refresh_token or refresh_token,  # Keep old if no new one
                 'token_type': 'Bearer',
-                'expires_in': credentials.expires_in,
+                'expires_in': expires_in,
                 'expires_at': expires_at,
                 'scopes': credentials.scopes,
             }
