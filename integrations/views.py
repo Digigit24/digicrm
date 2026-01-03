@@ -562,6 +562,24 @@ class WorkflowViewSet(viewsets.ModelViewSet):
             return WorkflowDetailSerializer
         return WorkflowListSerializer
 
+    def create(self, request, *args, **kwargs):
+        """Create workflow with better error logging"""
+        logger.info(f"Creating workflow with data: {request.data}")
+        logger.info(f"Request tenant_id: {getattr(request, 'tenant_id', 'NOT_SET')}")
+        logger.info(f"Request user_id: {getattr(request, 'user_id', 'NOT_SET')}")
+
+        serializer = self.get_serializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except Exception as e:
+            logger.error(f"Workflow creation validation failed: {e}")
+            logger.error(f"Validation errors: {getattr(serializer, 'errors', {})}")
+            raise
+
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
     def perform_destroy(self, instance):
         """Soft delete workflow"""
         instance.soft_delete()
