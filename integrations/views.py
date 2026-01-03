@@ -79,15 +79,25 @@ class ConnectionViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Get connections for current tenant and user"""
         tenant_id = getattr(self.request, 'tenant_id', None)
+
+        # Debug logging
+        logger.info(f"ConnectionViewSet.get_queryset - tenant_id from request: {tenant_id} (type: {type(tenant_id).__name__})")
+        logger.info(f"All connections count: {Connection.objects.count()}")
+
         if not tenant_id:
             logger.warning("get_queryset called without tenant_id")
             return Connection.objects.none()
 
-        logger.debug(f"Filtering connections for tenant_id: {tenant_id} (type: {type(tenant_id).__name__})")
+        # Filter by tenant_id (no conversion needed, Django handles UUID comparison)
         queryset = Connection.objects.filter(
-            tenant_id=str(tenant_id)
+            tenant_id=tenant_id
         ).select_related('integration')
-        logger.debug(f"Found {queryset.count()} connections")
+
+        logger.info(f"Filtered connections count: {queryset.count()}")
+        if queryset.exists():
+            for conn in queryset:
+                logger.info(f"  Found connection: id={conn.id}, name={conn.name}, status={conn.status}, tenant={conn.tenant_id}")
+
         return queryset
 
     def get_serializer_class(self):
@@ -125,7 +135,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
             # Check if already connected
             existing_connection = Connection.objects.filter(
-                tenant_id=str(request.tenant_id),
+                tenant_id=request.tenant_id,
                 integration_id=integration_id,
                 status=ConnectionStatusEnum.CONNECTED
             ).first()
@@ -215,8 +225,8 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
             # Check if connection already exists and update it, otherwise create new
             connection, created = Connection.objects.update_or_create(
-                tenant_id=str(request.tenant_id),
-                user_id=str(request.user_id),
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
                 integration=integration,
                 defaults={
                     'name': connection_name,
@@ -228,7 +238,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 }
             )
 
-            logger.info(f"Connection {'created' if created else 'updated'} for tenant {request.tenant_id}")
+            logger.info(f"Connection {'created' if created else 'updated'}: id={connection.id}, tenant={connection.tenant_id}, user={connection.user_id}")
 
             # Clear cached state
             cache.delete(f"oauth_state:{state}")
