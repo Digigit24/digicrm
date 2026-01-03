@@ -180,7 +180,7 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-    @action(detail=False, methods=['post', 'get'])
+    @action(detail=False, methods=['post', 'get'], permission_classes=[])
     def oauth_callback(self, request):
         """
         Handle OAuth callback and save connection.
@@ -222,8 +222,16 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             return redirect(redirect_url)
 
         # Handle POST request from frontend with authorization code
+        # POST requests must have authentication
+        if not hasattr(request, 'tenant_id') or not hasattr(request, 'user_id'):
+            logger.error("POST request to oauth_callback without authentication")
+            return Response(
+                {"error": "Authentication required for POST requests"},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+
         logger.info(f"oauth_callback POST called with data: {request.data}")
-        logger.info(f"Request tenant_id: {getattr(request, 'tenant_id', 'NOT_FOUND')}, user_id: {getattr(request, 'user_id', 'NOT_FOUND')}")
+        logger.info(f"Request tenant_id: {request.tenant_id}, user_id: {request.user_id}")
 
         serializer = OAuthCallbackSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
