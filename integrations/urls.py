@@ -33,6 +33,11 @@ workflows_router.register(
     r'actions', views.WorkflowActionViewSet, basename='workflow-action'
 )
 
+# Nested routers for workflow execution logs
+workflows_router.register(
+    r'execution-logs', views.ExecutionLogViewSet, basename='workflow-execution-log'
+)
+
 # Nested routers for action field mappings
 actions_router = nested_routers.NestedDefaultRouter(
     workflows_router, r'actions', lookup='action'
@@ -80,7 +85,8 @@ WORKFLOWS:
 - DELETE /api/integrations/workflows/:id/                     - Delete workflow (soft delete)
 - POST   /api/integrations/workflows/:id/test/                - Test workflow manually
 - POST   /api/integrations/workflows/:id/toggle/              - Toggle active status
-- GET    /api/integrations/workflows/:id/executions/          - Get execution logs
+- GET    /api/integrations/workflows/:id/executions/          - Get execution logs (legacy)
+- GET    /api/integrations/workflows/:id/execution-logs/      - Get execution logs (paginated)
 - GET    /api/integrations/workflows/stats/                   - Get workflow statistics
 
 WORKFLOW TRIGGERS:

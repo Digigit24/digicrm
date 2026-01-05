@@ -962,9 +962,13 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
     ViewSet for viewing execution logs.
 
     Read-only as logs are created by the system.
+    Supports both nested URL (/workflows/:id/execution-logs/) and root URL (/execution-logs/?workflow_id=:id)
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
+    filterset_fields = ['status', 'workflow_id']
+    ordering_fields = ['started_at', 'finished_at', 'status']
+    ordering = ['-started_at']
 
     def get_queryset(self):
         """Get execution logs for current tenant"""
@@ -974,19 +978,28 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
 
         queryset = ExecutionLog.objects.filter(
             tenant_id=tenant_id
-        ).select_related('workflow').order_by('-started_at')
+        ).select_related('workflow')
 
-        # Filter by workflow if provided
-        workflow_id = self.request.query_params.get('workflow_id')
-        if workflow_id:
-            queryset = queryset.filter(workflow_id=workflow_id)
+        # Filter by workflow from nested URL (e.g., /workflows/1/execution-logs/)
+        workflow_pk = self.kwargs.get('workflow_pk')
+        if workflow_pk:
+            queryset = queryset.filter(workflow_id=workflow_pk)
+        else:
+            # Fall back to query parameter (e.g., /execution-logs/?workflow_id=1)
+            workflow_id = self.request.query_params.get('workflow_id')
+            if workflow_id:
+                queryset = queryset.filter(workflow_id=workflow_id)
 
         # Filter by status if provided
         status_filter = self.request.query_params.get('status')
         if status_filter:
             queryset = queryset.filter(status=status_filter)
 
-        return queryset[:100]  # Limit to last 100
+        # Apply ordering
+        ordering = self.request.query_params.get('ordering', '-started_at')
+        queryset = queryset.order_by(ordering)
+
+        return queryset
 
     def get_serializer_class(self):
         """Return appropriate serializer"""
