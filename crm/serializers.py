@@ -48,12 +48,20 @@ class LeadSerializer(TenantMixin):
         model = Lead
         fields = [
             'id', 'name', 'phone', 'email', 'company', 'title',
-            'status', 'status_name', 'priority', 'value_amount', 'value_currency',
+            'status', 'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
             'source', 'owner_user_id', 'assigned_to', 'metadata', 'last_contacted_at',
             'next_follow_up_at', 'notes', 'address_line1', 'address_line2', 'city',
             'state', 'country', 'postal_code', 'created_at', 'updated_at', 'activities'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_lead_score(self, value):
+        """Validate lead_score is between 0 and 100"""
+        if value is not None and (value < 0 or value > 100):
+            raise serializers.ValidationError(
+                "Lead score must be between 0 and 100"
+            )
+        return value
 
 
 class LeadListSerializer(TenantMixin):
@@ -64,7 +72,7 @@ class LeadListSerializer(TenantMixin):
         model = Lead
         fields = [
             'id', 'name', 'phone', 'email', 'company', 'status',
-            'status_name', 'priority', 'value_amount', 'value_currency',
+            'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
             'owner_user_id', 'assigned_to', 'metadata', 'next_follow_up_at',
             'created_at', 'updated_at'
         ]

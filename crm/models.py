@@ -91,6 +91,12 @@ class Lead(models.Model):
         choices=PriorityEnum.choices,
         default=PriorityEnum.MEDIUM
     )
+    lead_score = models.IntegerField(
+        default=0,
+        null=True,
+        blank=True,
+        help_text='Lead score from 0 to 100'
+    )
     value_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     value_currency = models.TextField(null=True, blank=True)
     source = models.TextField(null=True, blank=True)
@@ -118,6 +124,12 @@ class Lead(models.Model):
             models.Index(fields=['owner_user_id'], name='idx_leads_owner_user_id'),
             models.Index(fields=['assigned_to'], name='idx_leads_assigned_to'),
             models.Index(fields=['phone'], name='idx_leads_phone'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(lead_score__isnull=True) | (models.Q(lead_score__gte=0) & models.Q(lead_score__lte=100)),
+                name='leads_score_range_check'
+            )
         ]
 
     def __str__(self):

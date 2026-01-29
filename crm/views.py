@@ -95,6 +95,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
     filterset_fields = {
         'status': ['exact'],
         'priority': ['exact'],
+        'lead_score': ['exact', 'gte', 'lte', 'isnull'],
         'owner_user_id': ['exact'],
         'assigned_to': ['exact', 'isnull'],
         'created_at': ['gte', 'lte', 'exact'],
@@ -106,7 +107,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
     }
     search_fields = ['name', 'phone', 'email', 'company', 'notes']
     ordering_fields = [
-        'name', 'created_at', 'updated_at', 'priority',
+        'name', 'created_at', 'updated_at', 'priority', 'lead_score',
         'value_amount', 'next_follow_up_at', 'last_contacted_at'
     ]
     ordering = ['-created_at']
@@ -834,6 +835,31 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
     ordering_fields = ['display_order', 'field_label', 'created_at']
     ordering = ['display_order', 'field_label']
 
+    def list(self, request, *args, **kwargs):
+        """
+        List all field configurations for the tenant.
+        Auto-populates default standard field configurations if none exist.
+        """
+        try:
+            # Import here to avoid circular imports
+            from .utils import ensure_default_field_configurations
+
+            # Ensure default field configurations exist for this tenant
+            created_count, existing_count = ensure_default_field_configurations(request.tenant_id)
+
+            if created_count > 0:
+                logger.info(
+                    f"Auto-created {created_count} default field configurations for tenant {request.tenant_id}"
+                )
+
+            # Continue with normal list behavior
+            return super().list(request, *args, **kwargs)
+
+        except Exception as e:
+            logger.error(f"Error in field configuration list: {str(e)}")
+            # Fall back to normal list behavior even if auto-population fails
+            return super().list(request, *args, **kwargs)
+
     @extend_schema(
         description='Get field schema organized by standard and custom fields',
         responses={200: {
@@ -855,6 +881,7 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
         """
         Get field schema organized by standard and custom fields.
         Returns a structured response with both standard and custom fields separated.
+        Auto-populates default standard field configurations if none exist.
         Requires: crm.settings.view permission
 
         Accessible at: /api/crm/field-configurations/field_schema/
@@ -868,6 +895,17 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
                 })
 
             logger.info(f"Field schema requested by tenant: {request.tenant_id}")
+
+            # Import here to avoid circular imports
+            from .utils import ensure_default_field_configurations
+
+            # Ensure default field configurations exist for this tenant
+            created_count, existing_count = ensure_default_field_configurations(request.tenant_id)
+
+            if created_count > 0:
+                logger.info(
+                    f"Auto-created {created_count} default field configurations for tenant {request.tenant_id}"
+                )
 
             # Get all field configurations for the tenant
             all_fields = LeadFieldConfiguration.objects.filter(
