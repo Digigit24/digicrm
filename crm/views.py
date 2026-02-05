@@ -15,7 +15,8 @@ from .models import (
 from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
     LeadActivitySerializer, LeadOrderSerializer,
-    LeadFieldConfigurationSerializer
+    LeadFieldConfigurationSerializer,
+    BulkLeadDeleteSerializer, BulkLeadStatusUpdateSerializer
 )
 from common.mixins import TenantViewSetMixin
 from common.permissions import (
@@ -699,6 +700,166 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
             logger.error(f"Error in import_leads view: {str(e)}")
             return Response(
                 {'error': f'Failed to import leads: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @extend_schema(
+        description='Bulk delete multiple leads',
+        request=BulkLeadDeleteSerializer,
+        responses={200: {
+            'type': 'object',
+            'properties': {
+                'deleted_count': {'type': 'integer', 'description': 'Number of leads deleted'},
+                'message': {'type': 'string'}
+            }
+        }}
+    )
+    @action(detail=False, methods=['post'], url_path='bulk-delete')
+    def bulk_delete(self, request):
+        """
+        Bulk delete multiple leads by IDs.
+        Requires: crm.leads.delete permission
+
+        Request body:
+        {
+            "lead_ids": [1, 2, 3, ...]
+        }
+
+        Accessible at: POST /api/crm/leads/bulk-delete/
+        """
+        try:
+            # Check permission for deleting leads
+            if not self._has_crm_permission(request, 'crm.leads.delete'):
+                raise PermissionDenied({
+                    "error": "Permission denied",
+                    "detail": "You don't have permission to delete leads"
+                })
+
+            # Validate request data
+            serializer = BulkLeadDeleteSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+
+            lead_ids = serializer.validated_data['lead_ids']
+
+            logger.info(f"Bulk delete requested for {len(lead_ids)} leads by tenant: {request.tenant_id}")
+
+            # Get leads that belong to this tenant
+            leads_to_delete = Lead.objects.filter(
+                tenant_id=request.tenant_id,
+                id__in=lead_ids
+            )
+
+            # Check permission scope for "own" permission
+            delete_permission = get_nested_permission(
+                getattr(request, 'permissions', {}),
+                'crm.leads.delete'
+            )
+
+            if isinstance(delete_permission, str) and delete_permission == "own":
+                leads_to_delete = leads_to_delete.filter(owner_user_id=request.user_id)
+
+            deleted_count = leads_to_delete.count()
+            leads_to_delete.delete()
+
+            logger.info(f"Bulk deleted {deleted_count} leads for tenant: {request.tenant_id}")
+
+            return Response({
+                'deleted_count': deleted_count,
+                'message': f'Successfully deleted {deleted_count} leads'
+            })
+
+        except PermissionDenied:
+            raise
+        except Exception as e:
+            logger.error(f"Error in bulk_delete view: {str(e)}")
+            return Response(
+                {'error': f'Failed to bulk delete leads: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @extend_schema(
+        description='Bulk update status for multiple leads',
+        request=BulkLeadStatusUpdateSerializer,
+        responses={200: {
+            'type': 'object',
+            'properties': {
+                'updated_count': {'type': 'integer', 'description': 'Number of leads updated'},
+                'message': {'type': 'string'}
+            }
+        }}
+    )
+    @action(detail=False, methods=['post'], url_path='bulk-status-update')
+    def bulk_status_update(self, request):
+        """
+        Bulk update status for multiple leads.
+        Requires: crm.leads.update permission
+
+        Request body:
+        {
+            "lead_ids": [1, 2, 3, ...],
+            "status_id": 5  // or null to clear status
+        }
+
+        Accessible at: POST /api/crm/leads/bulk-status-update/
+        """
+        try:
+            # Check permission for updating leads
+            if not self._has_crm_permission(request, 'crm.leads.update'):
+                raise PermissionDenied({
+                    "error": "Permission denied",
+                    "detail": "You don't have permission to update leads"
+                })
+
+            # Validate request data
+            serializer = BulkLeadStatusUpdateSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+
+            lead_ids = serializer.validated_data['lead_ids']
+            status_id = serializer.validated_data['status_id']
+
+            logger.info(f"Bulk status update requested for {len(lead_ids)} leads by tenant: {request.tenant_id}")
+
+            # Validate status exists (if not null)
+            if status_id is not None:
+                if not LeadStatus.objects.filter(
+                    tenant_id=request.tenant_id,
+                    id=status_id
+                ).exists():
+                    return Response(
+                        {'error': f'Status with ID {status_id} not found'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            # Get leads that belong to this tenant
+            leads_to_update = Lead.objects.filter(
+                tenant_id=request.tenant_id,
+                id__in=lead_ids
+            )
+
+            # Check permission scope for "own" permission
+            update_permission = get_nested_permission(
+                getattr(request, 'permissions', {}),
+                'crm.leads.update'
+            )
+
+            if isinstance(update_permission, str) and update_permission == "own":
+                leads_to_update = leads_to_update.filter(owner_user_id=request.user_id)
+
+            updated_count = leads_to_update.update(status_id=status_id)
+
+            logger.info(f"Bulk updated status for {updated_count} leads to status_id={status_id} for tenant: {request.tenant_id}")
+
+            return Response({
+                'updated_count': updated_count,
+                'message': f'Successfully updated status for {updated_count} leads'
+            })
+
+        except PermissionDenied:
+            raise
+        except Exception as e:
+            logger.error(f"Error in bulk_status_update view: {str(e)}")
+            return Response(
+                {'error': f'Failed to bulk update lead status: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 

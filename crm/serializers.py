@@ -79,6 +79,28 @@ class LeadListSerializer(TenantMixin):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
 
+class BulkLeadDeleteSerializer(serializers.Serializer):
+    """Serializer for bulk lead deletion"""
+    lead_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        min_length=1,
+        help_text="List of lead IDs to delete"
+    )
+
+
+class BulkLeadStatusUpdateSerializer(serializers.Serializer):
+    """Serializer for bulk lead status update"""
+    lead_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        min_length=1,
+        help_text="List of lead IDs to update"
+    )
+    status_id = serializers.IntegerField(
+        allow_null=True,
+        help_text="Status ID to set for all leads (null to clear status)"
+    )
+
+
 class LeadFieldConfigurationSerializer(TenantMixin):
     """
     Unified serializer for Lead field configurations.
