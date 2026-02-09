@@ -657,7 +657,9 @@ class WorkflowViewSet(viewsets.ModelViewSet):
 
         POST /api/integrations/workflows/:id/test/
         {
-            "trigger_data": {...} (optional)
+            "trigger_data": {...} (optional),
+            "reset_last_processed": false (optional),
+            "async": false (optional, auto-enabled for large batches)
         }
         """
         workflow = self.get_object()
@@ -667,6 +669,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
 
         trigger_data = serializer.validated_data.get('trigger_data')
         reset_last_processed = serializer.validated_data.get('reset_last_processed', False)
+        force_async = request.data.get('async', False)
 
         try:
             # Optionally reset last processed record to force full read
@@ -675,25 +678,51 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                 workflow.trigger.last_checked_at = None
                 workflow.trigger.save(update_fields=['last_processed_record', 'last_checked_at', 'updated_at'])
 
-            engine = WorkflowEngine(workflow)
-
+            # For single trigger_data items, run synchronously
             if trigger_data:
-                # Use provided test data
+                engine = WorkflowEngine(workflow)
                 execution_logs = engine.execute_workflow([trigger_data])
-            else:
-                # Check trigger automatically
-                execution_logs = engine.execute_workflow()
 
-            if not execution_logs:
+                if not execution_logs:
+                    return Response({
+                        'message': 'No trigger data found to execute workflow',
+                        'executions': []
+                    })
+
+                return Response({
+                    'message': f'Workflow executed {len(execution_logs)} time(s)',
+                    'executions': ExecutionLogListSerializer(execution_logs, many=True).data
+                })
+
+            # For automatic trigger checks, peek at how many rows to process
+            engine = WorkflowEngine(workflow)
+            new_rows = engine.check_trigger()
+
+            if not new_rows:
                 return Response({
                     'message': 'No trigger data found to execute workflow',
                     'executions': []
                 })
 
+            # For small batches (<=5 rows), run synchronously
+            if len(new_rows) <= 5 and not force_async:
+                execution_logs = engine.execute_workflow(new_rows)
+                return Response({
+                    'message': f'Workflow executed {len(execution_logs)} time(s)',
+                    'executions': ExecutionLogListSerializer(execution_logs, many=True).data
+                })
+
+            # For large batches, dispatch to Celery and return immediately
+            from integrations.tasks import execute_workflow_async
+            task = execute_workflow_async.delay(workflow.id)
+
             return Response({
-                'message': f'Workflow executed {len(execution_logs)} time(s)',
-                'executions': ExecutionLogListSerializer(execution_logs, many=True).data
-            })
+                'message': f'Found {len(new_rows)} rows. Processing in background.',
+                'async': True,
+                'task_id': str(task.id),
+                'rows_found': len(new_rows),
+                'hint': 'Check execution logs for results: GET /api/integrations/workflows/{id}/execution-logs/'
+            }, status=status.HTTP_202_ACCEPTED)
 
         except WorkflowEngineError as e:
             logger.error(f"Workflow test failed: {e}")

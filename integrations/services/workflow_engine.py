@@ -168,14 +168,12 @@ class WorkflowEngine:
             )
 
             if new_rows:
-                # Update last processed record
-                last_row = new_rows[-1]
-                trigger.last_processed_record = {
-                    'row_number': last_row['_row_number'],
-                    'checked_at': timezone.now().isoformat()
-                }
+                # NOTE: Do NOT update last_processed_record here.
+                # It is updated progressively in _execute_single_workflow()
+                # after each row is successfully processed, to avoid data loss
+                # if the request is canceled or processing fails partway through.
                 trigger.last_checked_at = timezone.now()
-                trigger.save(update_fields=['last_processed_record', 'last_checked_at', 'updated_at'])
+                trigger.save(update_fields=['last_checked_at', 'updated_at'])
 
                 self._log_step(
                     'check_trigger',
@@ -634,6 +632,19 @@ class WorkflowEngine:
                 execution_steps=self.execution_steps
             )
 
+            # Progressively update last_processed_record after each successful row
+            # so that if the process is interrupted, already-processed rows won't be re-read
+            row_number = trigger_data.get('_row_number')
+            if row_number is not None and hasattr(self.workflow, 'trigger'):
+                trigger = self.workflow.trigger
+                last_processed = trigger.last_processed_record or {}
+                if row_number > last_processed.get('row_number', 0):
+                    trigger.last_processed_record = {
+                        'row_number': row_number,
+                        'checked_at': timezone.now().isoformat()
+                    }
+                    trigger.save(update_fields=['last_processed_record', 'updated_at'])
+
             logger.info(
                 f"Workflow {self.workflow.name} executed successfully "
                 f"(execution_id: {execution_log.execution_id})"
@@ -650,6 +661,20 @@ class WorkflowEngine:
             # Update execution steps
             execution_log.execution_steps = self.execution_steps
             execution_log.save(update_fields=['execution_steps'])
+
+            # Still update last_processed_record for failed rows to avoid re-processing
+            # rows that will keep failing (e.g., invalid data). The failure is recorded
+            # in the execution log for review.
+            row_number = trigger_data.get('_row_number')
+            if row_number is not None and hasattr(self.workflow, 'trigger'):
+                trigger = self.workflow.trigger
+                last_processed = trigger.last_processed_record or {}
+                if row_number > last_processed.get('row_number', 0):
+                    trigger.last_processed_record = {
+                        'row_number': row_number,
+                        'checked_at': timezone.now().isoformat()
+                    }
+                    trigger.save(update_fields=['last_processed_record', 'updated_at'])
 
             logger.error(
                 f"Workflow {self.workflow.name} execution failed: {e}",
