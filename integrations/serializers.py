@@ -188,7 +188,8 @@ class WorkflowCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Workflow
-        fields = ['name', 'description', 'connection_id', 'is_active']
+        fields = ['id', 'name', 'description', 'connection_id', 'is_active']
+        read_only_fields = ['id']
 
     def validate_connection_id(self, value):
         """Validate that connection exists and belongs to tenant"""

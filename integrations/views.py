@@ -14,7 +14,7 @@ import logging
 import uuid
 from django.utils import timezone
 from django.db.models import Q
-from rest_framework import viewsets, status
+from rest_framework import serializers, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
@@ -831,6 +831,18 @@ class WorkflowTriggerViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = WorkflowTriggerSerializer
 
+    def initial(self, request, *args, **kwargs):
+        """Validate workflow_pk is a valid integer before processing"""
+        super().initial(request, *args, **kwargs)
+        workflow_pk = self.kwargs.get('workflow_pk')
+        if workflow_pk is not None:
+            try:
+                int(workflow_pk)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    {"workflow_id": f"Invalid workflow ID: '{workflow_pk}'. Must be a number."}
+                )
+
     def get_queryset(self):
         """Get triggers for workflows owned by current tenant"""
         tenant_id = getattr(self.request, 'tenant_id', None)
@@ -881,6 +893,18 @@ class WorkflowActionViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     serializer_class = WorkflowActionSerializer
 
+    def initial(self, request, *args, **kwargs):
+        """Validate workflow_pk is a valid integer before processing"""
+        super().initial(request, *args, **kwargs)
+        workflow_pk = self.kwargs.get('workflow_pk')
+        if workflow_pk is not None:
+            try:
+                int(workflow_pk)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    {"workflow_id": f"Invalid workflow ID: '{workflow_pk}'. Must be a number."}
+                )
+
     def get_queryset(self):
         """Get actions for a workflow"""
         tenant_id = getattr(self.request, 'tenant_id', None)
@@ -923,6 +947,20 @@ class WorkflowMappingViewSet(viewsets.ModelViewSet):
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = WorkflowMappingSerializer
+
+    def initial(self, request, *args, **kwargs):
+        """Validate URL kwargs are valid integers before processing"""
+        super().initial(request, *args, **kwargs)
+        for param in ('workflow_pk', 'action_pk'):
+            value = self.kwargs.get(param)
+            if value is not None:
+                try:
+                    int(value)
+                except (ValueError, TypeError):
+                    field_name = param.replace('_pk', '_id')
+                    raise serializers.ValidationError(
+                        {field_name: f"Invalid {field_name}: '{value}'. Must be a number."}
+                    )
 
     def get_queryset(self):
         """Get mappings for a workflow action"""
@@ -969,6 +1007,18 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
     filterset_fields = ['status', 'workflow_id']
     ordering_fields = ['started_at', 'finished_at', 'status']
     ordering = ['-started_at']
+
+    def initial(self, request, *args, **kwargs):
+        """Validate workflow_pk is a valid integer before processing"""
+        super().initial(request, *args, **kwargs)
+        workflow_pk = self.kwargs.get('workflow_pk')
+        if workflow_pk is not None:
+            try:
+                int(workflow_pk)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError(
+                    {"workflow_id": f"Invalid workflow ID: '{workflow_pk}'. Must be a number."}
+                )
 
     def get_queryset(self):
         """Get execution logs for current tenant"""
