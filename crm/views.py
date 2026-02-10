@@ -1132,3 +1132,57 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
                 {'error': 'Failed to fetch field schema'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+def debug_lead_count(request):
+    """
+    Temporary standalone debug endpoint (no auth required).
+    Diagnoses why leads API returns empty results.
+    GET /api/crm/debug/
+    REMOVE after diagnosis is complete.
+    """
+    from django.http import JsonResponse
+    from django.db import connection as db_connection
+
+    try:
+        total_leads = Lead.objects.count()
+
+        # Get distinct tenant_ids in the leads table
+        distinct_tenants = list(
+            Lead.objects.values_list('tenant_id', flat=True).distinct()[:10]
+        )
+
+        # Get request tenant_id (may be None if no auth)
+        request_tenant_id = getattr(request, 'tenant_id', None)
+        tenant_leads = Lead.objects.filter(tenant_id=request_tenant_id).count() if request_tenant_id else 0
+
+        # Get the 3 most recent leads (any tenant)
+        recent_leads = list(
+            Lead.objects.order_by('-created_at').values(
+                'id', 'name', 'tenant_id', 'created_at', 'source'
+            )[:3]
+        )
+        for lead in recent_leads:
+            lead['tenant_id'] = str(lead['tenant_id'])
+            lead['created_at'] = lead['created_at'].isoformat() if lead['created_at'] else None
+
+        # Check the actual column type in the database
+        with db_connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = 'crm_lead' AND column_name = 'tenant_id'"
+            )
+            column_info = cursor.fetchone()
+
+        return JsonResponse({
+            'request_tenant_id': str(request_tenant_id) if request_tenant_id else None,
+            'request_tenant_id_type': type(request_tenant_id).__name__,
+            'total_leads_all_tenants': total_leads,
+            'leads_for_request_tenant': tenant_leads,
+            'distinct_tenant_ids_in_db': [str(t) for t in distinct_tenants],
+            'recent_leads': recent_leads,
+            'db_engine': db_connection.vendor,
+            'tenant_id_column_info': list(column_info) if column_info else None,
+        })
+    except Exception as e:
+        return JsonResponse({'error': str(e)}, status=500)

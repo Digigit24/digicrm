@@ -49,6 +49,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/schema.json',
         '/api/schema.yaml',
         '/api/logs/',  # Logs endpoint - public for monitoring
+        '/api/crm/debug/',  # Temporary debug endpoint - REMOVE after diagnosis
     ]
 
     def process_request(self, request):
