@@ -382,6 +382,15 @@ FRONTEND_OAUTH_CALLBACK_URL = config('FRONTEND_OAUTH_CALLBACK_URL', default=f"{c
 INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)
 
 # ===========================
+# CACHE CONFIGURATION
+# ===========================
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'django_cache',
+    }
+}
+
 # CELERY CONFIGURATION
 # ===========================
 
