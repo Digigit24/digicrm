@@ -366,6 +366,11 @@ class TestWorkflowSerializer(serializers.Serializer):
         default=False,
         help_text="Reset last_processed_record before test to read all rows"
     )
+    clear_duplicates = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Clear duplicate detection cache before test to allow re-processing all rows"
+    )
 
 
 class WorkflowStatsSerializer(serializers.Serializer):

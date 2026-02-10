@@ -659,6 +659,7 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         {
             "trigger_data": {...} (optional),
             "reset_last_processed": false (optional),
+            "clear_duplicates": false (optional),
             "async": false (optional, auto-enabled for large batches)
         }
         """
@@ -669,9 +670,18 @@ class WorkflowViewSet(viewsets.ModelViewSet):
 
         trigger_data = serializer.validated_data.get('trigger_data')
         reset_last_processed = serializer.validated_data.get('reset_last_processed', False)
+        clear_duplicates = serializer.validated_data.get('clear_duplicates', False)
         force_async = request.data.get('async', False)
 
         try:
+            # Optionally clear duplicate detection cache
+            if clear_duplicates:
+                from integrations.models import DuplicateDetectionCache
+                deleted_count = DuplicateDetectionCache.objects.filter(
+                    workflow=workflow
+                ).delete()[0]
+                logger.info(f"Cleared {deleted_count} duplicate cache entries for workflow {workflow.id}")
+
             # Optionally reset last processed record to force full read
             if reset_last_processed and hasattr(workflow, 'trigger'):
                 workflow.trigger.last_processed_record = None
