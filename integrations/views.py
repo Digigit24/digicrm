@@ -152,7 +152,9 @@ class ConnectionViewSet(viewsets.ModelViewSet):
 
             # Get OAuth handler
             oauth_handler = get_oauth_handler()
+            logger.info(f"OAuth redirect_uri: {oauth_handler.redirect_uri}")
             authorization_url, state = oauth_handler.get_authorization_url(state)
+            logger.info(f"OAuth authorization_url: {authorization_url}")
 
             # Cache state for validation
             cache_key = f"oauth_state:{state}"
@@ -202,12 +204,11 @@ class ConnectionViewSet(viewsets.ModelViewSet):
         Returns: Connection details
         """
         # Handle GET request from Google OAuth redirect
-        # Handle GET request from Google OAuth redirect
         if request.method == 'GET':
             from django.shortcuts import redirect
             from django.conf import settings as django_settings
 
-            logger.info(f"oauth_callback GET request from Google with params: {request.GET}")
+            logger.warning(f"=== OAUTH CALLBACK HIT === method=GET params={request.GET}")
             code = request.GET.get('code')
             state = request.GET.get('state')
             error = request.GET.get('error')
