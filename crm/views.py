@@ -119,6 +119,43 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
             return LeadListSerializer
         return LeadSerializer
 
+    @action(detail=False, methods=['get'])
+    def debug_count(self, request):
+        """
+        Temporary diagnostic endpoint to debug empty leads issue.
+        GET /api/crm/leads/debug_count/
+        """
+        from django.db import connection as db_connection
+        tenant_id = getattr(request, 'tenant_id', None)
+        total_leads = Lead.objects.count()
+        tenant_leads = Lead.objects.filter(tenant_id=tenant_id).count() if tenant_id else 0
+
+        # Get distinct tenant_ids in the leads table
+        distinct_tenants = list(
+            Lead.objects.values_list('tenant_id', flat=True).distinct()[:10]
+        )
+
+        # Get the 3 most recent leads (any tenant)
+        recent_leads = list(
+            Lead.objects.order_by('-created_at').values(
+                'id', 'name', 'tenant_id', 'created_at', 'source'
+            )[:3]
+        )
+        # Serialize for JSON
+        for lead in recent_leads:
+            lead['tenant_id'] = str(lead['tenant_id'])
+            lead['created_at'] = lead['created_at'].isoformat() if lead['created_at'] else None
+
+        return Response({
+            'request_tenant_id': str(tenant_id) if tenant_id else None,
+            'request_tenant_id_type': type(tenant_id).__name__,
+            'total_leads_all_tenants': total_leads,
+            'leads_for_request_tenant': tenant_leads,
+            'distinct_tenant_ids_in_db': [str(t) for t in distinct_tenants],
+            'recent_leads': recent_leads,
+            'db_engine': db_connection.vendor,
+        })
+
     @extend_schema(
         description='Get leads organized by status for kanban board view',
         responses={200: {
