@@ -712,17 +712,25 @@ class WorkflowViewSet(viewsets.ModelViewSet):
                     'executions': ExecutionLogListSerializer(execution_logs, many=True).data
                 })
 
-            # For large batches, dispatch to Celery and return immediately
-            from integrations.tasks import execute_workflow_async
-            task = execute_workflow_async.delay(workflow.id)
+            # For large batches, try dispatching to Celery; fall back to sync
+            try:
+                from integrations.tasks import execute_workflow_async
+                task = execute_workflow_async.delay(workflow.id)
 
-            return Response({
-                'message': f'Found {len(new_rows)} rows. Processing in background.',
-                'async': True,
-                'task_id': str(task.id),
-                'rows_found': len(new_rows),
-                'hint': 'Check execution logs for results: GET /api/integrations/workflows/{id}/execution-logs/'
-            }, status=status.HTTP_202_ACCEPTED)
+                return Response({
+                    'message': f'Found {len(new_rows)} rows. Processing in background.',
+                    'async': True,
+                    'task_id': str(task.id),
+                    'rows_found': len(new_rows),
+                    'hint': 'Check execution logs for results: GET /api/integrations/workflows/{id}/execution-logs/'
+                }, status=status.HTTP_202_ACCEPTED)
+            except Exception as celery_err:
+                logger.warning(f"Celery unavailable ({celery_err}), falling back to synchronous execution for {len(new_rows)} rows")
+                execution_logs = engine.execute_workflow(new_rows)
+                return Response({
+                    'message': f'Workflow executed {len(execution_logs)} time(s) (sync fallback, Celery unavailable)',
+                    'executions': ExecutionLogListSerializer(execution_logs, many=True).data
+                })
 
         except WorkflowEngineError as e:
             logger.error(f"Workflow test failed: {e}")
