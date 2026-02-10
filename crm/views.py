@@ -1141,6 +1141,8 @@ def debug_lead_count(request):
     GET /api/crm/debug/
     REMOVE after diagnosis is complete.
     """
+    import jwt as pyjwt
+    from django.conf import settings as django_settings
     from django.http import JsonResponse
     from django.db import connection as db_connection
 
@@ -1152,10 +1154,6 @@ def debug_lead_count(request):
             Lead.objects.values_list('tenant_id', flat=True).distinct()[:10]
         )
 
-        # Get request tenant_id (may be None if no auth)
-        request_tenant_id = getattr(request, 'tenant_id', None)
-        tenant_leads = Lead.objects.filter(tenant_id=request_tenant_id).count() if request_tenant_id else 0
-
         # Get the 3 most recent leads (any tenant)
         recent_leads = list(
             Lead.objects.order_by('-created_at').values(
@@ -1166,23 +1164,73 @@ def debug_lead_count(request):
             lead['tenant_id'] = str(lead['tenant_id'])
             lead['created_at'] = lead['created_at'].isoformat() if lead['created_at'] else None
 
-        # Check the actual column type in the database
-        with db_connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_name = 'crm_lead' AND column_name = 'tenant_id'"
-            )
-            column_info = cursor.fetchone()
+        # Decode JWT from Authorization header (if present) to show what tenant_id
+        # the middleware would use — even though middleware skips public paths
+        jwt_info = None
+        auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ', 1)[1]
+            try:
+                secret_key = getattr(django_settings, 'JWT_SECRET_KEY', '')
+                algorithm = getattr(django_settings, 'JWT_ALGORITHM', 'HS256')
+                payload = pyjwt.decode(token, secret_key, algorithms=[algorithm], leeway=30)
+                jwt_info = {
+                    'tenant_id': payload.get('tenant_id'),
+                    'tenant_slug': payload.get('tenant_slug'),
+                    'user_id': payload.get('user_id'),
+                    'email': payload.get('email'),
+                }
+            except Exception as jwt_err:
+                jwt_info = {'decode_error': str(jwt_err)}
+
+        # Show raw tenant-related headers (what middleware uses for override)
+        header_tenant_token = request.META.get('HTTP_TENANTTOKEN')
+        header_x_tenant_id = request.META.get('HTTP_X_TENANT_ID')
+        header_x_tenant_slug = request.META.get('HTTP_X_TENANT_SLUG')
+
+        # Determine the effective tenant_id the middleware would compute
+        effective_tenant_id = None
+        if jwt_info and 'tenant_id' in jwt_info:
+            effective_tenant_id = jwt_info['tenant_id']
+        if header_tenant_token:
+            effective_tenant_id = header_tenant_token
+        if header_x_tenant_id:
+            effective_tenant_id = header_x_tenant_id
+
+        # Count leads matching the effective tenant_id
+        effective_tenant_leads = 0
+        if effective_tenant_id:
+            try:
+                effective_tenant_leads = Lead.objects.filter(
+                    tenant_id=effective_tenant_id
+                ).count()
+            except Exception:
+                effective_tenant_leads = -1  # indicates filter error (e.g. invalid UUID)
+
+        # Check lead counts per tenant
+        from django.db.models import Count
+        tenant_counts = list(
+            Lead.objects.values('tenant_id')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:10]
+        )
+        for tc in tenant_counts:
+            tc['tenant_id'] = str(tc['tenant_id'])
 
         return JsonResponse({
-            'request_tenant_id': str(request_tenant_id) if request_tenant_id else None,
-            'request_tenant_id_type': type(request_tenant_id).__name__,
             'total_leads_all_tenants': total_leads,
-            'leads_for_request_tenant': tenant_leads,
             'distinct_tenant_ids_in_db': [str(t) for t in distinct_tenants],
+            'leads_per_tenant': tenant_counts,
             'recent_leads': recent_leads,
+            'jwt_payload_tenant_info': jwt_info,
+            'header_tenanttoken': header_tenant_token,
+            'header_x_tenant_id': header_x_tenant_id,
+            'header_x_tenant_slug': header_x_tenant_slug,
+            'effective_tenant_id': str(effective_tenant_id) if effective_tenant_id else None,
+            'effective_tenant_id_type': type(effective_tenant_id).__name__,
+            'leads_for_effective_tenant': effective_tenant_leads,
             'db_engine': db_connection.vendor,
-            'tenant_id_column_info': list(column_info) if column_info else None,
         })
     except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500)
+        import traceback
+        return JsonResponse({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
