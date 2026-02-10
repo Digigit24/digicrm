@@ -155,11 +155,17 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             authorization_url, state = oauth_handler.get_authorization_url(state)
 
             # Cache state for validation
-            cache.set(f"oauth_state:{state}", {
+            cache_key = f"oauth_state:{state}"
+            cache_data = {
                 'tenant_id': str(request.tenant_id),
                 'user_id': str(request.user_id),
                 'integration_id': integration_id
-            }, timeout=600)  # 10 minutes
+            }
+            cache.set(cache_key, cache_data, timeout=600)  # 10 minutes
+
+            # Verify cache write succeeded
+            verify = cache.get(cache_key)
+            logger.info(f"OAuth state cached: key={cache_key}, verify_read_back={verify is not None}, data={verify}")
 
             return Response({
                 'authorization_url': authorization_url,
@@ -221,9 +227,11 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 logger.info(f"Exchanging code in GET request...")
                 
                 # Get cached state
-                cached_state = cache.get(f"oauth_state:{state}")
+                cache_key = f"oauth_state:{state}"
+                cached_state = cache.get(cache_key)
+                logger.info(f"OAuth callback - cache lookup: key={cache_key}, found={cached_state is not None}")
                 if not cached_state:
-                    logger.error("State validation failed")
+                    logger.error(f"State validation failed - state not in cache. state={state}")
                     return redirect(f"{frontend_url}/integrations?oauth_error=invalid_state")
                 
                 tenant_id = cached_state['tenant_id']
