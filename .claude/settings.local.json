@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python manage.py check:*)",
-      "Bash(python check_urls.py:*)"
+      "Bash(python check_urls.py:*)",
+      "Bash(ls:*)"
     ]
   }
 }

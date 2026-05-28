@@ -1,7 +1,7 @@
 from rest_framework import viewsets, filters, status
 from rest_framework.decorators import action, renderer_classes
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiExample
@@ -26,6 +26,7 @@ from common.permissions import (
 import logging
 import csv
 import io
+import json
 from datetime import datetime
 try:
     import openpyxl
@@ -118,6 +119,37 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         if self.action == 'list':
             return LeadListSerializer
         return LeadSerializer
+
+    def create(self, request, *args, **kwargs):
+        """Create a lead, treating metadata.external_lead_id as idempotency key."""
+        metadata = request.data.get('metadata') or {}
+        external_lead_id = metadata.get('external_lead_id') if isinstance(metadata, dict) else None
+
+        if external_lead_id:
+            external_lead_id = str(external_lead_id).strip()
+            metadata['external_lead_id'] = external_lead_id
+            existing_lead = Lead.objects.filter(
+                tenant_id=request.tenant_id,
+                metadata__external_lead_id=str(external_lead_id)
+            ).first()
+
+            if existing_lead:
+                serializer = self.get_serializer(existing_lead)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        """Auto-set tenant_id and owner_user_id from the JWT when omitted."""
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        owner_user_id = serializer.validated_data.get('owner_user_id') or getattr(self.request, 'user_id', None)
+
+        if not tenant_id:
+            raise ValidationError({'tenant_id': 'Tenant ID is required'})
+        if not owner_user_id:
+            raise ValidationError({'owner_user_id': 'Owner user ID is required'})
+
+        serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
 
     @extend_schema(
         description='Get leads organized by status for kanban board view',
@@ -567,6 +599,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
 
             # Track phone numbers in this import batch to avoid duplicates within the batch
             batch_phones = set()
+            batch_external_lead_ids = set()
 
             for idx, lead_data in enumerate(leads_data, start=1):
                 try:
@@ -575,8 +608,8 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
                     name_raw = lead_data.get('name', lead_data.get('Name', ''))
 
                     # Clean phone and name - strip whitespace and tabs
-                    phone = phone_raw.strip() if phone_raw else ''
-                    name = name_raw.strip() if name_raw else ''
+                    phone = str(phone_raw).strip() if phone_raw else ''
+                    name = str(name_raw).strip() if name_raw else ''
 
                     # Validate required fields
                     if not phone:
@@ -621,6 +654,50 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
                         failed_count += 1
                         continue
 
+                    # Prepare lead metadata and idempotency key
+                    metadata = lead_data.get('metadata', lead_data.get('Metadata', None))
+                    if isinstance(metadata, str):
+                        metadata = metadata.strip()
+                        if metadata:
+                            try:
+                                metadata = json.loads(metadata)
+                            except json.JSONDecodeError:
+                                metadata = {'raw_metadata': metadata}
+                        else:
+                            metadata = None
+                    elif not isinstance(metadata, dict):
+                        metadata = None
+
+                    external_lead_id = None
+                    if metadata:
+                        external_lead_id = metadata.get('external_lead_id')
+                        if external_lead_id:
+                            external_lead_id = str(external_lead_id).strip()
+                            metadata['external_lead_id'] = external_lead_id
+
+                    if external_lead_id and Lead.objects.filter(
+                        tenant_id=request.tenant_id,
+                        metadata__external_lead_id=external_lead_id
+                    ).exists():
+                        failures.append({
+                            'row': idx,
+                            'phone': phone,
+                            'name': name,
+                            'reason': 'External lead ID already exists in database'
+                        })
+                        failed_count += 1
+                        continue
+
+                    if external_lead_id and external_lead_id in batch_external_lead_ids:
+                        failures.append({
+                            'row': idx,
+                            'phone': phone,
+                            'name': name,
+                            'reason': 'Duplicate external lead ID in import file'
+                        })
+                        failed_count += 1
+                        continue
+
                     # Prepare lead data
                     # Handle CSV field name variations (lowercase, capitalized, with spaces)
                     lead_dict = {
@@ -640,6 +717,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
                         'postal_code': (lead_data.get('postal_code') or lead_data.get('Postal Code') or lead_data.get('postal code') or '').strip() or None,
                         'owner_user_id': request.user_id,
                         'tenant_id': request.tenant_id,
+                        'metadata': metadata,
                     }
 
                     # Handle value_amount (supports: value_amount, Value Amount, value amount)
@@ -670,6 +748,8 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
                     # Add to batch phones set
                     batch_phones.add(phone)
                     existing_phones.add(phone)  # Also add to existing to prevent duplicates in same batch
+                    if external_lead_id:
+                        batch_external_lead_ids.add(external_lead_id)
 
                     success_count += 1
 

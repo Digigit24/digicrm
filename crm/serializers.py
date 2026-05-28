@@ -54,6 +54,9 @@ class LeadSerializer(TenantMixin):
             'state', 'country', 'postal_code', 'created_at', 'updated_at', 'activities'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'owner_user_id': {'required': False},
+        }
 
     def validate_lead_score(self, value):
         """Validate lead_score is between 0 and 100"""
