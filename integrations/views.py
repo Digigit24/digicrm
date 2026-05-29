@@ -19,6 +19,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.core.cache import cache
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiTypes
 
 from integrations.models import (
     Integration, Connection, Workflow, WorkflowTrigger,
@@ -47,8 +48,15 @@ logger = logging.getLogger(__name__)
 
 class IntegrationViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    ViewSet for listing available integrations.
-    Read-only as integrations are pre-configured.
+    List integration providers that can be connected to the CRM.
+
+    Use this endpoint when an agent needs to discover available external
+    systems, such as Google Sheets or webhooks, before starting a connection or
+    workflow setup. These records describe provider capabilities and whether
+    OAuth is required.
+
+    This endpoint is read-only. Integration provider definitions are configured
+    by the system, not by tenant users.
     """
     queryset = Integration.objects.filter(is_active=True)
     serializer_class = IntegrationSerializer
@@ -62,16 +70,16 @@ class IntegrationViewSet(viewsets.ReadOnlyModelViewSet):
 
 class ConnectionViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for managing OAuth connections.
+    Manage tenant connections to external integration providers.
 
-    Endpoints:
-    - GET /connections/ - List user's connections
-    - GET /connections/:id/ - Get connection details
-    - POST /connections/initiate_oauth/ - Start OAuth flow
-    - POST /connections/oauth_callback/ - Handle OAuth callback
-    - POST /connections/:id/disconnect/ - Disconnect connection
-    - POST /connections/:id/refresh_token/ - Refresh access token
-    - GET /connections/:id/test/ - Test connection
+    Use this endpoint when an agent needs to connect Google Sheets or another
+    provider, inspect connection health, start or complete OAuth, refresh an
+    access token, disconnect an account, test whether a connection works, or
+    browse spreadsheets and sheets available through the connection.
+
+    Connection records are tenant-scoped. Agents should never expose encrypted
+    token values to users; use the status, expiry, and test endpoints to reason
+    about connection health.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
@@ -476,6 +484,10 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @extend_schema(
+        description='List spreadsheets available through this connected Google account.',
+        responses=SpreadsheetListSerializer(many=True)
+    )
     @action(detail=True, methods=['get'])
     def spreadsheets(self, request, pk=None):
         """
@@ -503,6 +515,19 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @extend_schema(
+        description='List worksheet tabs in a spreadsheet using spreadsheet_id as a query parameter.',
+        parameters=[
+            OpenApiParameter(
+                name='spreadsheet_id',
+                location=OpenApiParameter.QUERY,
+                required=True,
+                type=str,
+                description='Google spreadsheet ID whose worksheet tabs should be listed.'
+            )
+        ],
+        responses=SheetListSerializer(many=True)
+    )
     @action(detail=True, methods=['get'], url_path='sheets')
     def list_sheets(self, request, pk=None):
         """
@@ -533,6 +558,26 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @extend_schema(
+        description='Read the header row for a worksheet so fields can be mapped into CRM destinations.',
+        parameters=[
+            OpenApiParameter(
+                name='spreadsheet_id',
+                location=OpenApiParameter.QUERY,
+                required=True,
+                type=str,
+                description='Google spreadsheet ID that contains the worksheet.'
+            ),
+            OpenApiParameter(
+                name='sheet_name',
+                location=OpenApiParameter.QUERY,
+                required=True,
+                type=str,
+                description='Worksheet tab name whose first row should be read as column headers.'
+            )
+        ],
+        responses={200: {'type': 'object', 'properties': {'headers': {'type': 'array', 'items': {'type': 'string'}}}}}
+    )
     @action(detail=True, methods=['get'], url_path='sheet-columns')
     def sheet_columns(self, request, pk=None):
         """
@@ -569,6 +614,19 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+    @extend_schema(
+        description='List worksheet tabs in a spreadsheet using spreadsheet_id as a path parameter.',
+        parameters=[
+            OpenApiParameter(
+                name='spreadsheet_id',
+                location=OpenApiParameter.PATH,
+                required=True,
+                type=str,
+                description='Google spreadsheet ID whose worksheet tabs should be listed.'
+            )
+        ],
+        responses=SheetListSerializer(many=True)
+    )
     @action(detail=True, methods=['get'], url_path='spreadsheets/(?P<spreadsheet_id>[^/.]+)/sheets')
     def sheets(self, request, pk=None, spreadsheet_id=None):
         """
@@ -593,20 +651,32 @@ class ConnectionViewSet(viewsets.ModelViewSet):
             )
 
 
+@extend_schema_view(
+    list=extend_schema(
+        description='List tenant workflows, optionally filtered by active state.',
+        parameters=[
+            OpenApiParameter(
+                name='is_active',
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=OpenApiTypes.BOOL,
+                description='Filter workflows by active state. Use true for active workflows or false for inactive workflows.'
+            )
+        ]
+    )
+)
 class WorkflowViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for managing workflows.
+    Manage automation workflows that connect external data sources to CRM actions.
 
-    Endpoints:
-    - GET /workflows/ - List workflows
-    - POST /workflows/ - Create workflow
-    - GET /workflows/:id/ - Get workflow details
-    - PATCH /workflows/:id/ - Update workflow
-    - DELETE /workflows/:id/ - Delete workflow (soft delete)
-    - POST /workflows/:id/test/ - Test workflow manually
-    - POST /workflows/:id/toggle/ - Toggle active status
-    - GET /workflows/:id/executions/ - Get execution logs
-    - GET /workflows/stats/ - Get workflow statistics
+    Use this endpoint when an agent needs to create or inspect an automation,
+    activate or deactivate it, test it manually, view recent execution logs, or
+    retrieve tenant-level workflow statistics. Workflows typically connect a
+    trigger, such as a new Google Sheets row, to one or more actions, such as
+    creating a CRM lead.
+
+    Deleting a workflow performs a soft delete so historical execution data can
+    remain available for audit and debugging.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
@@ -659,6 +729,10 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         """Soft delete workflow"""
         instance.soft_delete()
 
+    @extend_schema(
+        description='Run a workflow manually using optional trigger data or the configured trigger source.',
+        request=TestWorkflowSerializer
+    )
     @action(detail=True, methods=['post'])
     def test(self, request, pk=None):
         """
@@ -796,6 +870,18 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         serializer = ExecutionLogListSerializer(logs, many=True)
         return Response(serializer.data)
 
+    @extend_schema(
+        description='List all mappings for a workflow or create a mapping for one of its actions.',
+        parameters=[
+            OpenApiParameter(
+                name='workflow_action_id',
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=OpenApiTypes.INT,
+                description='For POST requests, the numeric workflow action ID can also be provided in the request body.'
+            )
+        ]
+    )
     @action(detail=True, methods=['get', 'post'])
     def mappings(self, request, pk=None):
         """
@@ -877,11 +963,24 @@ class WorkflowViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+@extend_schema(
+    parameters=[
+        OpenApiParameter(
+            name='workflow_pk',
+            location=OpenApiParameter.PATH,
+            required=True,
+            type=OpenApiTypes.INT,
+            description='Numeric workflow ID that owns this trigger.'
+        )
+    ]
+)
 class WorkflowTriggerViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for managing workflow triggers.
+    Manage triggers for a specific workflow.
 
-    Triggers are tied to workflows (one-to-one relationship).
+    Use this nested endpoint when an agent needs to configure what starts an
+    automation, such as a new spreadsheet row, updated row, webhook event,
+    schedule, or manual trigger. Each workflow can have one trigger.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
@@ -939,11 +1038,24 @@ class WorkflowTriggerViewSet(viewsets.ModelViewSet):
         )
 
 
+@extend_schema(
+    parameters=[
+        OpenApiParameter(
+            name='workflow_pk',
+            location=OpenApiParameter.PATH,
+            required=True,
+            type=OpenApiTypes.INT,
+            description='Numeric workflow ID that owns these actions.'
+        )
+    ]
+)
 class WorkflowActionViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for managing workflow actions.
+    Manage ordered actions for a specific workflow.
 
-    Actions belong to workflows and are executed in order.
+    Use this nested endpoint when an agent needs to define what happens after a
+    workflow trigger fires. Actions can create leads, update leads, create
+    tasks, send email, or call a webhook, depending on action_type.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
@@ -994,11 +1106,31 @@ class WorkflowActionViewSet(viewsets.ModelViewSet):
         )
 
 
+@extend_schema(
+    parameters=[
+        OpenApiParameter(
+            name='workflow_pk',
+            location=OpenApiParameter.PATH,
+            required=True,
+            type=OpenApiTypes.INT,
+            description='Numeric workflow ID that owns the action.'
+        ),
+        OpenApiParameter(
+            name='action_pk',
+            location=OpenApiParameter.PATH,
+            required=True,
+            type=OpenApiTypes.INT,
+            description='Numeric workflow action ID that owns these mappings.'
+        )
+    ]
+)
 class WorkflowMappingViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for managing field mappings.
+    Manage field mappings for a specific workflow action.
 
-    Mappings belong to workflow actions.
+    Use this nested endpoint when an agent needs to map source fields from a
+    trigger, such as spreadsheet columns, into destination CRM fields. Mappings
+    can include defaults, validation rules, and transformations.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
@@ -1051,12 +1183,27 @@ class WorkflowMappingViewSet(viewsets.ModelViewSet):
         )
 
 
+@extend_schema(
+    parameters=[
+        OpenApiParameter(
+            name='workflow_pk',
+            location=OpenApiParameter.PATH,
+            required=False,
+            type=OpenApiTypes.INT,
+            description='Optional numeric workflow ID when using nested workflow execution-log routes.'
+        )
+    ]
+)
 class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    ViewSet for viewing execution logs.
+    View workflow execution logs for automation monitoring and debugging.
 
-    Read-only as logs are created by the system.
-    Supports both nested URL (/workflows/:id/execution-logs/) and root URL (/execution-logs/?workflow_id=:id)
+    Use this endpoint when an agent needs to inspect whether automations ran
+    successfully, diagnose failures, review trigger input and result output, or
+    see retry history. Logs are read-only because they are created by the
+    workflow engine.
+
+    Supports both nested workflow URLs and root-level filtering by workflow_id.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]

@@ -3,7 +3,11 @@
     "allow": [
       "Bash(python manage.py check:*)",
       "Bash(python check_urls.py:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Skill(firecrawl)",
+      "Skill(firecrawl:*)",
+      "Bash(firecrawl map *)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(u\\) for u in d.get\\('links',[]\\)]\")"
     ]
   }
 }

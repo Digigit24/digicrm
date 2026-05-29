@@ -22,8 +22,18 @@ logger = logging.getLogger(__name__)
 )
 class TaskViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Tasks
-    Requires: crm.tasks permissions
+    Manage follow-up tasks, reminders, assignments, and checklists for leads.
+
+    Use this endpoint when an agent needs to create work items for a lead,
+    assign tasks to team members, track task status, set due dates, or find
+    overdue and completed follow-ups. Tasks are useful for operational CRM work
+    such as "call this lead tomorrow", "send proposal", or "collect documents".
+
+    Query parameters support filtering by lead, status, priority, assignee,
+    reporter, due date, completion date, and created date. The search parameter
+    searches task title and description.
+
+    Required permissions are based on crm.tasks actions.
     """
     queryset = Task.objects.select_related('lead')
     serializer_class = TaskSerializer

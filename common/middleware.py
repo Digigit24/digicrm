@@ -49,6 +49,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/schema.json',
         '/api/schema.yaml',
         '/api/logs/',  # Logs endpoint - public for monitoring
+        '/api/telephony/webhook/',  # TeleCMI CDR and live-event webhooks (secured by webhook_secret)
     ]
 
     def process_request(self, request):

@@ -19,6 +19,7 @@ class IntegrationTypeEnum(models.TextChoices):
     ZAPIER = 'ZAPIER', 'Zapier'
     API = 'API', 'Generic API'
     EMAIL = 'EMAIL', 'Email'
+    TELECMI = 'TELECMI', 'TeleCMI Telephony'
 
 
 class ConnectionStatusEnum(models.TextChoices):

@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'payments',
     'tasks',
     'integrations',
+    'telephony',
 ]
 
 MIDDLEWARE = [
@@ -239,6 +240,18 @@ SPECTACULAR_SETTINGS = {
     'SERVE_INCLUDE_SCHEMA': False,
     'SCHEMA_PATH_PREFIX': '/api/',
     'COMPONENT_SPLIT_REQUEST': True,
+    'ENUM_NAME_OVERRIDES': {
+        'LeadPriorityEnum': 'crm.models.PriorityEnum.choices',
+        'LeadActivityTypeEnum': 'crm.models.ActivityTypeEnum.choices',
+        'TaskStatusEnum': 'tasks.models.TaskStatusEnum.choices',
+        'PaymentTypeEnum': 'payments.models.PaymentTypeEnum.choices',
+        'PaymentStatusEnum': 'payments.models.PaymentStatusEnum.choices',
+        'IntegrationTypeEnum': 'integrations.models.IntegrationTypeEnum.choices',
+        'ConnectionStatusEnum': 'integrations.models.ConnectionStatusEnum.choices',
+        'WorkflowTriggerTypeEnum': 'integrations.models.TriggerTypeEnum.choices',
+        'WorkflowActionTypeEnum': 'integrations.models.ActionTypeEnum.choices',
+        'WorkflowExecutionStatusEnum': 'integrations.models.ExecutionStatusEnum.choices',
+    },
 }
 
 # Logging Configuration

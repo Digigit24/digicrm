@@ -16,7 +16,17 @@ from common.mixins import TenantViewSetMixin
 )
 class PaymentViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Payments
+    Manage lead-related payments, invoices, advances, refunds, and receipts.
+
+    Use this endpoint when an agent needs to record a financial transaction for
+    a lead, inspect payment history, search by reference number, or filter
+    payments by type, status, date, amount, and currency. Payment records are
+    useful for tracking commercial progress after a lead becomes a paying
+    customer or has an invoice, advance, or refund event.
+
+    Query parameters support filtering by lead, payment type, status, date,
+    amount, currency, and created date. The search parameter searches reference
+    number, method, notes, and lead name.
     """
     queryset = Payment.objects.select_related('lead')
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]

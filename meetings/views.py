@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import extend_schema, extend_schema_view
+from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiTypes
 from django.db.models import Q
 from datetime import datetime, date, timedelta
 from .models import Meeting
@@ -27,8 +27,18 @@ logger = logging.getLogger(__name__)
 )
 class MeetingViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Meetings
-    Requires: crm.meetings permissions
+    Manage meetings, appointments, demos, and scheduled conversations with leads.
+
+    Use this endpoint when an agent needs to schedule a meeting, update meeting
+    time or location, connect a meeting to a lead, record meeting notes, or
+    retrieve upcoming calendar events. Meetings require a start and end time,
+    and the end time must be after the start time.
+
+    Query parameters support filtering by lead, start time, end time, and
+    created date. The search parameter searches title, location, description,
+    and notes.
+
+    Required permissions are based on crm.meetings actions.
     """
     queryset = Meeting.objects.select_related('lead')
     serializer_class = MeetingSerializer
@@ -73,27 +83,27 @@ class MeetingViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewS
     @extend_schema(
         description='Get meetings organized by date for calendar view',
         parameters=[
-            {
-                'name': 'start_date',
-                'in': 'query',
-                'description': 'Start date for calendar view (YYYY-MM-DD)',
-                'required': False,
-                'schema': {'type': 'string', 'format': 'date'}
-            },
-            {
-                'name': 'end_date',
-                'in': 'query',
-                'description': 'End date for calendar view (YYYY-MM-DD)',
-                'required': False,
-                'schema': {'type': 'string', 'format': 'date'}
-            },
-            {
-                'name': 'month',
-                'in': 'query',
-                'description': 'Month for calendar view (YYYY-MM)',
-                'required': False,
-                'schema': {'type': 'string', 'pattern': r'^\d{4}-\d{2}$'}
-            }
+            OpenApiParameter(
+                name='start_date',
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=OpenApiTypes.DATE,
+                description='Start date for the calendar range in YYYY-MM-DD format.'
+            ),
+            OpenApiParameter(
+                name='end_date',
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=OpenApiTypes.DATE,
+                description='End date for the calendar range in YYYY-MM-DD format.'
+            ),
+            OpenApiParameter(
+                name='month',
+                location=OpenApiParameter.QUERY,
+                required=False,
+                type=str,
+                description='Calendar month in YYYY-MM format. If provided, month takes precedence over start_date and end_date.'
+            )
         ],
         responses={200: {
             'type': 'object',

@@ -61,8 +61,18 @@ class CSVRenderer(BaseRenderer):
 )
 class LeadStatusViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Lead Statuses
-    Requires: crm.statuses permissions
+    Manage CRM pipeline statuses used to organize leads.
+
+    Use this endpoint when an agent needs to inspect or maintain the stages that
+    appear in the lead pipeline or kanban board. Typical operations include
+    listing active statuses in display order, creating a new stage such as
+    "Contacted" or "Qualified", updating colors and ordering, and marking a
+    status as won or lost.
+
+    Each status belongs to the authenticated tenant. Agents should use lead
+    status IDs from this endpoint when assigning a lead to a pipeline stage.
+
+    Required permissions are based on crm.statuses actions.
     """
     queryset = LeadStatus.objects.all()
     serializer_class = LeadStatusSerializer
@@ -86,8 +96,25 @@ class LeadStatusViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVi
 )
 class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Leads with comprehensive filtering
-    Requires: crm.leads permissions
+    Manage CRM leads, contacts, source attribution, and lead qualification data.
+
+    Use this endpoint when an agent needs to create a new lead, search existing
+    leads, update contact details, change priority or status, record source
+    attribution, or retrieve a full lead profile with its activity timeline.
+    This is the primary endpoint for external lead ingestion from websites,
+    Meta Lead Ads, Make.com workflows, manual CRM entry, and partner systems.
+
+    For external systems, send source-specific details in the metadata object.
+    The metadata.external_lead_id value is treated as an idempotency key during
+    normal create requests, so retrying the same external lead returns the
+    existing lead instead of creating a duplicate.
+
+    Query parameters support filtering by status, priority, score, owner,
+    assignee, created and updated dates, follow-up date, city, state, and
+    country. The standard search parameter searches name, phone, email,
+    company, and notes.
+
+    Required permissions are based on crm.leads actions.
     """
     queryset = Lead.objects.select_related('status').prefetch_related('activities')
     authentication_classes = [JWTAuthentication]
@@ -954,8 +981,18 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
 )
 class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Lead Activities
-    Requires: crm.activities permissions
+    Manage the activity timeline for leads.
+
+    Use this endpoint when an agent needs to record or inspect interactions
+    connected to a lead, such as calls, emails, meetings, notes, SMS messages,
+    and other follow-up events. Activities help explain what has happened with
+    a lead over time and who performed each interaction.
+
+    Agents should create an activity after important communication or status
+    changes when the user wants a timeline note. Activities are tenant-scoped
+    and can be filtered by lead, type, user, and date range.
+
+    Required permissions are based on crm.activities actions.
     """
     queryset = LeadActivity.objects.select_related('lead')
     serializer_class = LeadActivitySerializer
@@ -1033,8 +1070,17 @@ class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Model
 )
 class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Lead Orders (Kanban board positioning)
-    Requires: crm.leads permissions (same as leads since orders control lead positioning)
+    Manage lead positions within kanban pipeline columns.
+
+    Use this endpoint when an agent or UI needs to preserve the order of leads
+    inside a pipeline status column. It links a lead to a status and stores a
+    decimal position value that controls where the lead appears on the board.
+
+    This endpoint is for board layout and ordering. To change the business
+    status of a lead, update the lead itself or use the bulk status endpoint.
+
+    Required permissions follow crm.leads because ordering changes affect how
+    leads are managed in the pipeline.
     """
     queryset = LeadOrder.objects.select_related('lead', 'status')
     serializer_class = LeadOrderSerializer
@@ -1049,21 +1095,20 @@ class LeadOrderViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
 
 class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
     """
-    ViewSet for managing Lead Field Configurations.
-    Handles both standard Lead model fields and custom fields in a unified API.
+    Manage the lead field schema used by forms, imports, and CRM displays.
 
-    Standard fields: Pre-defined Lead model fields (visibility, display order)
-    Custom fields: Dynamic fields stored in Lead.metadata JSON
+    Use this endpoint when an agent needs to understand which lead fields are
+    available for a tenant, which fields are visible or required, and how custom
+    fields should be represented in Lead.metadata. It covers both standard lead
+    fields, such as name, phone, email, source, and notes, and custom fields
+    configured by the tenant.
 
-    Requires: crm.settings permissions (admin-level)
+    Agents should call the field_schema action before building dynamic forms or
+    mapping external data into tenant-specific custom fields. Standard fields
+    map directly to Lead model fields. Custom fields are stored in the lead
+    metadata JSON object using field_name as the metadata key.
 
-    Operations:
-    - list: List all lead field configurations
-    - retrieve: Retrieve a specific lead field configuration
-    - create: Create a new lead field configuration
-    - update: Update a lead field configuration
-    - partial_update: Partially update a lead field configuration
-    - destroy: Delete a lead field configuration
+    Required permissions are based on crm.settings actions.
     """
     queryset = LeadFieldConfiguration.objects.all()
     serializer_class = LeadFieldConfigurationSerializer
