@@ -10,14 +10,16 @@ from django.db.models import Count, Q
 from django.http import HttpResponse, StreamingHttpResponse
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
-    LeadFieldConfiguration
+    LeadFieldConfiguration, LeadAttachment
 )
 from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
     LeadActivitySerializer, LeadOrderSerializer,
     LeadFieldConfigurationSerializer,
-    BulkLeadDeleteSerializer, BulkLeadStatusUpdateSerializer
+    BulkLeadDeleteSerializer, BulkLeadStatusUpdateSerializer,
+    LeadAttachmentSerializer
 )
+from .zata_client import upload_to_zata, delete_from_zata
 from common.mixins import TenantViewSetMixin
 from common.permissions import (
     CRMPermissionMixin, HasCRMPermission,
@@ -969,6 +971,108 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
                 {'error': f'Failed to bulk update lead status: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+    @extend_schema(
+        description='List or upload attachments for a specific lead',
+        request={
+            'multipart/form-data': {
+                'type': 'object',
+                'properties': {
+                    'file': {'type': 'string', 'format': 'binary'}
+                },
+                'required': ['file']
+            }
+        },
+        responses={
+            200: LeadAttachmentSerializer(many=True),
+            201: LeadAttachmentSerializer,
+        },
+        parameters=[
+            OpenApiParameter('X-Zata-Bucket', str, OpenApiParameter.HEADER, description='Zata workspace bucket name'),
+            OpenApiParameter('X-Zata-Folder-ID', str, OpenApiParameter.HEADER, description='Target Zata folder UUID'),
+        ]
+    )
+    @action(detail=True, methods=['get', 'post'], url_path='attachments', url_name='attachments')
+    def attachments(self, request, pk=None):
+        """
+        GET  /api/crm/leads/<pk>/attachments/ — list attachments for a lead
+        POST /api/crm/leads/<pk>/attachments/ — upload a file to Zata and record the attachment
+        """
+        lead = self.get_object()
+
+        if request.method == 'GET':
+            if not self._has_crm_permission(request, 'crm.leads.view'):
+                raise PermissionDenied({'error': 'Permission denied', 'detail': "You don't have permission to view attachments"})
+
+            qs = LeadAttachment.objects.filter(lead=lead, tenant_id=request.tenant_id)
+            serializer = LeadAttachmentSerializer(qs, many=True)
+            return Response(serializer.data)
+
+        # POST — upload
+        if not self._has_crm_permission(request, 'crm.leads.create'):
+            raise PermissionDenied({'error': 'Permission denied', 'detail': "You don't have permission to upload attachments"})
+
+        uploaded_file = request.FILES.get('file')
+        if not uploaded_file:
+            return Response({'error': 'No file provided. Send the file under the "file" field.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        folder_id = request.META.get('HTTP_X_ZATA_FOLDER_ID')
+        if not folder_id:
+            return Response({'error': 'X-Zata-Folder-ID header is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            zata_result = upload_to_zata(uploaded_file, folder_id, uploaded_file.name)
+        except Exception as e:
+            logger.error(f"Zata upload failed for lead {lead.id}: {e}")
+            return Response({'error': f'Zata upload failed: {str(e)}'}, status=status.HTTP_502_BAD_GATEWAY)
+
+        attachment = LeadAttachment.objects.create(
+            tenant_id=request.tenant_id,
+            lead=lead,
+            file_name=uploaded_file.name,
+            file_size=uploaded_file.size,
+            mime_type=uploaded_file.content_type or 'application/octet-stream',
+            zata_video_id=zata_result.get('id'),
+            download_url=zata_result.get('download_url') or '',
+            uploaded_by=getattr(request, 'user_id', None),
+        )
+
+        serializer = LeadAttachmentSerializer(attachment)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        description='Delete a specific attachment from a lead',
+        responses={204: None}
+    )
+    @action(
+        detail=True,
+        methods=['delete'],
+        url_path=r'attachments/(?P<attachment_id>[^/.]+)',
+        url_name='attachment-detail'
+    )
+    def delete_attachment(self, request, pk=None, attachment_id=None):
+        """
+        DELETE /api/crm/leads/<pk>/attachments/<attachment_id>/
+        Removes the DB record and optionally deletes the file from Zata.
+        """
+        if not self._has_crm_permission(request, 'crm.leads.delete'):
+            raise PermissionDenied({'error': 'Permission denied', 'detail': "You don't have permission to delete attachments"})
+
+        lead = self.get_object()
+        try:
+            attachment = LeadAttachment.objects.get(id=attachment_id, lead=lead, tenant_id=request.tenant_id)
+        except LeadAttachment.DoesNotExist:
+            return Response({'error': 'Attachment not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if attachment.zata_video_id:
+            try:
+                delete_from_zata(str(attachment.zata_video_id))
+            except Exception as e:
+                logger.warning(f"Zata delete failed for attachment {attachment.id} (video {attachment.zata_video_id}): {e}")
+
+        attachment.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @extend_schema_view(

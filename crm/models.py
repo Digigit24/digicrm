@@ -202,6 +202,37 @@ class LeadOrder(models.Model):
         return f"{self.lead.name} - {self.status.name} - Position: {self.position}"
 
 
+class LeadAttachment(models.Model):
+    """File attachments linked to a lead, stored in Zata S3 storage"""
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    lead = models.ForeignKey(
+        Lead,
+        on_delete=models.CASCADE,
+        related_name='attachments',
+        db_column='lead_id'
+    )
+    file_name = models.TextField()
+    file_size = models.BigIntegerField()
+    mime_type = models.CharField(max_length=100)
+    zata_video_id = models.UUIDField(null=True, blank=True)
+    download_url = models.TextField()
+    uploaded_by = models.UUIDField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'lead_attachments'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_attachments_tenant'),
+            models.Index(fields=['lead'], name='idx_lead_attachments_lead_id'),
+        ]
+
+    def __str__(self):
+        return f"{self.file_name} ({self.lead_id})"
+
+
 class LeadFieldConfiguration(models.Model):
     """
     Unified model for managing both standard Lead fields and custom fields.

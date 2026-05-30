@@ -188,6 +188,9 @@ CORS_ALLOW_HEADERS = [
     'x-tenant-id',
     'x-tenant-slug',
     'tenanttoken',
+    # Zata storage headers
+    'x-zata-bucket',
+    'x-zata-folder-id',
 ]
 
 
@@ -375,6 +378,12 @@ LOGGING = {
         },
     },
 }
+
+# ===========================
+# ZATA STORAGE CONFIGURATION
+# ===========================
+ZATA_API_URL = config('ZATA_API_URL', default='')
+ZATA_API_TOKEN = config('ZATA_API_TOKEN', default='')
 
 # ===========================
 # INTEGRATIONS CONFIGURATION

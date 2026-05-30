@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
-    LeadFieldConfiguration
+    LeadFieldConfiguration, LeadAttachment
 )
 from common.mixins import TenantMixin
 
@@ -318,8 +318,18 @@ class LeadFieldConfigurationSerializer(TenantMixin):
     def to_representation(self, instance):
         """Add computed fields to the representation"""
         representation = super().to_representation(instance)
-        
+
         # Add a category field for easier frontend filtering
         representation['category'] = 'standard' if instance.is_standard else 'custom'
-        
+
         return representation
+
+
+class LeadAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LeadAttachment
+        fields = [
+            'id', 'tenant_id', 'lead', 'file_name', 'file_size', 'mime_type',
+            'zata_video_id', 'download_url', 'uploaded_by', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'tenant_id', 'zata_video_id', 'download_url', 'created_at', 'updated_at']
