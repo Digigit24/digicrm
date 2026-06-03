@@ -92,8 +92,7 @@ class TeleCMIAgent(models.Model):
         help_text='TeleCMI user ID (e.g. 103_1111112)'
     )
     password_encrypted = models.TextField(help_text='Encrypted TeleCMI agent password')
-    cached_token = models.CharField(
-        max_length=200,
+    cached_token = models.TextField(
         null=True,
         blank=True,
         help_text='Cached login token from /v2/user/login'
