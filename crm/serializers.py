@@ -1,9 +1,55 @@
 from rest_framework import serializers
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
-    LeadFieldConfiguration, LeadAttachment
+    LeadFieldConfiguration, LeadAttachment,
+    LeadGroup, LeadGroupMembership
 )
 from common.mixins import TenantMixin
+
+
+class LeadGroupSerializer(TenantMixin):
+    """
+    Serialize CRM lead group records.
+
+    Agents use this schema to create, inspect, update, and delete named groups
+    (also called lists) that organise leads into collections such as VIP Clients,
+    Cold Leads, or Follow-Up Queue.
+    """
+    lead_count = serializers.IntegerField(read_only=True, default=0)
+
+    class Meta:
+        model = LeadGroup
+        fields = [
+            'id', 'name', 'description', 'color_hex',
+            'created_by', 'lead_count', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_by', 'lead_count', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'id': {'help_text': 'Unique numeric identifier for this lead group. Read-only.'},
+            'name': {'help_text': 'Display name for the group, e.g. VIP Clients or Cold Leads.'},
+            'description': {'help_text': 'Optional description of the group purpose.'},
+            'color_hex': {'help_text': 'Optional hex color for the group badge, e.g. #6366F1.'},
+            'created_by': {'help_text': 'UUID of the user who created this group. Read-only.'},
+            'lead_count': {'help_text': 'Number of leads currently in this group. Read-only.'},
+            'created_at': {'help_text': 'Timestamp when this group was created. Read-only.'},
+            'updated_at': {'help_text': 'Timestamp when this group was last updated. Read-only.'},
+        }
+
+
+class LeadGroupMinimalSerializer(serializers.ModelSerializer):
+    """Minimal group info embedded inside Lead responses."""
+    class Meta:
+        model = LeadGroup
+        fields = ['id', 'name', 'color_hex']
+
+
+class BulkLeadGroupMembershipSerializer(serializers.Serializer):
+    """Validate bulk add/remove lead IDs for a group."""
+    lead_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        min_length=1,
+        help_text='List of numeric lead IDs to add or remove from the group.'
+    )
 
 
 class LeadStatusSerializer(TenantMixin):
@@ -101,6 +147,19 @@ class LeadSerializer(TenantMixin):
         read_only=True,
         help_text='Chronological activity records attached to this lead. Read-only in the lead payload.'
     )
+    groups = LeadGroupMinimalSerializer(
+        many=True,
+        read_only=True,
+        help_text='Groups this lead belongs to. Read-only; use /lead-groups/:id/add-leads/ to assign.'
+    )
+    group_ids = serializers.PrimaryKeyRelatedField(
+        source='groups',
+        many=True,
+        queryset=LeadGroup.objects.all(),
+        required=False,
+        write_only=True,
+        help_text='List of group IDs to assign this lead to (write-only).'
+    )
 
     class Meta:
         model = Lead
@@ -109,7 +168,8 @@ class LeadSerializer(TenantMixin):
             'status', 'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
             'source', 'owner_user_id', 'assigned_to', 'metadata', 'last_contacted_at',
             'next_follow_up_at', 'notes', 'address_line1', 'address_line2', 'city',
-            'state', 'country', 'postal_code', 'created_at', 'updated_at', 'activities'
+            'state', 'country', 'postal_code', 'groups', 'group_ids',
+            'created_at', 'updated_at', 'activities'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
         extra_kwargs = {
@@ -165,6 +225,11 @@ class LeadListSerializer(TenantMixin):
         read_only=True,
         help_text='Display name of the linked pipeline status. Read-only.'
     )
+    groups = LeadGroupMinimalSerializer(
+        many=True,
+        read_only=True,
+        help_text='Groups this lead belongs to. Read-only.'
+    )
 
     class Meta:
         model = Lead
@@ -172,7 +237,7 @@ class LeadListSerializer(TenantMixin):
             'id', 'name', 'phone', 'email', 'company', 'status',
             'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
             'owner_user_id', 'assigned_to', 'metadata', 'next_follow_up_at',
-            'created_at', 'updated_at'
+            'groups', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
         extra_kwargs = {

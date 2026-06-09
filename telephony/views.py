@@ -228,6 +228,50 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
         )
         return Response(result)
 
+    @action(detail=True, methods=['get'], url_path='recording')
+    def recording(self, request, pk=None):
+        """
+        GET /api/telephony/calls/<pk>/recording/
+        Proxy-streams the call recording audio from TeleCMI.
+        Uses tenant app_id + secret — never exposes credentials to frontend.
+        """
+        from django.http import StreamingHttpResponse
+        from integrations.utils.encryption import decrypt_token, EncryptionError
+
+        call_log = self.get_object()
+        if not call_log.recording_file:
+            return Response(
+                {'error': 'No recording available for this call'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            credential = get_tenant_credential(_tenant_id(request))
+        except TokenServiceError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_424_FAILED_DEPENDENCY)
+
+        try:
+            secret = decrypt_token(credential.secret_encrypted)
+        except EncryptionError as exc:
+            logger.error('Failed to decrypt TeleCMI secret for tenant %s: %s', _tenant_id(request), exc)
+            return Response({'error': 'Could not decrypt TeleCMI credentials'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        try:
+            telecmi_resp = client.stream_recording(credential.app_id, secret, call_log.recording_file)
+        except client.TeleCMIError as exc:
+            http_status = status.HTTP_404_NOT_FOUND if exc.status_code == 404 else status.HTTP_502_BAD_GATEWAY
+            return Response({'error': str(exc)}, status=http_status)
+
+        content_type = telecmi_resp.headers.get('Content-Type', 'audio/wav')
+        streaming = StreamingHttpResponse(
+            telecmi_resp.iter_content(chunk_size=8192),
+            content_type=content_type,
+        )
+        streaming['Content-Disposition'] = f'inline; filename="{call_log.recording_file}"'
+        if 'Content-Length' in telecmi_resp.headers:
+            streaming['Content-Length'] = telecmi_resp.headers['Content-Length']
+        return streaming
+
 
 # ──────────────────────────────────────────────────────────────
 # SMS

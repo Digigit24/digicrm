@@ -234,6 +234,43 @@ def set_caller_id(token: str, caller_id: str) -> dict:
 
 
 # ──────────────────────────────────────────────
+# Call recordings
+# ──────────────────────────────────────────────
+
+def stream_recording(app_id: str, secret: str, filename: str):
+    """
+    GET /v2/play?appid=...&secret=...&file=...
+    Streams the call recording audio file from TeleCMI.
+
+    Returns a requests.Response object (streaming=True) so the caller
+    can iterate chunks. The caller is responsible for closing it.
+
+    Raises TeleCMIError on auth failure, missing file, or network errors.
+    """
+    url = f'{TELECMI_BASE_URL}/play'
+    try:
+        response = requests.get(
+            url,
+            params={'appid': app_id, 'secret': secret, 'file': filename},
+            timeout=30,
+            stream=True,
+        )
+    except requests.RequestException as exc:
+        raise TeleCMIError(f'Network error fetching recording: {exc}')
+
+    if response.status_code == 407:
+        raise TeleCMIError('TeleCMI authentication failed for recording', status_code=407)
+    if response.status_code == 404:
+        raise TeleCMIError('Recording file not found on TeleCMI', status_code=404)
+    if response.status_code != 200:
+        raise TeleCMIError(
+            f'TeleCMI recording error {response.status_code}',
+            status_code=response.status_code,
+        )
+    return response
+
+
+# ──────────────────────────────────────────────
 # Break management
 # ──────────────────────────────────────────────
 

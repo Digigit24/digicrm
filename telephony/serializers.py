@@ -86,6 +86,10 @@ class CallLogSerializer(serializers.ModelSerializer):
     """Read-only CDR record."""
     direction_display = serializers.CharField(source='get_direction_display', read_only=True)
     call_type_display = serializers.CharField(source='get_call_type_display', read_only=True)
+    has_recording = serializers.SerializerMethodField()
+
+    def get_has_recording(self, obj):
+        return bool(obj.recording_file)
 
     class Meta:
         model = CallLog
@@ -94,7 +98,8 @@ class CallLogSerializer(serializers.ModelSerializer):
             'call_type', 'call_type_display',
             'from_number', 'to_number', 'duration', 'billed_sec', 'rate',
             'caller_name', 'telecmi_notes', 'call_time',
-            'lead_id', 'agent_user_id', 'synced_via', 'created_at',
+            'lead_id', 'agent_user_id', 'synced_via',
+            'recording_file', 'has_recording', 'created_at',
         ]
         read_only_fields = fields
 

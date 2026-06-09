@@ -10,14 +10,16 @@ from django.db.models import Count, Q
 from django.http import HttpResponse, StreamingHttpResponse
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
-    LeadFieldConfiguration, LeadAttachment
+    LeadFieldConfiguration, LeadAttachment,
+    LeadGroup, LeadGroupMembership
 )
 from .serializers import (
     LeadSerializer, LeadListSerializer, LeadStatusSerializer,
     LeadActivitySerializer, LeadOrderSerializer,
     LeadFieldConfigurationSerializer,
     BulkLeadDeleteSerializer, BulkLeadStatusUpdateSerializer,
-    LeadAttachmentSerializer
+    LeadAttachmentSerializer,
+    LeadGroupSerializer, BulkLeadGroupMembershipSerializer
 )
 from .zata_client import upload_to_zata, delete_from_zata
 from common.mixins import TenantViewSetMixin
@@ -118,7 +120,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
 
     Required permissions are based on crm.leads actions.
     """
-    queryset = Lead.objects.select_related('status').prefetch_related('activities')
+    queryset = Lead.objects.select_related('status').prefetch_related('activities', 'groups')
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'leads'
@@ -135,6 +137,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         'city': ['exact', 'icontains'],
         'state': ['exact', 'icontains'],
         'country': ['exact', 'icontains'],
+        'groups': ['exact'],
     }
     search_fields = ['name', 'phone', 'email', 'company', 'notes']
     ordering_fields = [
@@ -1324,3 +1327,127 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
                 {'error': 'Failed to fetch field schema'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+@extend_schema_view(
+    list=extend_schema(description='List all lead groups for the tenant'),
+    retrieve=extend_schema(description='Retrieve a specific lead group'),
+    create=extend_schema(description='Create a new lead group'),
+    update=extend_schema(description='Update a lead group'),
+    partial_update=extend_schema(description='Partially update a lead group'),
+    destroy=extend_schema(description='Delete a lead group'),
+)
+class LeadGroupViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet):
+    """
+    Manage CRM lead groups (lists).
+
+    Lead groups let you organise leads into named collections such as VIP Clients,
+    Cold Leads, or Follow-Up Queue. Each group belongs to the authenticated tenant.
+
+    Use the add_leads and remove_leads actions to manage group membership in bulk.
+    Use the group_leads action to list all leads that belong to a specific group.
+
+    Required permissions are based on crm.leads actions.
+    """
+    serializer_class = LeadGroupSerializer
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_resource = 'leads'
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'description']
+    ordering_fields = ['name', 'created_at', 'updated_at']
+    ordering = ['name']
+
+    def get_queryset(self):
+        return LeadGroup.objects.filter(
+            tenant_id=self.request.tenant_id
+        ).annotate(lead_count=Count('memberships'))
+
+    def perform_create(self, serializer):
+        serializer.save(
+            tenant_id=self.request.tenant_id,
+            created_by=self.request.user_id
+        )
+
+    @extend_schema(
+        description='Add leads to this group in bulk',
+        request=BulkLeadGroupMembershipSerializer,
+        responses={200: {'type': 'object', 'properties': {
+            'added': {'type': 'integer'},
+            'already_in_group': {'type': 'integer'},
+            'not_found': {'type': 'integer'},
+        }}}
+    )
+    @action(detail=True, methods=['post'], url_path='add-leads')
+    def add_leads(self, request, pk=None):
+        """Bulk-add leads to this group. Silently skips leads already in the group."""
+        group = self.get_object()
+        serializer = BulkLeadGroupMembershipSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        lead_ids = serializer.validated_data['lead_ids']
+        leads = Lead.objects.filter(id__in=lead_ids, tenant_id=request.tenant_id)
+        found_ids = set(leads.values_list('id', flat=True))
+        not_found = len(lead_ids) - len(found_ids)
+
+        added = 0
+        already_in = 0
+        for lead in leads:
+            membership, created = LeadGroupMembership.objects.get_or_create(
+                group=group,
+                lead=lead,
+                defaults={'added_by': request.user_id}
+            )
+            if created:
+                added += 1
+            else:
+                already_in += 1
+
+        return Response({
+            'added': added,
+            'already_in_group': already_in,
+            'not_found': not_found,
+        })
+
+    @extend_schema(
+        description='Remove leads from this group in bulk',
+        request=BulkLeadGroupMembershipSerializer,
+        responses={200: {'type': 'object', 'properties': {
+            'removed': {'type': 'integer'},
+        }}}
+    )
+    @action(detail=True, methods=['post'], url_path='remove-leads')
+    def remove_leads(self, request, pk=None):
+        """Bulk-remove leads from this group."""
+        group = self.get_object()
+        serializer = BulkLeadGroupMembershipSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        lead_ids = serializer.validated_data['lead_ids']
+        deleted_count, _ = LeadGroupMembership.objects.filter(
+            group=group,
+            lead_id__in=lead_ids
+        ).delete()
+
+        return Response({'removed': deleted_count})
+
+    @extend_schema(
+        description='List all leads belonging to this group',
+        responses={200: LeadListSerializer(many=True)}
+    )
+    @action(detail=True, methods=['get'], url_path='leads')
+    def group_leads(self, request, pk=None):
+        """Return paginated list of leads in this group."""
+        group = self.get_object()
+        leads_qs = Lead.objects.filter(
+            tenant_id=request.tenant_id,
+            groups=group
+        ).select_related('status').prefetch_related('groups')
+
+        page = self.paginate_queryset(leads_qs)
+        if page is not None:
+            serializer = LeadListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = LeadListSerializer(leads_qs, many=True)
+        return Response(serializer.data)

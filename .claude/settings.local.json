@@ -8,7 +8,8 @@
       "Skill(firecrawl:*)",
       "Bash(firecrawl map *)",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(u\\) for u in d.get\\('links',[]\\)]\")",
-      "Bash(python manage.py makemigrations crm --name lead_attachments)"
+      "Bash(python manage.py makemigrations crm --name lead_attachments)",
+      "Bash(python manage.py makemigrations telephony --name add_recording_file)"
     ]
   }
 }

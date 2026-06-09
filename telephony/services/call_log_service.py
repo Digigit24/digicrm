@@ -47,6 +47,8 @@ def process_cdr_record(tenant_id, raw_cdr: dict, direction: str, synced_via: str
     # Find matching lead by phone number (tenant-scoped)
     lead_id = _find_lead_id(tenant_id, from_number if direction == 'inbound' else to_number)
 
+    recording_file = raw_cdr.get('record') or raw_cdr.get('file') or ''
+
     log, created = CallLog.objects.get_or_create(
         tenant_id=tenant_id,
         cmiuid=cmiuid,
@@ -60,6 +62,7 @@ def process_cdr_record(tenant_id, raw_cdr: dict, direction: str, synced_via: str
             'rate': raw_cdr.get('rate', 0),
             'caller_name': raw_cdr.get('name') or '',
             'telecmi_notes': raw_cdr.get('notes'),
+            'recording_file': recording_file,
             'call_time': call_time,
             'lead_id': lead_id,
             'synced_via': synced_via,
@@ -67,16 +70,19 @@ def process_cdr_record(tenant_id, raw_cdr: dict, direction: str, synced_via: str
     )
 
     if not created:
-        # Update mutable fields on re-sync (e.g. notes added post-call)
-        updated = False
+        # Update mutable fields on re-sync (e.g. notes or recording added post-call)
+        updated_fields = []
         if raw_cdr.get('notes') and log.telecmi_notes != raw_cdr['notes']:
             log.telecmi_notes = raw_cdr['notes']
-            updated = True
+            updated_fields.append('telecmi_notes')
         if lead_id and log.lead_id != lead_id:
             log.lead_id = lead_id
-            updated = True
-        if updated:
-            log.save(update_fields=['telecmi_notes', 'lead_id', 'updated_at'])
+            updated_fields.append('lead_id')
+        if recording_file and not log.recording_file:
+            log.recording_file = recording_file
+            updated_fields.append('recording_file')
+        if updated_fields:
+            log.save(update_fields=updated_fields + ['updated_at'])
 
     # Create a CRM Activity if we have a lead and haven't done it yet
     if lead_id and not log.activity_created:

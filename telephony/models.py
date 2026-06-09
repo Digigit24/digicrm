@@ -156,6 +156,12 @@ class CallLog(models.Model):
     # Link to CRM entities - nullable because call may come from unknown number
     lead_id = models.BigIntegerField(null=True, blank=True, db_index=True)
     agent_user_id = models.UUIDField(null=True, blank=True, db_index=True)
+    recording_file = models.CharField(
+        max_length=300,
+        null=True,
+        blank=True,
+        help_text='TeleCMI recording filename (e.g. demo_1111113.wav)'
+    )
     # Track how this record was created
     synced_via = models.CharField(
         max_length=20,

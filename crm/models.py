@@ -112,6 +112,12 @@ class Lead(models.Model):
     state = models.TextField(null=True, blank=True)
     country = models.TextField(null=True, blank=True)
     postal_code = models.TextField(null=True, blank=True)
+    groups = models.ManyToManyField(
+        'LeadGroup',
+        through='LeadGroupMembership',
+        related_name='leads',
+        blank=True
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -231,6 +237,64 @@ class LeadAttachment(models.Model):
 
     def __str__(self):
         return f"{self.file_name} ({self.lead_id})"
+
+
+class LeadGroup(models.Model):
+    """Groups/Lists for organizing leads"""
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    color_hex = models.TextField(null=True, blank=True)
+    created_by = models.UUIDField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'lead_groups'
+        ordering = ['name']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_lead_groups_tenant_id'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tenant_id', 'name'],
+                name='unique_lead_group_per_tenant'
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class LeadGroupMembership(models.Model):
+    """Through table linking Leads to LeadGroups"""
+    id = models.BigAutoField(primary_key=True)
+    group = models.ForeignKey(
+        LeadGroup,
+        on_delete=models.CASCADE,
+        related_name='memberships',
+        db_column='group_id'
+    )
+    lead = models.ForeignKey(
+        'Lead',
+        on_delete=models.CASCADE,
+        related_name='group_memberships',
+        db_column='lead_id'
+    )
+    added_by = models.UUIDField(null=True, blank=True)
+    added_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'lead_group_memberships'
+        unique_together = [['group', 'lead']]
+        indexes = [
+            models.Index(fields=['group'], name='idx_lgm_group'),
+            models.Index(fields=['lead'], name='idx_lgm_lead'),
+        ]
+
+    def __str__(self):
+        return f"{self.lead_id} -> {self.group_id}"
 
 
 class LeadFieldConfiguration(models.Model):
