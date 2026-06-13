@@ -38,6 +38,7 @@ urlpatterns = [
     path('api/tasks/', include('tasks.urls')),
     path('api/integrations/', include('integrations.urls')),
     path('api/telephony/', include('telephony.urls')),
+    path('api/whatsapp/', include('whatsapp_integration.urls')),  # WhatsApp adapter
 ]
 
 # Serve static files in development

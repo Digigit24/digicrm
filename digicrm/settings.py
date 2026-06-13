@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'tasks',
     'integrations',
     'telephony',
+    'whatsapp_integration',   # DigiCRM WhatsApp adapter app
 ]
 
 MIDDLEWARE = [
