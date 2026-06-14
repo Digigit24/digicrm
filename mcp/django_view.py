@@ -35,9 +35,14 @@ from django.urls import path
 
 logger = logging.getLogger(__name__)
 
-# Set this on your production server: MCP_SECRET=<random string>
-MCP_SECRET = os.environ.get('MCP_SECRET', '').strip()  # strip to avoid whitespace issues
-MCP_CLIENT_ID = 'digicrm-mcp'   # fixed — enter this in Claude's connector settings
+# Set these on your production server (.env or systemd):
+#   MCP_SECRET=<random string>
+#   DIGICRM_TENANT_ID=<your tenant UUID>
+#   MCP_OWNER_USER_ID=<UUID of user that "owns" MCP-created records>
+MCP_SECRET     = os.environ.get('MCP_SECRET',        '').strip()
+TENANT_ID      = os.environ.get('DIGICRM_TENANT_ID', '').strip()
+OWNER_USER_ID  = os.environ.get('MCP_OWNER_USER_ID', '').strip()
+MCP_CLIENT_ID  = 'digicrm-mcp'   # fixed — enter this in Claude's connector settings
 
 
 def _cors(response):
@@ -310,100 +315,137 @@ def oauth_authorize(request):
 def _dispatch_tool(name: str, args: dict) -> dict:
     """
     Handle MCP tool calls using Django ORM directly.
-    No HTTP, no JWT — same process as Django itself.
+    tenant_id is ALWAYS from env (DIGICRM_TENANT_ID), never from agent input.
     """
-    # Import models here (Django is already set up at this point)
     from crm.models import Lead, LeadStatus, LeadActivity, LeadGroup, LeadGroupMembership
     from tasks.models import Task
     from meetings.models import Meeting
     from django.utils import timezone
-    import datetime
+    from django.db.models import Q
+
+    if not TENANT_ID:
+        raise RuntimeError('DIGICRM_TENANT_ID env var not set on server — cannot query tenant data')
+
+    logger.info(f'MCP tool: {name} args={list(args.keys())}')
 
     # ── CRM tools ──────────────────────────────────────────────────────────────
 
     if name == 'list_leads':
-        qs = Lead.objects.filter(tenant_id=args.get('tenant_id')) if args.get('tenant_id') else Lead.objects.all()
-        search = args.get('search')
+        qs = Lead.objects.filter(tenant_id=TENANT_ID)
+        search = args.get('search', '').strip()
         if search:
-            qs = qs.filter(name__icontains=search) | qs.filter(phone__icontains=search)
-        page = int(args.get('page', 1))
+            # Use Q to keep tenant filter intact
+            qs = qs.filter(Q(name__icontains=search) | Q(phone__icontains=search) | Q(email__icontains=search))
+        page      = int(args.get('page', 1))
         page_size = int(args.get('page_size', 20))
-        offset = (page - 1) * page_size
-        total = qs.count()
-        leads = list(qs.values('id', 'name', 'phone', 'email', 'status_id', 'lead_score', 'created_at')[offset:offset+page_size])
+        offset    = (page - 1) * page_size
+        total     = qs.count()
+        leads = list(qs.select_related('status').values(
+            'id', 'name', 'phone', 'email',
+            'status__name', 'lead_score', 'source',
+            'assigned_to', 'created_at'
+        )[offset:offset + page_size])
         return {'count': total, 'page': page, 'results': leads}
 
     if name == 'get_lead':
-        lead = Lead.objects.get(id=args['lead_id'])
-        return {'id': lead.id, 'name': lead.name, 'phone': lead.phone,
-                'email': lead.email, 'lead_score': lead.lead_score,
-                'status_id': lead.status_id, 'notes': lead.notes,
-                'created_at': str(lead.created_at)}
+        lead = Lead.objects.select_related('status').get(id=args['lead_id'], tenant_id=TENANT_ID)
+        return {
+            'id':           lead.id,
+            'name':         lead.name,
+            'phone':        lead.phone,
+            'email':        lead.email,
+            'company':      lead.company,
+            'title':        lead.title,
+            'status':       lead.status.name if lead.status else None,
+            'status_id':    lead.status_id,
+            'priority':     lead.priority,
+            'lead_score':   lead.lead_score,
+            'source':       lead.source,
+            'notes':        lead.notes,
+            'assigned_to':  str(lead.assigned_to) if lead.assigned_to else None,
+            'value_amount': str(lead.value_amount) if lead.value_amount else None,
+            'metadata':     lead.metadata,
+            'city':         lead.city,
+            'country':      lead.country,
+            'last_contacted_at': str(lead.last_contacted_at) if lead.last_contacted_at else None,
+            'next_follow_up_at': str(lead.next_follow_up_at) if lead.next_follow_up_at else None,
+            'created_at':   str(lead.created_at),
+            'updated_at':   str(lead.updated_at),
+        }
 
     if name == 'create_lead':
+        if not OWNER_USER_ID:
+            raise RuntimeError('MCP_OWNER_USER_ID env var not set — cannot create records')
         lead = Lead.objects.create(
+            tenant_id=TENANT_ID,
+            owner_user_id=OWNER_USER_ID,
             name=args['name'],
             phone=args['phone'],
-            email=args.get('email', ''),
-            source=args.get('source', ''),
+            email=args.get('email') or '',
+            source=args.get('source') or '',
             lead_score=args.get('lead_score', 0),
-            notes=args.get('notes', ''),
-            assigned_to_id=args.get('assigned_to'),
+            notes=args.get('notes') or '',
+            assigned_to=args.get('assigned_to') or None,
         )
         return {'id': lead.id, 'name': lead.name, 'phone': lead.phone}
 
     if name == 'update_lead':
-        lead = Lead.objects.get(id=args['lead_id'])
-        fields = ['name', 'phone', 'email', 'lead_score', 'notes', 'source']
-        for f in fields:
+        lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        for f in ['name', 'phone', 'email', 'lead_score', 'notes', 'source', 'priority',
+                  'city', 'state', 'country', 'company', 'title']:
             if f in args:
                 setattr(lead, f, args[f])
         if 'assigned_to' in args:
-            lead.assigned_to_id = args['assigned_to']
+            lead.assigned_to = args['assigned_to'] or None
         lead.save()
         return {'id': lead.id, 'updated': True}
 
     if name == 'update_lead_status':
-        lead = Lead.objects.get(id=args['lead_id'])
+        lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
         lead.status_id = args['status_id']
         lead.save(update_fields=['status'])
         return {'id': lead.id, 'status_id': args['status_id']}
 
     if name == 'list_lead_statuses':
-        statuses = list(LeadStatus.objects.values('id', 'name', 'color', 'order'))
+        statuses = list(LeadStatus.objects.filter(tenant_id=TENANT_ID).values('id', 'name', 'color', 'order'))
         return {'results': statuses}
 
     if name == 'add_lead_to_group':
         LeadGroupMembership.objects.get_or_create(
             lead_id=args['lead_id'],
-            group_id=args['lead_group_id']
+            group_id=args['lead_group_id'],
         )
         return {'lead_id': args['lead_id'], 'group_id': args['lead_group_id'], 'added': True}
 
     if name == 'create_lead_activity':
         activity = LeadActivity.objects.create(
+            tenant_id=TENANT_ID,
             lead_id=args['lead_id'],
             activity_type=args['type'],
             content=args['content'],
-            happened_at=args.get('happened_at', timezone.now()),
+            happened_at=args.get('happened_at') or timezone.now(),
         )
         return {'id': activity.id, 'lead_id': args['lead_id']}
 
     # ── Task tools ─────────────────────────────────────────────────────────────
 
     if name == 'create_task':
+        if not OWNER_USER_ID:
+            raise RuntimeError('MCP_OWNER_USER_ID env var not set — cannot create records')
         task = Task.objects.create(
+            tenant_id=TENANT_ID,
+            owner_user_id=OWNER_USER_ID,
             title=args['title'],
-            description=args.get('description', ''),
+            description=args.get('description') or '',
             lead_id=args.get('lead_id'),
             due_date=args.get('due_date'),
             priority=args.get('priority', 'MEDIUM'),
-            assignee_id=args.get('assignee_user_id'),
+            assignee_user_id=args.get('assignee_user_id') or None,
         )
         return {'id': task.id, 'title': task.title}
 
     if name == 'update_task':
-        task = Task.objects.get(id=args['task_id'])
+        task = Task.objects.get(id=args['task_id'], tenant_id=TENANT_ID)
         for f in ['title', 'description', 'status', 'priority', 'due_date']:
             if f in args:
                 setattr(task, f, args[f])
@@ -413,26 +455,29 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     # ── Meeting tools ──────────────────────────────────────────────────────────
 
     if name == 'create_meeting':
+        if not OWNER_USER_ID:
+            raise RuntimeError('MCP_OWNER_USER_ID env var not set — cannot create records')
         meeting = Meeting.objects.create(
+            tenant_id=TENANT_ID,
+            owner_user_id=OWNER_USER_ID,
             lead_id=args['lead_id'],
             title=args['title'],
-            start_time=args['start_time'],
-            end_time=args['end_time'],
-            notes=args.get('notes', ''),
+            start_at=args['start_time'],   # tool arg name → model field name
+            end_at=args['end_time'],
+            notes=args.get('notes') or '',
         )
         return {'id': meeting.id, 'title': meeting.title}
 
     if name == 'update_meeting':
-        meeting = Meeting.objects.get(id=args['meeting_id'])
-        for f in ['title', 'status', 'start_time', 'end_time', 'notes']:
+        meeting = Meeting.objects.get(id=args['meeting_id'], tenant_id=TENANT_ID)
+        field_map = {'start_time': 'start_at', 'end_time': 'end_at'}
+        for f in ['title', 'notes', 'start_time', 'end_time', 'location']:
             if f in args:
-                setattr(meeting, f, args[f])
+                setattr(meeting, field_map.get(f, f), args[f])
         meeting.save()
         return {'id': meeting.id, 'updated': True}
 
-    # ── WhatsApp & Sequence tools — still go via HTTP to whatsapp_integration ──
-    # (because that app internally calls the Laravel adapter)
-
+    # ── WhatsApp & Sequence tools — go via HTTP to whatsapp_integration / Laravel
     from mcp.server import _dispatch as _server_dispatch
     return json.loads(_server_dispatch(name, args))
 
