@@ -13,7 +13,7 @@ from drf_spectacular.views import (
 )
 from common.admin_site import tenant_admin_site
 from common.views import TokenLoginView, AdminHealthView, SuperAdminProxyLoginView, superadmin_proxy_login_view
-from mcp.django_view import mcp_urlpatterns, oauth_well_known
+from mcp.django_view import mcp_urlpatterns, oauth_well_known, oauth_protected_resource
 
 urlpatterns = [
     # Root URL - redirect to admin
@@ -46,7 +46,11 @@ urlpatterns = [
 urlpatterns += mcp_urlpatterns
 
 # OAuth discovery (required by MCP spec for remote HTTP servers)
-urlpatterns += [path('.well-known/oauth-authorization-server', oauth_well_known)]
+urlpatterns += [
+    path('.well-known/oauth-authorization-server', oauth_well_known),
+    path('.well-known/oauth-protected-resource', oauth_protected_resource),
+    path('.well-known/oauth-protected-resource/<path:path>', oauth_protected_resource),
+]
 
 # Serve static files in development
 if settings.DEBUG:

@@ -62,7 +62,7 @@ def _check_auth(request) -> bool:
 # ── OAuth endpoints (required by MCP spec for remote HTTP servers) ─────────────
 
 def oauth_well_known(request):
-    """OAuth 2.0 server discovery — Claude reads this first."""
+    """OAuth 2.0 Authorization Server metadata — Claude reads this first."""
     base = f"{'https' if request.is_secure() else 'http'}://{request.get_host()}"
     return _cors(JsonResponse({
         'issuer': base,
@@ -73,6 +73,20 @@ def oauth_well_known(request):
         'grant_types_supported': ['authorization_code', 'client_credentials'],
         'token_endpoint_auth_methods_supported': ['client_secret_post', 'client_secret_basic'],
         'code_challenge_methods_supported': ['S256'],
+    }))
+
+
+def oauth_protected_resource(request, path=''):
+    """
+    OAuth Protected Resource Metadata (RFC 9728).
+    Claude hits /.well-known/oauth-protected-resource to discover auth requirements.
+    """
+    base = f"{'https' if request.is_secure() else 'http'}://{request.get_host()}"
+    return _cors(JsonResponse({
+        'resource': f'{base}/mcp/sse',
+        'authorization_servers': [base],
+        'bearer_methods_supported': ['header'],
+        'resource_documentation': f'{base}/mcp/health',
     }))
 
 
@@ -317,6 +331,7 @@ def mcp_health(request):
     return _cors(JsonResponse({'status': 'ok', 'server': 'digicrm-mcp'}))
 
 
+@csrf_exempt
 def mcp_sse(request):
     if not _check_auth(request):
         return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
