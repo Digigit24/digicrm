@@ -330,6 +330,14 @@ LOGGING = {
             'backupCount': 5,
             'formatter': 'detailed',
         },
+        'file_mcp': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': LOGS_DIR / 'mcp.log',
+            'maxBytes': 1024*1024*10,  # 10MB
+            'backupCount': 5,
+            'formatter': 'detailed',
+            'level': 'DEBUG',
+        },
     },
     'root': {
         'handlers': ['console', 'file_debug'],
@@ -383,6 +391,12 @@ LOGGING = {
         },
         'whatsapp_integration': {
             'handlers': ['console', 'file_debug', 'file_info', 'file_error'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        # MCP server — all endpoints: oauth, sse, message, dispatch
+        'mcp': {
+            'handlers': ['console', 'file_mcp', 'file_error'],
             'level': 'DEBUG',
             'propagate': False,
         },
