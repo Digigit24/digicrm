@@ -78,8 +78,35 @@ def _tool(name: str, description: str, properties: dict, required: list = None):
 
 
 # ---------------------------------------------------------------------------
-# PHASE 1 — CRM CORE (10 tools)
+# PHASE 1 — CRM CORE (10 tools)  + read tools
 # ---------------------------------------------------------------------------
+
+_tool('list_leads', """
+Search and list leads in the CRM.
+
+Returns paginated list with id, name, phone, email, status, lead_score, source.
+Use search to filter by name, phone, or email.
+""", {
+    'search':    {'type': 'string',  'description': 'Filter by name, phone, or email (partial match)'},
+    'page':      {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size': {'type': 'integer', 'description': 'Results per page (default 20, max 100)'},
+})
+
+_tool('get_lead', """
+Get full details of a single lead by ID.
+
+Returns all fields: name, phone, email, company, title, status, priority,
+lead_score, source, notes, assigned_to, metadata, address, timestamps.
+""", {
+    'lead_id': {'type': 'integer', 'description': 'ID of the lead'},
+}, ['lead_id'])
+
+_tool('list_lead_statuses', """
+List all available lead status options for this workspace.
+
+Returns id, name, color, and order for each status.
+Use status id when calling update_lead_status.
+""", {})
 
 _tool('create_lead', """
 Create a new CRM lead.

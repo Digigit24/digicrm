@@ -16,7 +16,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from common.authentication import JWTRequestAuthentication
 from common.mixins import TenantViewSetMixin
 from common.permissions import HasCRMPermission, JWTAuthentication
-from crm.models import Lead, LeadActivity, LeadGroup
+from crm.models import Lead, LeadActivity, LeadGroup, LeadStatus
 from crm.serializers import LeadActivitySerializer
 
 from .models import (
@@ -1250,3 +1250,285 @@ class WhatsAppTemplatesProxyView(APIView):
         except LaravelAdapterError as e:
             return Response({'detail': str(e)}, status=503)
         return Response({'templates': templates})
+
+
+# ---------------------------------------------------------------------------
+# AI Support Endpoints
+# ---------------------------------------------------------------------------
+# These endpoints are designed for AI agents / external integrations that need
+# to discover resources dynamically — no hardcoded UUIDs required.
+#
+#   GET  /api/whatsapp/ai/context/           → templates + sequences + statuses + lead groups
+#   GET  /api/whatsapp/ai/templates/         → templates with _uid, name, category, status
+#   POST /api/whatsapp/ai/campaign/launch/   → create & launch campaign in one step
+#   GET  /api/whatsapp/ai/sequences/         → active sequences with steps
+# ---------------------------------------------------------------------------
+
+
+
+class AIContextView(APIView):
+    """
+    Single-call AI context endpoint.
+    Returns everything an AI agent needs to make decisions:
+      - whatsapp_templates  (with _uid, name, category, language, status)
+      - sequences           (id, name, steps count)
+      - lead_statuses       (id, name, color_hex)
+      - lead_groups         (id, name, lead_count)
+
+    GET /api/whatsapp/ai/context/
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+
+    @extend_schema(description='All AI context: templates, sequences, statuses, lead groups.')
+    def get(self, request):
+        tenant_id = getattr(request, 'tenant_id', None) or request.user.tenant_id
+
+        # --- Templates (from Laravel, cached 10 min) ---
+        try:
+            adapter   = _adapter_from_request(request)
+            raw_templates = adapter.get_templates()
+            templates = [
+                {
+                    'uid':      t.get('_uid') or t.get('uid'),
+                    'name':     t.get('template_name') or t.get('name'),
+                    'category': t.get('category'),
+                    'language': t.get('language'),
+                    'status':   t.get('status'),
+                }
+                for t in (raw_templates if isinstance(raw_templates, list) else [])
+            ]
+        except LaravelAdapterError:
+            templates = []
+
+        # --- Sequences ---
+        seqs = list(
+            WhatsAppSequence.objects
+            .filter(tenant_id=tenant_id)
+            .prefetch_related('steps')
+            .values('id', 'name', 'description', 'is_active')
+        )
+        for s in seqs:
+            s['step_count'] = WhatsAppSequenceStep.objects.filter(
+                sequence_id=s['id']
+            ).count()
+
+        # --- Lead statuses ---
+        statuses = list(
+            LeadStatus.objects
+            .filter(tenant_id=tenant_id)
+            .values('id', 'name', 'color_hex', 'order_index')
+            .order_by('order_index')
+        )
+
+        # --- Lead groups ---
+        groups = list(
+            LeadGroup.objects
+            .filter(tenant_id=tenant_id)
+            .values('id', 'name')
+        )
+        for g in groups:
+            g['lead_count'] = Lead.objects.filter(
+                tenant_id=tenant_id, groups__id=g['id']
+            ).count()
+
+        return Response({
+            'whatsapp_templates': templates,
+            'sequences':          seqs,
+            'lead_statuses':      statuses,
+            'lead_groups':        groups,
+        })
+
+
+class AITemplatesView(APIView):
+    """
+    Clean template list for AI — returns _uid, name, category, language, status.
+
+    GET /api/whatsapp/ai/templates/?search=promo&category=MARKETING
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+
+    @extend_schema(description='List WhatsApp templates (AI-friendly: uid, name, category, language).')
+    def get(self, request):
+        try:
+            adapter = _adapter_from_request(request)
+            raw     = adapter.get_templates()
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=503)
+
+        templates = [
+            {
+                'uid':      t.get('_uid') or t.get('uid'),
+                'name':     t.get('template_name') or t.get('name'),
+                'category': t.get('category'),
+                'language': t.get('language'),
+                'status':   t.get('status'),
+                'body':     _template_body_text(t),
+            }
+            for t in (raw if isinstance(raw, list) else [])
+        ]
+
+        search   = request.query_params.get('search', '').lower()
+        category = request.query_params.get('category', '').upper()
+        if search:
+            templates = [t for t in templates if search in (t['name'] or '').lower()]
+        if category:
+            templates = [t for t in templates if (t['category'] or '').upper() == category]
+
+        return Response({'results': templates, 'count': len(templates)})
+
+
+def _template_body_text(t: dict) -> str:
+    """Extract body text from a WhatsApp template dict."""
+    components = t.get('components') or []
+    for comp in components:
+        if (comp.get('type') or '').upper() == 'BODY':
+            return comp.get('text', '')
+    return ''
+
+
+class AICampaignLaunchView(APIView):
+    """
+    Create and immediately launch a WhatsApp campaign in a single API call.
+    Designed for AI agents — no pre-created campaign record needed.
+
+    POST /api/whatsapp/ai/campaign/launch/
+    Body:
+    {
+      "name": "June Outreach",
+      "template_uid": "<_uid from /ai/templates/>",
+      "template_components": [...],     // optional variable values
+      "lead_ids": [1, 2, 3],            // target specific leads
+      "scheduled_at": "2026-06-15T10:00:00Z"  // optional, defaults now
+    }
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+
+    @extend_schema(description='Create + launch a WhatsApp campaign in one step (AI-friendly).')
+    def post(self, request):
+        tenant_id = getattr(request, 'tenant_id', None) or request.user.tenant_id
+
+        name        = request.data.get('name', '').strip()
+        template_uid = request.data.get('template_uid', '').strip()
+        lead_ids    = request.data.get('lead_ids', [])
+        template_components = request.data.get('template_components', [])
+        scheduled_at = request.data.get('scheduled_at')
+
+        if not name:
+            return Response({'detail': 'name is required'}, status=400)
+        if not template_uid:
+            return Response({'detail': 'template_uid is required'}, status=400)
+        if not lead_ids:
+            return Response({'detail': 'lead_ids is required and must not be empty'}, status=400)
+
+        # Resolve leads → phone numbers
+        leads = list(Lead.objects.filter(id__in=lead_ids, tenant_id=tenant_id))
+        if not leads:
+            return Response({'detail': 'No valid leads found for given lead_ids'}, status=404)
+
+        contacts = [
+            {'phone': lead.phone, 'name': lead.name or lead.phone}
+            for lead in leads
+            if lead.phone
+        ]
+        if not contacts:
+            return Response({'detail': 'None of the specified leads have a phone number'}, status=422)
+
+        # Create DigiCRM campaign record
+        from django.utils import timezone as tz
+        import datetime
+        scheduled_dt = None
+        if scheduled_at:
+            try:
+                scheduled_dt = datetime.datetime.fromisoformat(scheduled_at.replace('Z', '+00:00'))
+            except ValueError:
+                scheduled_dt = None
+
+        campaign = WhatsAppCampaign.objects.create(
+            tenant_id=tenant_id,
+            name=name,
+            template_uid=template_uid,
+            template_components=template_components,
+            status=CampaignStatusEnum.DRAFT,
+            scheduled_at=scheduled_dt or tz.now(),
+            total_contacts=len(contacts),
+            created_by=getattr(request.user, 'tenant_id', tenant_id),
+        )
+
+        # Launch via Laravel adapter
+        try:
+            adapter = _adapter_from_request(request)
+            result  = adapter.create_campaign(
+                name=name,
+                template_uid=template_uid,
+                contacts=contacts,
+                template_components=template_components,
+                scheduled_at=scheduled_at,
+                digicrm_campaign_id=campaign.id,
+            )
+            campaign.laravel_campaign_uid = result.get('campaign_uid')
+            campaign.status = CampaignStatusEnum.LAUNCHED
+            campaign.save(update_fields=['laravel_campaign_uid', 'status'])
+        except LaravelAdapterError as e:
+            campaign.status = CampaignStatusEnum.FAILED
+            campaign.save(update_fields=['status'])
+            return Response({
+                'detail':      str(e),
+                'campaign_id': campaign.id,
+                'status':      'failed',
+            }, status=502)
+
+        _log_agent_action(
+            tenant_id=tenant_id,
+            action_type=AgentActionTypeEnum.CREATE_CAMPAIGN,
+            payload_in=request.data,
+            payload_out=result,
+            lead_id=None,
+            status=AgentActionStatusEnum.SUCCESS,
+        )
+
+        return Response({
+            'campaign_id':        campaign.id,
+            'laravel_campaign_uid': campaign.laravel_campaign_uid,
+            'name':               campaign.name,
+            'status':             campaign.status,
+            'contacts_count':     len(contacts),
+            'scheduled_at':       campaign.scheduled_at,
+        }, status=201)
+
+
+class AISequencesView(APIView):
+    """
+    List active WhatsApp sequences with their steps for AI agent context.
+
+    GET /api/whatsapp/ai/sequences/
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+
+    @extend_schema(description='List active sequences with steps (AI-friendly).')
+    def get(self, request):
+        tenant_id = getattr(request, 'tenant_id', None) or request.user.tenant_id
+        seqs = (
+            WhatsAppSequence.objects
+            .filter(tenant_id=tenant_id, is_active=True)
+            .prefetch_related('steps')
+        )
+        data = []
+        for s in seqs:
+            steps = list(
+                s.steps.order_by('step_number').values(
+                    'id', 'step_number', 'message_type',
+                    'template_uid', 'text_content', 'delay_hours'
+                )
+            )
+            data.append({
+                'id':          s.id,
+                'name':        s.name,
+                'description': s.description,
+                'step_count':  len(steps),
+                'steps':       steps,
+            })
+        return Response({'results': data, 'count': len(data)})

@@ -306,47 +306,6 @@ class LaravelWhatsAppAdapter:
         )
 
     # ------------------------------------------------------------------
-    # 5. CHAT HISTORY FOR A PHONE NUMBER
-    # ------------------------------------------------------------------
-    def get_chat_history(self, phone: str, page: int = 1, per_page: int = 50) -> dict:
-        """
-        Get paginated message history for a phone number.
-        Phone is normalized (91 prefix for 10-digit) to match how Laravel stores contacts.
-        Used by the Lead detail page WhatsApp chat drawer.
-        """
-        normalized = self._normalize_phone(phone)
-        return _make_request(
-            'GET',
-            self._url(f'contacts/by-phone/{normalized}/messages'),
-            self.api_token,
-            params={'page': page, 'per_page': per_page}
-        )
-
-    # ------------------------------------------------------------------
-    # 6. SEND PLAIN TEXT MESSAGE TO A PHONE NUMBER
-    # ------------------------------------------------------------------
-    def send_text_message(
-        self,
-        phone: str,
-        name: str,
-        text: str,
-        digicrm_lead_id: int = None,
-    ) -> dict:
-        """
-        Send a plain WhatsApp text message via the adapter.
-        Returns: { result, message, wa_message_id, contact_uid, digicrm_lead_id }
-        """
-        payload = {
-            'phone': self._normalize_phone(phone),
-            'name': name,
-            'text': text,
-            'digicrm_lead_id': digicrm_lead_id,
-        }
-        return _make_request('POST', self._url('messages/send-text'), self.api_token, json=payload)
-
-    # ------------------------------------------------------------------
-    # 7. GET TEMPLATES (cached 10 minutes)
-    # ------------------------------------------------------------------
     def get_templates(self) -> list:
         """
         List available WhatsApp templates for this vendor.

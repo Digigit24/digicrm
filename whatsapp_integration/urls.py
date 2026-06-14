@@ -15,6 +15,11 @@ from .views import (
     AgentLogActivityView,
     AgentActionLogListView,
     WhatsAppTemplatesProxyView,
+    # AI support endpoints
+    AIContextView,
+    AITemplatesView,
+    AICampaignLaunchView,
+    AISequencesView,
 )
 
 router = DefaultRouter()
@@ -30,9 +35,7 @@ urlpatterns = [
     # Templates proxy (dropdown data for campaign creation)
     path('templates/', WhatsAppTemplatesProxyView.as_view(), name='whatsapp-templates-proxy'),
 
-    # Inbound webhooks (called by n8n, not the frontend)
-    # POST /api/whatsapp/webhooks/{event_type}/
-    #   event_type: message-replied | campaign-completed
+    # Inbound webhooks
     path('webhooks/<str:event_type>/', WhatsAppWebhookView.as_view(), name='whatsapp-webhook'),
 
     # Enrollment update (pause/resume/cancel)
@@ -45,4 +48,14 @@ urlpatterns = [
     path('agent/update-status/', AgentUpdateLeadStatusView.as_view(), name='agent-update-status'),
     path('agent/log-activity/', AgentLogActivityView.as_view(), name='agent-log-activity'),
     path('agent/logs/', AgentActionLogListView.as_view(), name='agent-action-logs'),
+
+    # AI support endpoints — dynamic resource discovery, no hardcoded UUIDs needed
+    # GET  /api/whatsapp/ai/context/          → templates + sequences + statuses + lead groups
+    # GET  /api/whatsapp/ai/templates/        → templates with uid, name, category, body
+    # POST /api/whatsapp/ai/campaign/launch/  → create & launch campaign in one step
+    # GET  /api/whatsapp/ai/sequences/        → active sequences with steps
+    path('ai/context/', AIContextView.as_view(), name='ai-context'),
+    path('ai/templates/', AITemplatesView.as_view(), name='ai-templates'),
+    path('ai/campaign/launch/', AICampaignLaunchView.as_view(), name='ai-campaign-launch'),
+    path('ai/sequences/', AISequencesView.as_view(), name='ai-sequences'),
 ]
