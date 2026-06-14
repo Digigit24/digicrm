@@ -36,7 +36,7 @@ from django.urls import path
 logger = logging.getLogger(__name__)
 
 # Set this on your production server: MCP_SECRET=<random string>
-MCP_SECRET = os.environ.get('MCP_SECRET', '')
+MCP_SECRET = os.environ.get('MCP_SECRET', '').strip()  # strip to avoid whitespace issues
 MCP_CLIENT_ID = 'digicrm-mcp'   # fixed — enter this in Claude's connector settings
 
 
@@ -487,21 +487,40 @@ def mcp_health(request):
 
 @csrf_exempt
 def mcp_sse(request):
+    auth_header = request.headers.get('Authorization', '')
+    logger.info(f'MCP SSE connect: method={request.method} auth_present={bool(auth_header)} secret_set={bool(MCP_SECRET)}')
+
     if not _check_auth(request):
+        logger.warning('MCP SSE: auth FAILED')
         return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
 
+    logger.info('MCP SSE: auth OK, starting stream')
+
     def event_stream():
-        scheme = 'https' if request.is_secure() else 'http'
-        host = request.get_host()
-        endpoint = f'{scheme}://{host}/mcp/message'
-        yield f'event: endpoint\ndata: {endpoint}\n\n'
-        while True:
-            yield ': heartbeat\n\n'
-            time.sleep(15)
+        try:
+            # Use X-Forwarded-Proto from nginx if present (handles reverse-proxy HTTPS)
+            x_proto = request.META.get('HTTP_X_FORWARDED_PROTO', '')
+            scheme = x_proto if x_proto in ('http', 'https') else ('https' if request.is_secure() else 'http')
+            host = request.get_host()
+            endpoint = f'{scheme}://{host}/mcp/message'
+            logger.info(f'MCP SSE: yielding endpoint event → {endpoint}')
+            yield f'event: endpoint\ndata: {endpoint}\n\n'
+            logger.info('MCP SSE: endpoint sent, entering heartbeat loop')
+            count = 0
+            while True:
+                count += 1
+                logger.debug(f'MCP SSE: heartbeat #{count}')
+                yield ': heartbeat\n\n'
+                time.sleep(15)
+        except GeneratorExit:
+            logger.info('MCP SSE: client disconnected (GeneratorExit)')
+        except Exception as exc:
+            logger.exception(f'MCP SSE: generator exception: {exc}')
 
     response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
     response['Cache-Control'] = 'no-cache'
     response['X-Accel-Buffering'] = 'no'
+    response['Connection'] = 'keep-alive'
     return _cors(response)
 
 
@@ -512,6 +531,7 @@ def mcp_message(request):
     if request.method != 'POST':
         return HttpResponse(status=405)
     if not _check_auth(request):
+        logger.warning('MCP message: auth FAILED')
         return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
 
     try:
@@ -519,11 +539,15 @@ def mcp_message(request):
     except json.JSONDecodeError:
         return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400))
 
+    method = body.get('method', '?')
+    logger.info(f'MCP message: method={method} id={body.get("id")}')
+
     try:
         result = _handle_mcp_request(body)
+        logger.info(f'MCP message: {method} → ok')
         return _cors(JsonResponse(result, safe=False))
     except Exception as e:
-        logger.exception('MCP request failed')
+        logger.exception(f'MCP message: {method} FAILED')
         return _cors(JsonResponse({'error': str(e)}, status=500))
 
 
