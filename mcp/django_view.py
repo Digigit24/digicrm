@@ -142,13 +142,167 @@ def oauth_token(request):
 
 @csrf_exempt
 def oauth_authorize(request):
-    """Authorization code endpoint — redirect immediately with a code."""
-    redirect_uri = request.GET.get('redirect_uri', '')
-    state = request.GET.get('state', '')
-    code = secrets.token_urlsafe(16)
-    sep = '&' if '?' in redirect_uri else '?'
-    location = f'{redirect_uri}{sep}code={code}&state={state}'
-    return HttpResponse(status=302, headers={'Location': location})
+    """
+    Authorization endpoint — shows an approval UI to the user.
+    GET  → show approval page
+    POST → user clicked Approve → redirect back with auth code
+    """
+    redirect_uri = request.GET.get('redirect_uri') or request.POST.get('redirect_uri', '')
+    state        = request.GET.get('state')        or request.POST.get('state', '')
+    client_id    = request.GET.get('client_id')    or request.POST.get('client_id', '')
+
+    if request.method == 'POST' and request.POST.get('action') == 'approve':
+        code = secrets.token_urlsafe(16)
+        sep  = '&' if '?' in redirect_uri else '?'
+        return HttpResponse(status=302, headers={'Location': f'{redirect_uri}{sep}code={code}&state={state}'})
+
+    if request.method == 'POST' and request.POST.get('action') == 'deny':
+        sep = '&' if '?' in redirect_uri else '?'
+        return HttpResponse(status=302, headers={'Location': f'{redirect_uri}{sep}error=access_denied&state={state}'})
+
+    # GET — show approval page
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connect Claude to DigiCRM</title>
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }}
+    .card {{
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 420px;
+      width: 100%;
+      text-align: center;
+    }}
+    .logos {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      margin-bottom: 28px;
+    }}
+    .logo {{
+      width: 52px;
+      height: 52px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+    }}
+    .logo-claude {{ background: #d97706; }}
+    .logo-crm    {{ background: #7c3aed; }}
+    .connector {{
+      color: #64748b;
+      font-size: 22px;
+      font-weight: 300;
+    }}
+    h1 {{
+      color: #f1f5f9;
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }}
+    .subtitle {{
+      color: #94a3b8;
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 28px;
+    }}
+    .permissions {{
+      background: #0f172a;
+      border: 1px solid #1e3a5f;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 28px;
+      text-align: left;
+    }}
+    .permissions p {{
+      color: #64748b;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 10px;
+    }}
+    .perm {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: #cbd5e1;
+      font-size: 13px;
+      padding: 5px 0;
+    }}
+    .perm-icon {{ color: #22c55e; font-size: 15px; }}
+    .buttons {{
+      display: flex;
+      gap: 12px;
+    }}
+    .btn {{
+      flex: 1;
+      padding: 12px;
+      border-radius: 8px;
+      border: none;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }}
+    .btn:hover {{ opacity: 0.85; }}
+    .btn-deny    {{ background: #1e293b; border: 1px solid #334155; color: #94a3b8; }}
+    .btn-approve {{ background: #7c3aed; color: #fff; }}
+    .footer {{
+      margin-top: 20px;
+      color: #475569;
+      font-size: 11px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logos">
+      <div class="logo logo-claude">🤖</div>
+      <div class="connector">⇄</div>
+      <div class="logo logo-crm">⚡</div>
+    </div>
+    <h1>Connect Claude to DigiCRM</h1>
+    <p class="subtitle">
+      Claude is requesting access to your DigiCRM workspace to manage leads,
+      tasks, meetings, and WhatsApp conversations on your behalf.
+    </p>
+    <div class="permissions">
+      <p>Claude will be able to</p>
+      <div class="perm"><span class="perm-icon">✓</span> Read and create leads</div>
+      <div class="perm"><span class="perm-icon">✓</span> Manage tasks and meetings</div>
+      <div class="perm"><span class="perm-icon">✓</span> Send WhatsApp messages</div>
+      <div class="perm"><span class="perm-icon">✓</span> Run sequences and campaigns</div>
+    </div>
+    <form method="POST">
+      <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+      <input type="hidden" name="state"        value="{state}">
+      <input type="hidden" name="client_id"    value="{client_id}">
+      <div class="buttons">
+        <button class="btn btn-deny"    name="action" value="deny">Deny</button>
+        <button class="btn btn-approve" name="action" value="approve">Allow Access</button>
+      </div>
+    </form>
+    <p class="footer">Powered by Celiyo · crm.celiyo.com</p>
+  </div>
+</body>
+</html>"""
+    return HttpResponse(html)
 
 
 # ── Direct ORM tool dispatcher ────────────────────────────────────────────────
