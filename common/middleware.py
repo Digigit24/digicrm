@@ -50,6 +50,8 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/schema.yaml',
         '/api/logs/',  # Logs endpoint - public for monitoring
         '/api/telephony/webhook/',  # TeleCMI CDR and live-event webhooks (secured by webhook_secret)
+        '/mcp/',                    # MCP server endpoints (Claude connector — auth handled internally)
+        '/.well-known/',            # OAuth discovery (required by MCP spec)
     ]
 
     def process_request(self, request):
