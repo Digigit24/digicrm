@@ -192,6 +192,10 @@ CORS_ALLOW_HEADERS = [
     # Zata storage headers
     'x-zata-bucket',
     'x-zata-folder-id',
+    # WhatsApp vendor credentials (passed from frontend localStorage)
+    'x-wa-vendor-uid',
+    'x-wa-api-token',
+    'x-wa-base-url',
 ]
 
 
@@ -374,6 +378,11 @@ LOGGING = {
         },
         'integrations': {
             'handlers': ['console', 'file_info', 'file_error'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'whatsapp_integration': {
+            'handlers': ['console', 'file_debug', 'file_info', 'file_error'],
             'level': 'DEBUG',
             'propagate': False,
         },

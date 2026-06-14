@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from decouple import config as env_config
 
 from django.utils import timezone
 from drf_spectacular.utils import (
@@ -38,6 +39,54 @@ from .serializers import (
 from .services.laravel_adapter import LaravelWhatsAppAdapter, LaravelAdapterError
 
 logger = logging.getLogger(__name__)
+
+
+def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
+    """
+    Build a LaravelWhatsAppAdapter for this request.
+    Reads vendor credentials from X-WA-Vendor-Uid / X-WA-Api-Token headers
+    (sent by the React frontend from localStorage) so we never need a
+    WhatsAppVendorConfig DB record.  Falls back to DB lookup if headers absent.
+    """
+    vendor_uid = request.headers.get('X-WA-Vendor-Uid') or None
+    api_token  = request.headers.get('X-WA-Api-Token') or None
+    base_url   = request.headers.get('X-WA-Base-Url') or None
+
+    # Env var fallback (read via decouple so .env is respected)
+    env_vendor_uid = env_config('WA_VENDOR_UID', default=None)
+    env_api_token  = env_config('WA_API_TOKEN', default=None)
+    env_base_url   = env_config('WA_BASE_URL', default=None)
+
+    # Fill any missing piece from env vars
+    vendor_uid = vendor_uid or env_vendor_uid
+    api_token  = api_token  or env_api_token
+    base_url   = base_url   or env_base_url
+
+    logger.info(
+        '[WA Adapter] Resolved credentials — '
+        'header_vendor=%s header_token=%s env_vendor=%s env_token=%s final_vendor=%s has_token=%s path=%s',
+        bool(request.headers.get('X-WA-Vendor-Uid')),
+        bool(request.headers.get('X-WA-Api-Token')),
+        bool(env_vendor_uid),
+        bool(env_api_token),
+        vendor_uid,
+        bool(api_token),
+        request.path,
+    )
+
+    if not (vendor_uid and api_token):
+        logger.warning(
+            '[WA Adapter] No credentials from headers or env vars — falling back to DB lookup. '
+            'tenant=%s path=%s',
+            request.tenant_id, request.path
+        )
+
+    return LaravelWhatsAppAdapter(
+        tenant_id=request.tenant_id,
+        vendor_uid=vendor_uid,
+        api_token=api_token,
+        base_url=base_url,
+    )
 
 
 def _log_agent_action(tenant_id, action_type, payload_in, payload_out=None,
@@ -198,7 +247,7 @@ class WhatsAppCampaignViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         scheduled_iso = campaign.scheduled_at.isoformat() if campaign.scheduled_at else None
 
         try:
-            adapter = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter = _adapter_from_request(request)
             result = adapter.create_campaign(
                 name=campaign.name,
                 contacts=contacts,
@@ -245,7 +294,7 @@ class WhatsAppCampaignViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         try:
-            adapter = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter = _adapter_from_request(request)
             data = adapter.get_campaign_analytics(campaign.laravel_campaign_uid)
         except LaravelAdapterError as e:
             return Response({'detail': str(e)}, status=503)
@@ -270,7 +319,7 @@ class WhatsAppCampaignViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         try:
-            adapter  = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter  = _adapter_from_request(request)
             page     = int(request.query_params.get('page', 1))
             per_page = int(request.query_params.get('per_page', 50))
             data = adapter.get_campaign_replies(campaign.laravel_campaign_uid, page, per_page)
@@ -403,9 +452,13 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
     permission_resource = 'leads'
 
     def _get_lead(self, request, lead_id):
+        logger.debug('[WA LeadViewSet] _get_lead called. lead_id=%s tenant=%s', lead_id, request.tenant_id)
         try:
-            return Lead.objects.get(id=lead_id, tenant_id=request.tenant_id)
+            lead = Lead.objects.get(id=lead_id, tenant_id=request.tenant_id)
+            logger.debug('[WA LeadViewSet] Lead found. lead=%s phone=%s', lead.id, lead.phone)
+            return lead
         except Lead.DoesNotExist:
+            logger.warning('[WA LeadViewSet] Lead not found. lead_id=%s tenant=%s', lead_id, request.tenant_id)
             return None
 
     @extend_schema(
@@ -421,19 +474,30 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'], url_path='(?P<lead_id>[0-9]+)/chat')
     def chat(self, request, lead_id=None):
         """Get WhatsApp chat history for a lead."""
+        logger.info('[WA Chat] Fetching chat. tenant=%s lead_id=%s user=%s',
+                    request.tenant_id, lead_id, request.user_id)
+
         lead = self._get_lead(request, lead_id)
         if not lead:
+            logger.warning('[WA Chat] Lead not found. tenant=%s lead_id=%s', request.tenant_id, lead_id)
             return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
         if not lead.phone:
+            logger.warning('[WA Chat] Lead has no phone. tenant=%s lead_id=%s', request.tenant_id, lead_id)
             return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        page     = int(request.query_params.get('page', 1))
+        per_page = int(request.query_params.get('per_page', 50))
+        logger.info('[WA Chat] Calling Laravel adapter. lead=%s phone=%s page=%s per_page=%s',
+                    lead_id, lead.phone, page, per_page)
         try:
-            adapter  = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
-            page     = int(request.query_params.get('page', 1))
-            per_page = int(request.query_params.get('per_page', 50))
+            adapter = _adapter_from_request(request)
             data = adapter.get_chat_history(lead.phone, page, per_page)
+            logger.info('[WA Chat] Success. lead=%s messages_returned=%s',
+                        lead_id, len(data.get('data', data) if isinstance(data, dict) else data))
         except LaravelAdapterError as e:
-            return Response({'detail': str(e)}, status=503)
+            logger.error('[WA Chat] LaravelAdapterError. lead=%s error=%s status=%s',
+                         lead_id, str(e), e.status_code)
+            return Response({'detail': str(e)}, status=e.status_code)
         return Response(data)
 
     @extend_schema(
@@ -444,18 +508,25 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'], url_path='(?P<lead_id>[0-9]+)/send')
     def send(self, request, lead_id=None):
         """Send a WhatsApp template message to a lead."""
+        logger.info('[WA Send] Request received. tenant=%s lead_id=%s user=%s',
+                    request.tenant_id, lead_id, request.user_id)
+
         lead = self._get_lead(request, lead_id)
         if not lead:
+            logger.warning('[WA Send] Lead not found. tenant=%s lead_id=%s', request.tenant_id, lead_id)
             return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
         if not lead.phone:
+            logger.warning('[WA Send] Lead has no phone. tenant=%s lead_id=%s', request.tenant_id, lead_id)
             return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = AgentSendWhatsAppSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         d = serializer.validated_data
 
+        logger.info('[WA Send] Calling Laravel adapter. lead=%s phone=%s template=%s',
+                    lead_id, lead.phone, d.get('template_uid'))
         try:
-            adapter = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter = _adapter_from_request(request)
             result = adapter.send_message(
                 phone=lead.phone,
                 name=lead.name,
@@ -463,8 +534,11 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
                 template_components=d.get('template_components', []),
                 digicrm_lead_id=lead.id,
             )
+            logger.info('[WA Send] Message sent successfully. lead=%s result=%s', lead_id, result)
         except LaravelAdapterError as e:
-            return Response({'detail': str(e)}, status=503)
+            logger.error('[WA Send] LaravelAdapterError. lead=%s error=%s status=%s',
+                         lead_id, str(e), e.status_code)
+            return Response({'detail': str(e)}, status=e.status_code)
 
         # Log activity on the lead
         if d.get('note'):
@@ -482,6 +556,44 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
         lead.save(update_fields=['last_contacted_at'])
 
         return Response({'detail': 'Message sent.', **result})
+
+    @extend_schema(
+        description='Send a plain WhatsApp text message to a lead (requires 24h window to be open). Body: {"text": "..."}',
+        responses={200: OpenApiResponse(description='Text message sent.')}
+    )
+    @action(detail=False, methods=['post'], url_path='(?P<lead_id>[0-9]+)/send_text')
+    def send_text(self, request, lead_id=None):
+        """Send a plain-text WhatsApp message to a lead via the adapter."""
+        logger.info('[WA SendText] Request received. tenant=%s lead_id=%s user=%s',
+                    request.tenant_id, lead_id, request.user_id)
+
+        lead = self._get_lead(request, lead_id)
+        if not lead:
+            return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not lead.phone:
+            return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        text = request.data.get('text', '').strip()
+        if not text:
+            return Response({'detail': 'text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            adapter = _adapter_from_request(request)
+            result = adapter.send_text_message(
+                phone=lead.phone,
+                name=lead.name or lead.phone,
+                text=text,
+                digicrm_lead_id=lead.id,
+            )
+            logger.info('[WA SendText] Sent successfully. lead=%s', lead_id)
+        except LaravelAdapterError as e:
+            logger.error('[WA SendText] LaravelAdapterError. lead=%s error=%s', lead_id, str(e))
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        lead.last_contacted_at = timezone.now()
+        lead.save(update_fields=['last_contacted_at'])
+
+        return Response({'detail': 'Text message sent.', **result})
 
     @extend_schema(
         description='Get active sequence enrollments for a lead.',
@@ -574,6 +686,140 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
             completed_at=timezone.now(),
         )
         return Response({'detail': 'Lead unenrolled from sequence(s).'})
+
+    @extend_schema(
+        description='Assign a team member to handle this lead\'s WhatsApp chat. Body: {"user_uid": "..."}',
+        responses={200: OpenApiResponse(description='User assigned to chat.')}
+    )
+    @action(detail=False, methods=['post'], url_path='(?P<lead_id>[0-9]+)/assign-chat-user')
+    def assign_chat_user(self, request, lead_id=None):
+        """Assign a team member to this lead's WhatsApp inbox chat."""
+        lead = self._get_lead(request, lead_id)
+        if not lead:
+            return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not lead.phone:
+            return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user_uid = request.data.get('user_uid', '').strip()
+        if not user_uid:
+            return Response({'detail': 'user_uid is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            adapter = _adapter_from_request(request)
+            result = adapter.assign_chat_user(lead.phone, user_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        return Response({'detail': 'Chat user assigned.', **result})
+
+    @extend_schema(
+        description='Mark all WhatsApp messages for this lead as read.',
+        responses={200: OpenApiResponse(description='Chat marked as read.')}
+    )
+    @action(detail=False, methods=['post'], url_path='(?P<lead_id>[0-9]+)/mark-read')
+    def mark_read(self, request, lead_id=None):
+        """Mark all WhatsApp messages for a lead as read."""
+        lead = self._get_lead(request, lead_id)
+        if not lead:
+            return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not lead.phone:
+            return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            adapter = _adapter_from_request(request)
+            result = adapter.mark_chat_read(lead.phone)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        return Response({'detail': 'Chat marked as read.', **result})
+
+    @extend_schema(
+        description='Block or unblock a lead\'s WhatsApp contact. Body: {"block": true|false} (default true).',
+        responses={200: OpenApiResponse(description='Contact blocked/unblocked.')}
+    )
+    @action(detail=False, methods=['post'], url_path='(?P<lead_id>[0-9]+)/block')
+    def block(self, request, lead_id=None):
+        """Block or unblock a lead's WhatsApp contact."""
+        lead = self._get_lead(request, lead_id)
+        if not lead:
+            return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not lead.phone:
+            return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        do_block = request.data.get('block', True)
+
+        try:
+            adapter = _adapter_from_request(request)
+            result = adapter.block_contact(lead.phone, block=bool(do_block))
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        action_label = 'blocked' if do_block else 'unblocked'
+        return Response({'detail': f'Contact {action_label}.', **result})
+
+
+# ---------------------------------------------------------------------------
+# Enrollment Update View (pause / resume / cancel)
+# ---------------------------------------------------------------------------
+
+class LeadSequenceEnrollmentUpdateView(APIView):
+    """
+    PATCH /api/whatsapp/enrollments/{id}/
+
+    Update a single enrollment's status.
+    Accepted actions via JSON body: { "action": "pause" | "resume" | "cancel" }
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_resource = 'leads'
+
+    @extend_schema(
+        description='Pause, resume, or cancel a sequence enrollment. Body: {"action": "pause"|"resume"|"cancel"}',
+        responses={200: LeadSequenceEnrollmentSerializer},
+    )
+    def patch(self, request, pk=None):
+        try:
+            enrollment = LeadSequenceEnrollment.objects.select_related('lead', 'sequence').get(
+                id=pk, tenant_id=request.tenant_id
+            )
+        except LeadSequenceEnrollment.DoesNotExist:
+            return Response({'detail': 'Enrollment not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        action_name = request.data.get('action', '').lower()
+
+        if action_name == 'pause':
+            if enrollment.status != SequenceEnrollmentStatusEnum.ACTIVE:
+                return Response(
+                    {'detail': 'Only ACTIVE enrollments can be paused.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            enrollment.status = SequenceEnrollmentStatusEnum.PAUSED
+            enrollment.stopped_reason = 'manual_pause'
+            enrollment.save(update_fields=['status', 'stopped_reason', 'updated_at'])
+
+        elif action_name == 'resume':
+            if enrollment.status != SequenceEnrollmentStatusEnum.PAUSED:
+                return Response(
+                    {'detail': 'Only PAUSED enrollments can be resumed.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            enrollment.status = SequenceEnrollmentStatusEnum.ACTIVE
+            enrollment.stopped_reason = None
+            enrollment.save(update_fields=['status', 'stopped_reason', 'updated_at'])
+
+        elif action_name == 'cancel':
+            enrollment.status = SequenceEnrollmentStatusEnum.OPTED_OUT
+            enrollment.stopped_reason = 'manual_cancel'
+            enrollment.completed_at = timezone.now()
+            enrollment.save(update_fields=['status', 'stopped_reason', 'completed_at', 'updated_at'])
+
+        else:
+            return Response(
+                {'detail': 'Invalid action. Use "pause", "resume", or "cancel".'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(LeadSequenceEnrollmentSerializer(enrollment).data)
 
 
 # ---------------------------------------------------------------------------
@@ -700,7 +946,7 @@ class AgentSendWhatsAppView(APIView):
             return Response({'detail': 'Lead has no phone number.'}, status=400)
 
         try:
-            adapter = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter = _adapter_from_request(request)
             result = adapter.send_message(
                 phone=lead.phone,
                 name=lead.name,
@@ -843,7 +1089,7 @@ class AgentCreateCampaignView(APIView):
             return Response({'detail': 'No leads with phone numbers in this group.'}, status=400)
 
         try:
-            adapter = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter = _adapter_from_request(request)
             scheduled_iso = campaign.scheduled_at.isoformat() if campaign.scheduled_at else None
             result = adapter.create_campaign(
                 name=campaign.name,
@@ -999,7 +1245,7 @@ class WhatsAppTemplatesProxyView(APIView):
     @extend_schema(description='List available WhatsApp templates from the Laravel adapter.')
     def get(self, request):
         try:
-            adapter   = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
+            adapter   = _adapter_from_request(request)
             templates = adapter.get_templates()
         except LaravelAdapterError as e:
             return Response({'detail': str(e)}, status=503)

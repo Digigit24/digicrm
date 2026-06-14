@@ -6,6 +6,7 @@ from .views import (
     WhatsAppCampaignViewSet,
     WhatsAppSequenceViewSet,
     LeadWhatsAppViewSet,
+    LeadSequenceEnrollmentUpdateView,
     WhatsAppWebhookView,
     AgentSendWhatsAppView,
     AgentEnrollSequenceView,
@@ -33,6 +34,9 @@ urlpatterns = [
     # POST /api/whatsapp/webhooks/{event_type}/
     #   event_type: message-replied | campaign-completed
     path('webhooks/<str:event_type>/', WhatsAppWebhookView.as_view(), name='whatsapp-webhook'),
+
+    # Enrollment update (pause/resume/cancel)
+    path('enrollments/<int:pk>/', LeadSequenceEnrollmentUpdateView.as_view(), name='enrollment-update'),
 
     # Agent action endpoints (write-only, all logged)
     path('agent/send/', AgentSendWhatsAppView.as_view(), name='agent-send-whatsapp'),

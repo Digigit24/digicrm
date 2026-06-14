@@ -13,6 +13,7 @@ from drf_spectacular.views import (
 )
 from common.admin_site import tenant_admin_site
 from common.views import TokenLoginView, AdminHealthView, SuperAdminProxyLoginView, superadmin_proxy_login_view
+from mcp.django_view import mcp_urlpatterns
 
 urlpatterns = [
     # Root URL - redirect to admin
@@ -40,6 +41,9 @@ urlpatterns = [
     path('api/telephony/', include('telephony.urls')),
     path('api/whatsapp/', include('whatsapp_integration.urls')),  # WhatsApp adapter
 ]
+
+# MCP server endpoints (Claude Desktop / Claude in Chrome custom connector)
+urlpatterns += mcp_urlpatterns
 
 # Serve static files in development
 if settings.DEBUG:

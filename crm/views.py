@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.renderers import BaseRenderer, JSONRenderer
 from django_filters.rest_framework import DjangoFilterBackend
+import django_filters
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiExample
 from drf_spectacular.openapi import AutoSchema
 from django.db.models import Count, Q
@@ -90,6 +91,34 @@ class LeadStatusViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVi
     ordering = ['order_index']
 
 
+class LeadFilter(django_filters.FilterSet):
+    """
+    Custom FilterSet for Lead model.
+    Supports both exact and multi-value (comma-separated) filtering
+    for status and priority so the React UI can pass multiple selections.
+    e.g. ?status__in=1,3,5  ?priority__in=HIGH,MEDIUM
+    """
+    status__in = django_filters.BaseInFilter(field_name='status', lookup_expr='in')
+    priority__in = django_filters.BaseInFilter(field_name='priority', lookup_expr='in')
+
+    class Meta:
+        model = Lead
+        fields = {
+            'status': ['exact'],
+            'priority': ['exact'],
+            'lead_score': ['exact', 'gte', 'lte', 'isnull'],
+            'owner_user_id': ['exact'],
+            'assigned_to': ['exact', 'isnull'],
+            'created_at': ['gte', 'lte', 'exact'],
+            'updated_at': ['gte', 'lte'],
+            'next_follow_up_at': ['gte', 'lte', 'isnull'],
+            'city': ['exact', 'icontains'],
+            'state': ['exact', 'icontains'],
+            'country': ['exact', 'icontains'],
+            'groups': ['exact'],
+        }
+
+
 @extend_schema_view(
     list=extend_schema(description='List all leads'),
     retrieve=extend_schema(description='Retrieve a specific lead'),
@@ -125,20 +154,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
     permission_classes = [HasCRMPermission]
     permission_resource = 'leads'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = {
-        'status': ['exact'],
-        'priority': ['exact'],
-        'lead_score': ['exact', 'gte', 'lte', 'isnull'],
-        'owner_user_id': ['exact'],
-        'assigned_to': ['exact', 'isnull'],
-        'created_at': ['gte', 'lte', 'exact'],
-        'updated_at': ['gte', 'lte'],
-        'next_follow_up_at': ['gte', 'lte', 'isnull'],
-        'city': ['exact', 'icontains'],
-        'state': ['exact', 'icontains'],
-        'country': ['exact', 'icontains'],
-        'groups': ['exact'],
-    }
+    filterset_class = LeadFilter
     search_fields = ['name', 'phone', 'email', 'company', 'notes']
     ordering_fields = [
         'name', 'created_at', 'updated_at', 'priority', 'lead_score',

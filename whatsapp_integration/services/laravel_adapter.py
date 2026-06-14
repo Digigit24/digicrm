@@ -75,20 +75,57 @@ class LaravelWhatsAppAdapter:
     """
     Facade for all DigiCRM → Laravel WhatsApp API calls.
 
-    Usage:
+    Preferred — pass credentials from request headers (no DB lookup):
+        adapter = LaravelWhatsAppAdapter(
+            tenant_id=request.tenant_id,
+            vendor_uid=request.headers.get('X-WA-Vendor-Uid'),
+            api_token=request.headers.get('X-WA-Api-Token'),
+        )
+
+    Fallback — if headers absent, reads WhatsAppVendorConfig from DB:
         adapter = LaravelWhatsAppAdapter(tenant_id=request.tenant_id)
-        result  = adapter.send_message(phone="919876543210", ...)
     """
 
-    def __init__(self, tenant_id: str):
+    DEFAULT_BASE_URL = 'https://whatsappapi.celiyo.com/api'
+
+    def __init__(
+        self,
+        tenant_id: str,
+        vendor_uid: str = None,
+        api_token: str = None,
+        base_url: str = None,
+    ):
         self.tenant_id = str(tenant_id)
-        config = _get_vendor_config(self.tenant_id)
-        self.vendor_uid  = config.vendor_uid
-        self.api_token   = config.api_token
-        self.base_url    = config.api_base_url.rstrip('/')
+
+        if vendor_uid and api_token:
+            # Credentials supplied directly (e.g. from request headers)
+            self.vendor_uid = vendor_uid
+            self.api_token  = api_token
+            self.base_url   = (base_url or self.DEFAULT_BASE_URL).rstrip('/')
+        else:
+            # Fall back to DB lookup
+            config = _get_vendor_config(self.tenant_id)
+            self.vendor_uid = config.vendor_uid
+            self.api_token  = config.api_token
+            self.base_url   = config.api_base_url.rstrip('/')
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}/{self.vendor_uid}/adapter/{path.lstrip('/')}"
+
+    @staticmethod
+    def _normalize_phone(phone: str) -> str:
+        """
+        Strip non-digits and ensure Indian country code (91) is prepended.
+        DigiCRM stores 10-digit numbers — WhatsApp Cloud API needs full E.164 (without +).
+        Examples:
+            '9876543210'    → '919876543210'
+            '+919876543210' → '919876543210'
+            '919876543210'  → '919876543210'  (already correct, untouched)
+        """
+        digits = ''.join(filter(str.isdigit, phone or ''))
+        if len(digits) == 10:
+            digits = '91' + digits
+        return digits
 
     # ------------------------------------------------------------------
     # 1. SEND SINGLE MESSAGE TO A PHONE NUMBER
@@ -107,7 +144,7 @@ class LaravelWhatsAppAdapter:
         Returns dict with: wa_message_id, contact_uid, digicrm_lead_id
         """
         payload = {
-            'phone': phone,
+            'phone': self._normalize_phone(phone),
             'name': name,
             'template_uid': template_uid,
             'template_components': template_components or [],
@@ -135,11 +172,16 @@ class LaravelWhatsAppAdapter:
         scheduled_at: ISO 8601 string or None for immediate
         Returns dict with: campaign_uid, group_uid, total_contacts, scheduled_at
         """
+        # Normalize all contact phone numbers before sending
+        normalized_contacts = [
+            {**c, 'phone': self._normalize_phone(c.get('phone', ''))}
+            for c in contacts
+        ]
         payload = {
             'name': name,
             'template_uid': template_uid,
             'template_components': template_components or [],
-            'contacts': contacts,
+            'contacts': normalized_contacts,
             'timezone': timezone,
             'digicrm_campaign_id': digicrm_campaign_id,
         }
@@ -190,23 +232,120 @@ class LaravelWhatsAppAdapter:
         )
 
     # ------------------------------------------------------------------
-    # 5. CHAT HISTORY FOR A PHONE NUMBER
+    # 5. SEND PLAIN TEXT MESSAGE TO A PHONE NUMBER
+    # ------------------------------------------------------------------
+    def send_text_message(
+        self,
+        phone: str,
+        name: str,
+        text: str,
+        digicrm_lead_id: int = None,
+    ) -> dict:
+        """
+        Send a plain text WhatsApp message (requires 24h window open).
+        """
+        payload = {
+            'phone': self._normalize_phone(phone),
+            'name': name,
+            'text': text,
+            'digicrm_lead_id': digicrm_lead_id,
+        }
+        return _make_request('POST', self._url('messages/send-text'), self.api_token, json=payload)
+
+    # ------------------------------------------------------------------
+    # 6. GET CHAT HISTORY BY PHONE
     # ------------------------------------------------------------------
     def get_chat_history(self, phone: str, page: int = 1, per_page: int = 50) -> dict:
-        """
-        Get paginated message history for a phone number.
-        Used by the Lead detail page WhatsApp chat drawer.
-        """
-        clean_phone = ''.join(filter(str.isdigit, phone))
+        """Fetch paginated WhatsApp message history for a phone number."""
+        normalized = self._normalize_phone(phone)
         return _make_request(
             'GET',
-            self._url(f'contacts/by-phone/{clean_phone}/messages'),
+            self._url(f'contacts/by-phone/{normalized}/messages'),
             self.api_token,
             params={'page': page, 'per_page': per_page}
         )
 
     # ------------------------------------------------------------------
-    # 6. GET TEMPLATES (cached 10 minutes)
+    # 7. ASSIGN CHAT USER (BY PHONE)
+    # ------------------------------------------------------------------
+    def assign_chat_user(self, phone: str, user_uid: str) -> dict:
+        """Assign a WhatsApp chat to a team member by phone number."""
+        normalized = self._normalize_phone(phone)
+        return _make_request(
+            'POST',
+            self._url(f'contacts/by-phone/{normalized}/assign-user'),
+            self.api_token,
+            json={'user_uid': user_uid}
+        )
+
+    # ------------------------------------------------------------------
+    # 8. MARK CHAT AS READ (BY PHONE)
+    # ------------------------------------------------------------------
+    def mark_chat_read(self, phone: str) -> dict:
+        """Mark all messages in a WhatsApp chat as read, by phone number."""
+        normalized = self._normalize_phone(phone)
+        return _make_request(
+            'POST',
+            self._url(f'contacts/by-phone/{normalized}/mark-read'),
+            self.api_token,
+            json={}
+        )
+
+    # ------------------------------------------------------------------
+    # 9. BLOCK / UNBLOCK WHATSAPP CONTACT (BY PHONE)
+    # ------------------------------------------------------------------
+    def block_contact(self, phone: str, block: bool = True) -> dict:
+        """Block or unblock a WhatsApp contact by phone number."""
+        normalized = self._normalize_phone(phone)
+        endpoint = 'block' if block else 'unblock'
+        return _make_request(
+            'POST',
+            self._url(f'contacts/by-phone/{normalized}/{endpoint}'),
+            self.api_token,
+            json={}
+        )
+
+    # ------------------------------------------------------------------
+    # 5. CHAT HISTORY FOR A PHONE NUMBER
+    # ------------------------------------------------------------------
+    def get_chat_history(self, phone: str, page: int = 1, per_page: int = 50) -> dict:
+        """
+        Get paginated message history for a phone number.
+        Phone is normalized (91 prefix for 10-digit) to match how Laravel stores contacts.
+        Used by the Lead detail page WhatsApp chat drawer.
+        """
+        normalized = self._normalize_phone(phone)
+        return _make_request(
+            'GET',
+            self._url(f'contacts/by-phone/{normalized}/messages'),
+            self.api_token,
+            params={'page': page, 'per_page': per_page}
+        )
+
+    # ------------------------------------------------------------------
+    # 6. SEND PLAIN TEXT MESSAGE TO A PHONE NUMBER
+    # ------------------------------------------------------------------
+    def send_text_message(
+        self,
+        phone: str,
+        name: str,
+        text: str,
+        digicrm_lead_id: int = None,
+    ) -> dict:
+        """
+        Send a plain WhatsApp text message via the adapter.
+        Returns: { result, message, wa_message_id, contact_uid, digicrm_lead_id }
+        """
+        payload = {
+            'phone': self._normalize_phone(phone),
+            'name': name,
+            'text': text,
+            'digicrm_lead_id': digicrm_lead_id,
+        }
+        return _make_request('POST', self._url('messages/send-text'), self.api_token, json=payload)
+
+    # ------------------------------------------------------------------
+    # 7. GET TEMPLATES (cached 10 minutes)
     # ------------------------------------------------------------------
     def get_templates(self) -> list:
         """

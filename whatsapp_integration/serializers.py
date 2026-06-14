@@ -232,8 +232,11 @@ class BulkEnrollSerializer(serializers.Serializer):
 # ---------------------------------------------------------------------------
 
 class AgentSendWhatsAppSerializer(serializers.Serializer):
-    """Input for agent send-whatsapp action."""
-    lead_id             = serializers.IntegerField(help_text='DigiCRM lead ID.')
+    """Input for agent send-whatsapp action.
+    lead_id is optional — the /leads/{lead_id}/send/ endpoint takes it from the URL path.
+    It remains required only for the agent's generic /agent/send/ endpoint.
+    """
+    lead_id             = serializers.IntegerField(required=False, help_text='DigiCRM lead ID (optional when using URL path).')
     template_uid        = serializers.CharField(help_text='Laravel template _uid.')
     template_components = serializers.ListField(
         child=serializers.DictField(), required=False, default=list,
