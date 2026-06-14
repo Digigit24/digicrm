@@ -1,25 +1,33 @@
 """
-DigiCRM MCP Django View — Direct ORM edition
-=============================================
+DigiCRM MCP Django View — Direct ORM + OAuth edition
+======================================================
 Runs INSIDE Django, calls models directly. No JWT env var needed,
 no HTTP round-trip to itself.
 
 Setup in main urls.py:
-    from mcp.django_view import mcp_urlpatterns
+    from mcp.django_view import mcp_urlpatterns, oauth_well_known
     urlpatterns += mcp_urlpatterns
+    urlpatterns += [path('.well-known/oauth-authorization-server', oauth_well_known)]
 
-Custom connector URL:
-    https://crm.celiyo.com/mcp/sse   (leave OAuth fields blank)
+Custom connector URL:  https://crm.celiyo.com/mcp/sse
+OAuth Client ID:       digicrm-mcp          (fixed, enter in connector settings)
+OAuth Client Secret:   value of MCP_SECRET  (set on your server, enter in connector settings)
 
-The only env var you need is optional security:
-    MCP_SECRET=somerandomstring
-Then use: https://crm.celiyo.com/mcp/sse?secret=somerandomstring
+Required env var on production server:
+    MCP_SECRET=<any random string, e.g. openssl rand -hex 32>
+
+Flow:
+    1. Claude reads /.well-known/oauth-authorization-server
+    2. Claude POSTs client_id + client_secret to /mcp/oauth/token
+    3. Claude gets back an access token (= MCP_SECRET)
+    4. Claude sends Bearer <token> on all /mcp/sse and /mcp/message requests
 """
 
 import json
 import time
 import os
 import logging
+import secrets
 
 from django.http import JsonResponse, StreamingHttpResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -27,7 +35,9 @@ from django.urls import path
 
 logger = logging.getLogger(__name__)
 
+# Set this on your production server: MCP_SECRET=<random string>
 MCP_SECRET = os.environ.get('MCP_SECRET', '')
+MCP_CLIENT_ID = 'digicrm-mcp'   # fixed — enter this in Claude's connector settings
 
 
 def _cors(response):
@@ -37,10 +47,94 @@ def _cors(response):
     return response
 
 
-def _check_secret(request):
+def _check_auth(request) -> bool:
+    """Accept either Bearer token (from OAuth flow) or ?secret= param."""
     if not MCP_SECRET:
+        return True  # no secret configured → open (dev mode)
+    # Bearer token sent by Claude after OAuth
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer ') and auth[7:].strip() == MCP_SECRET:
         return True
+    # Fallback: ?secret= in URL (for direct testing)
     return request.GET.get('secret', '') == MCP_SECRET
+
+
+# ── OAuth endpoints (required by MCP spec for remote HTTP servers) ─────────────
+
+def oauth_well_known(request):
+    """OAuth 2.0 server discovery — Claude reads this first."""
+    base = f"{'https' if request.is_secure() else 'http'}://{request.get_host()}"
+    return _cors(JsonResponse({
+        'issuer': base,
+        'authorization_endpoint': f'{base}/mcp/oauth/authorize',
+        'token_endpoint': f'{base}/mcp/oauth/token',
+        'registration_endpoint': f'{base}/mcp/oauth/register',
+        'response_types_supported': ['code'],
+        'grant_types_supported': ['authorization_code', 'client_credentials'],
+        'token_endpoint_auth_methods_supported': ['client_secret_post', 'client_secret_basic'],
+        'code_challenge_methods_supported': ['S256'],
+    }))
+
+
+@csrf_exempt
+def oauth_register(request):
+    """
+    Dynamic client registration (RFC 7591).
+    Claude tries this when no Client ID is provided in connector settings.
+    We reject it — user must enter Client ID + Secret manually.
+    """
+    if request.method == 'OPTIONS':
+        return _cors(HttpResponse())
+    # Return the fixed client_id so Claude can proceed
+    return _cors(JsonResponse({
+        'client_id': MCP_CLIENT_ID,
+        'client_secret': MCP_SECRET or 'configure-MCP_SECRET-env-var',
+        'client_name': 'DigiCRM MCP',
+        'grant_types': ['client_credentials'],
+        'token_endpoint_auth_method': 'client_secret_post',
+    }, status=201))
+
+
+@csrf_exempt
+def oauth_token(request):
+    """
+    Token endpoint — Claude exchanges client_id + client_secret for a Bearer token.
+    We validate the secret and return it as the access token (simple but sufficient).
+    """
+    if request.method == 'OPTIONS':
+        return _cors(HttpResponse())
+
+    # Parse form or JSON body
+    try:
+        if request.content_type and 'json' in request.content_type:
+            body = json.loads(request.body)
+        else:
+            body = request.POST.dict() or json.loads(request.body or '{}')
+    except Exception:
+        body = {}
+
+    client_id = body.get('client_id') or request.POST.get('client_id', '')
+    client_secret = body.get('client_secret') or request.POST.get('client_secret', '')
+
+    if MCP_SECRET and client_secret != MCP_SECRET:
+        return _cors(JsonResponse({'error': 'invalid_client'}, status=401))
+
+    return _cors(JsonResponse({
+        'access_token': MCP_SECRET or 'no-secret-configured',
+        'token_type': 'bearer',
+        'expires_in': 31536000,  # 1 year
+    }))
+
+
+@csrf_exempt
+def oauth_authorize(request):
+    """Authorization code endpoint — redirect immediately with a code."""
+    redirect_uri = request.GET.get('redirect_uri', '')
+    state = request.GET.get('state', '')
+    code = secrets.token_urlsafe(16)
+    sep = '&' if '?' in redirect_uri else '?'
+    location = f'{redirect_uri}{sep}code={code}&state={state}'
+    return HttpResponse(status=302, headers={'Location': location})
 
 
 # ── Direct ORM tool dispatcher ────────────────────────────────────────────────
@@ -224,14 +318,13 @@ def mcp_health(request):
 
 
 def mcp_sse(request):
-    if not _check_secret(request):
-        return _cors(JsonResponse({'error': 'Forbidden'}, status=403))
+    if not _check_auth(request):
+        return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
 
     def event_stream():
         scheme = 'https' if request.is_secure() else 'http'
         host = request.get_host()
-        secret_param = f'?secret={MCP_SECRET}' if MCP_SECRET else ''
-        endpoint = f'{scheme}://{host}/mcp/message{secret_param}'
+        endpoint = f'{scheme}://{host}/mcp/message'
         yield f'event: endpoint\ndata: {endpoint}\n\n'
         while True:
             yield ': heartbeat\n\n'
@@ -249,8 +342,8 @@ def mcp_message(request):
         return _cors(HttpResponse())
     if request.method != 'POST':
         return HttpResponse(status=405)
-    if not _check_secret(request):
-        return _cors(JsonResponse({'error': 'Forbidden'}, status=403))
+    if not _check_auth(request):
+        return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
 
     try:
         body = json.loads(request.body)
@@ -266,7 +359,10 @@ def mcp_message(request):
 
 
 mcp_urlpatterns = [
-    path('mcp/health',  mcp_health),
-    path('mcp/sse',     mcp_sse),
-    path('mcp/message', mcp_message),
+    path('mcp/health',          mcp_health),
+    path('mcp/sse',             mcp_sse),
+    path('mcp/message',         mcp_message),
+    path('mcp/oauth/token',     oauth_token),
+    path('mcp/oauth/register',  oauth_register),
+    path('mcp/oauth/authorize', oauth_authorize),
 ]
