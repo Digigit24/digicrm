@@ -443,10 +443,14 @@ def _handle_mcp_request(body: dict) -> dict:
     req_id = body.get('id')
 
     if method == 'initialize':
+        # Negotiate protocol version: accept whatever client requests, reply with same
+        client_version = body.get('params', {}).get('protocolVersion', '2024-11-05')
+        supported = {'2024-11-05', '2025-03-26'}
+        proto = client_version if client_version in supported else '2025-03-26'
         return {
             'jsonrpc': '2.0', 'id': req_id,
             'result': {
-                'protocolVersion': '2024-11-05',
+                'protocolVersion': proto,
                 'capabilities': {'tools': {}},
                 'serverInfo': {'name': 'digicrm', 'version': '1.0.0'},
             }
@@ -487,18 +491,57 @@ def mcp_health(request):
 
 @csrf_exempt
 def mcp_sse(request):
+    """
+    Dual-transport MCP endpoint.
+
+    POST → Streamable HTTP transport (MCP spec 2025-03-26).
+           Claude sends JSON-RPC directly in the body; we reply with JSON.
+           This is what Claude's custom connector uses.
+
+    GET  → Legacy SSE transport (MCP spec 2024-11-05).
+           We stream the endpoint URL so the client knows where to POST.
+    """
+    if request.method == 'OPTIONS':
+        return _cors(HttpResponse())
+
     auth_header = request.headers.get('Authorization', '')
-    logger.info(f'MCP SSE connect: method={request.method} auth_present={bool(auth_header)} secret_set={bool(MCP_SECRET)}')
+    logger.info(f'MCP endpoint: method={request.method} auth_present={bool(auth_header)} secret_set={bool(MCP_SECRET)}')
 
     if not _check_auth(request):
-        logger.warning('MCP SSE: auth FAILED')
+        logger.warning('MCP endpoint: auth FAILED')
         return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
 
-    logger.info('MCP SSE: auth OK, starting stream')
+    # ── Streamable HTTP transport (POST) ────────────────────────────────────────
+    if request.method == 'POST':
+        try:
+            body = json.loads(request.body)
+        except json.JSONDecodeError:
+            return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400))
+
+        method = body.get('method', '?')
+        logger.info(f'MCP streamable POST: method={method} id={body.get("id")}')
+
+        # notifications have no id and no response
+        if body.get('id') is None and method.startswith('notifications/'):
+            logger.info(f'MCP streamable: notification {method} (no response)')
+            return _cors(HttpResponse(status=202))
+
+        try:
+            result = _handle_mcp_request(body)
+            logger.info(f'MCP streamable POST: {method} → ok')
+            return _cors(JsonResponse(result, safe=False))
+        except Exception as e:
+            logger.exception(f'MCP streamable POST: {method} FAILED')
+            return _cors(JsonResponse({
+                'jsonrpc': '2.0', 'id': body.get('id'),
+                'error': {'code': -32603, 'message': str(e)}
+            }, status=500))
+
+    # ── Legacy SSE transport (GET) ───────────────────────────────────────────────
+    logger.info('MCP SSE: GET → starting legacy SSE stream')
 
     def event_stream():
         try:
-            # Use X-Forwarded-Proto from nginx if present (handles reverse-proxy HTTPS)
             x_proto = request.META.get('HTTP_X_FORWARDED_PROTO', '')
             scheme = x_proto if x_proto in ('http', 'https') else ('https' if request.is_secure() else 'http')
             host = request.get_host()
@@ -506,14 +549,11 @@ def mcp_sse(request):
             logger.info(f'MCP SSE: yielding endpoint event → {endpoint}')
             yield f'event: endpoint\ndata: {endpoint}\n\n'
             logger.info('MCP SSE: endpoint sent, entering heartbeat loop')
-            count = 0
             while True:
-                count += 1
-                logger.debug(f'MCP SSE: heartbeat #{count}')
                 yield ': heartbeat\n\n'
                 time.sleep(15)
         except GeneratorExit:
-            logger.info('MCP SSE: client disconnected (GeneratorExit)')
+            logger.info('MCP SSE: client disconnected')
         except Exception as exc:
             logger.exception(f'MCP SSE: generator exception: {exc}')
 
