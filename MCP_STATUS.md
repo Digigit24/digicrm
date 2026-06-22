@@ -11,11 +11,11 @@
 - **Endpoint:** `POST /mcp/sse`  
 - **Auth:** `Authorization: Bearer <MCP_SECRET>`  
 - **Protocol:** MCP Streamable HTTP 2025-03-26 (JSON-RPC 2.0)  
-- **Tools registered:** 34
+- **Tools registered:** 39
 
 ---
 
-## All 34 MCP Tools
+## All 39 MCP Tools
 
 ### Phase 1 — CRM Core (13 tools) ✅ All passing
 
@@ -34,6 +34,19 @@
 | `update_task` | Update task (title, due date, status) | ✅ |
 | `create_meeting` | Schedule a meeting for a lead | ✅ |
 | `update_meeting` | Update meeting details | ✅ |
+
+### Phase 1b — Users & Assignment (5 tools) — added 2026-06-23
+
+| Tool | Description | Status |
+|------|-------------|--------|
+| `list_users` | List workspace users (id, name, email) from admin.celiyo.com via the `/api/crm/users/` proxy. Resolve names to UUIDs. | new |
+| `assign_lead` | Assign/reassign a single lead to a user (PATCH `assigned_to`; pass null to unassign) | new |
+| `bulk_assign_leads` | Assign many leads to one user in a single call | new |
+| `create_lead_group` | Create a new lead group/list (`POST /api/crm/lead-groups/`) | new |
+| `create_lead_status` | Create a new pipeline status (`POST /api/crm/statuses/`; auto-orders if `order_index` omitted) | new |
+
+> `list_leads` also gained `assigned_to` and `unassigned` filter args.
+> New REST route: `GET /api/crm/users/` (proxy to admin.celiyo.com, reuses the service JWT). Implemented in `crm/views.py::TenantUserListView` + `crm/user_directory.py`.
 
 ### Phase 2 — WhatsApp (10 tools) — 7 passing, 3 failing
 

@@ -2,7 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     LeadViewSet, LeadStatusViewSet, LeadActivityViewSet, LeadOrderViewSet,
-    LeadFieldConfigurationViewSet, LeadGroupViewSet
+    LeadFieldConfigurationViewSet, LeadGroupViewSet, TenantUserListView
 )
 
 router = DefaultRouter()
@@ -14,5 +14,6 @@ router.register(r'field-configurations', LeadFieldConfigurationViewSet, basename
 router.register(r'lead-groups', LeadGroupViewSet, basename='leadgroup')
 
 urlpatterns = [
+    path('users/', TenantUserListView.as_view(), name='tenant-users'),
     path('', include(router.urls)),
 ]

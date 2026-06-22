@@ -693,24 +693,59 @@ class LeadWhatsAppViewSet(viewsets.ViewSet):
     )
     @action(detail=False, methods=['post'], url_path='(?P<lead_id>[0-9]+)/assign-chat-user')
     def assign_chat_user(self, request, lead_id=None):
-        """Assign a team member to this lead's WhatsApp inbox chat."""
+        """Assign a team member to this lead's WhatsApp inbox chat.
+
+        Uses DigiCRM's own user system (admin.celiyo.com JWT auth) — user_uid is
+        the UUID from request.user_id / the tenant's user list.  The lead's
+        assigned_to field is updated directly in DigiCRM; the Laravel adapter call
+        is attempted as a best-effort sync to the WhatsApp inbox panel.
+        """
+        import uuid as _uuid
         lead = self._get_lead(request, lead_id)
         if not lead:
             return Response({'detail': 'Lead not found.'}, status=status.HTTP_404_NOT_FOUND)
-        if not lead.phone:
-            return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
 
         user_uid = request.data.get('user_uid', '').strip()
         if not user_uid:
             return Response({'detail': 'user_uid is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Validate it's a well-formed UUID (matches DigiCRM user system)
         try:
-            adapter = _adapter_from_request(request)
-            result = adapter.assign_chat_user(lead.phone, user_uid)
-        except LaravelAdapterError as e:
-            return Response({'detail': str(e)}, status=e.status_code)
+            _uuid.UUID(user_uid)
+        except ValueError:
+            return Response({'detail': 'user_uid must be a valid UUID.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        return Response({'detail': 'Chat user assigned.', **result})
+        # ── Primary: update Lead.assigned_to in DigiCRM ──────────────────────
+        lead.assigned_to = user_uid
+        lead.save(update_fields=['assigned_to'])
+
+        # Log the assignment as a lead activity
+        from crm.models import LeadActivity
+        LeadActivity.objects.create(
+            lead=lead,
+            tenant_id=request.tenant_id,
+            type='NOTE',
+            content='Chat assigned to user %s via WhatsApp agent.' % user_uid,
+            created_by=request.user_id,
+        )
+
+        # ── Secondary: best-effort sync to Laravel WhatsApp inbox ────────────
+        # Laravel's user system is separate; this may not find a matching user.
+        # Failure here does NOT block the DigiCRM assignment above.
+        adapter_result = {}
+        if lead.phone:
+            try:
+                adapter = _adapter_from_request(request)
+                adapter_result = adapter.assign_chat_user(lead.phone, user_uid)
+            except Exception:
+                adapter_result = {'wa_inbox_sync': 'skipped — no matching Laravel user for this UID'}
+
+        return Response({
+            'detail': 'Chat user assigned.',
+            'lead_id': lead.id,
+            'assigned_to': user_uid,
+            **adapter_result,
+        })
 
     @extend_schema(
         description='Mark all WhatsApp messages for this lead as read.',

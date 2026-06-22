@@ -144,6 +144,10 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                 Q(phone__icontains=search) |
                 Q(email__icontains=search)
             )
+        if args.get('assigned_to'):
+            qs = qs.filter(assigned_to=args['assigned_to'])
+        elif args.get('unassigned'):
+            qs = qs.filter(assigned_to__isnull=True)
         page      = int(args.get('page', 1))
         page_size = int(args.get('page_size', 20))
         offset    = (page - 1) * page_size
@@ -249,6 +253,78 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             group_id=args['lead_group_id'],
         )
         return {'lead_id': args['lead_id'], 'group_id': args['lead_group_id'], 'added': True}
+
+    # -- list_users --
+    if name == 'list_users':
+        from crm.user_directory import fetch_tenant_users
+        return fetch_tenant_users(
+            search=args.get('search'),
+            page_size=args.get('page_size', 100),
+        )
+
+    # -- assign_lead --
+    if name == 'assign_lead':
+        lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        lead.assigned_to = args.get('assigned_to') or None
+        lead.save(update_fields=['assigned_to', 'updated_at'])
+        return {'id': lead.id, 'assigned_to': str(lead.assigned_to) if lead.assigned_to else None}
+
+    # -- bulk_assign_leads --
+    if name == 'bulk_assign_leads':
+        assigned_to = args.get('assigned_to') or None
+        success, failure, errors = 0, 0, []
+        for lead_id in args.get('lead_ids', []):
+            try:
+                updated = Lead.objects.filter(
+                    id=lead_id, tenant_id=TENANT_ID
+                ).update(assigned_to=assigned_to)
+                if updated:
+                    success += 1
+                else:
+                    failure += 1
+                    errors.append({'lead_id': lead_id, 'error': 'not found in tenant'})
+            except Exception as exc:  # noqa: BLE001
+                failure += 1
+                errors.append({'lead_id': lead_id, 'error': str(exc)})
+        return {
+            'success_count': success,
+            'failure_count': failure,
+            'assigned_to': str(assigned_to) if assigned_to else None,
+            'errors': errors,
+        }
+
+    # -- create_lead_group --
+    if name == 'create_lead_group':
+        group = LeadGroup.objects.create(
+            tenant_id=TENANT_ID,
+            name=args['name'],
+            description=args.get('description') or None,
+            color_hex=args.get('color_hex') or None,
+            created_by=OWNER_USER_ID or TENANT_ID,
+        )
+        return {'id': group.id, 'name': group.name}
+
+    # -- create_lead_status --
+    if name == 'create_lead_status':
+        order_index = args.get('order_index')
+        if order_index is None:
+            last = (
+                LeadStatus.objects.filter(tenant_id=TENANT_ID)
+                .order_by('-order_index')
+                .values_list('order_index', flat=True)
+                .first()
+            )
+            order_index = (last + 1) if last is not None else 0
+        status_obj = LeadStatus.objects.create(
+            tenant_id=TENANT_ID,
+            name=args['name'],
+            order_index=order_index,
+            color_hex=args.get('color_hex') or None,
+            is_won=args.get('is_won', False),
+            is_lost=args.get('is_lost', False),
+            is_active=args.get('is_active', True),
+        )
+        return {'id': status_obj.id, 'name': status_obj.name, 'order_index': status_obj.order_index}
 
     # ── create_lead_activity ────────────────────────────────────────────────────
     if name == 'create_lead_activity':
@@ -603,7 +679,12 @@ def _handle_mcp_request(body: dict) -> dict:
 
 
 def mcp_health(request):
-    return _cors(JsonResponse({'status': 'ok', 'server': 'digicrm-mcp', 'tools': 31}))
+    try:
+        from mcp.server import TOOLS
+        tool_count = len(TOOLS)
+    except Exception:  # noqa: BLE001
+        tool_count = None
+    return _cors(JsonResponse({'status': 'ok', 'server': 'digicrm-mcp', 'tools': tool_count}))
 
 
 @csrf_exempt

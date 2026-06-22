@@ -84,12 +84,17 @@ def _tool(name: str, description: str, properties: dict, required: list = None):
 _tool('list_leads', """
 Search and list leads in the CRM.
 
-Returns paginated list with id, name, phone, email, status, lead_score, source.
+Returns paginated list with id, name, phone, email, status, lead_score, source,
+assigned_to.
 Use search to filter by name, phone, or email.
+Use assigned_to (a user UUID from list_users) to show only that user's leads,
+or unassigned=true to show leads with no owner.
 """, {
-    'search':    {'type': 'string',  'description': 'Filter by name, phone, or email (partial match)'},
-    'page':      {'type': 'integer', 'description': 'Page number (default 1)'},
-    'page_size': {'type': 'integer', 'description': 'Results per page (default 20, max 100)'},
+    'search':      {'type': 'string',  'description': 'Filter by name, phone, or email (partial match)'},
+    'assigned_to': {'type': 'string',  'description': 'User UUID - only return leads assigned to this user. Resolve names via list_users.'},
+    'unassigned':  {'type': 'boolean', 'description': 'If true, only return leads with no assigned user. Ignored when assigned_to is set.'},
+    'page':        {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':   {'type': 'integer', 'description': 'Results per page (default 20, max 100)'},
 })
 
 _tool('get_lead', """
@@ -174,6 +179,67 @@ lead_group_id: integer ID of the group (get from list_lead_groups if needed)
     'lead_id':       {'type': 'integer'},
     'lead_group_id': {'type': 'integer'},
 }, ['lead_id', 'lead_group_id'])
+
+_tool('list_users', """
+List the users (team members) in this workspace.
+
+Users come from the central auth directory (admin.celiyo.com), not the CRM.
+Returns id (UUID), name, and email for each user.
+Use a user's id as the assigned_to value when assigning leads or filtering leads.
+""", {
+    'search':    {'type': 'string',  'description': 'Filter users by name or email (optional)'},
+    'page_size': {'type': 'integer', 'description': 'Max users to return (default 100)'},
+})
+
+_tool('assign_lead', """
+Assign (or reassign) a single lead to a user.
+
+Pass the user's UUID as assigned_to (resolve names via list_users first).
+Pass assigned_to = null to unassign the lead.
+""", {
+    'lead_id':     {'type': 'integer', 'description': 'ID of the lead to assign'},
+    'assigned_to': {'type': ['string', 'null'], 'description': 'User UUID to assign the lead to, or null to unassign'},
+}, ['lead_id', 'assigned_to'])
+
+_tool('bulk_assign_leads', """
+Assign (or reassign) many leads to one user in a single call.
+
+Applies the same assigned_to to every lead in lead_ids.
+Pass assigned_to = null to unassign all of them.
+Returns per-lead success/failure counts.
+""", {
+    'lead_ids':    {'type': 'array', 'items': {'type': 'integer'}, 'description': 'IDs of the leads to assign'},
+    'assigned_to': {'type': ['string', 'null'], 'description': 'User UUID to assign all leads to, or null to unassign'},
+}, ['lead_ids', 'assigned_to'])
+
+_tool('create_lead_group', """
+Create a new CRM lead group (list/segment).
+
+Required: name (must be unique within the workspace)
+Optional: description, color_hex (e.g. #6366F1)
+Returns the created group with its id.
+""", {
+    'name':        {'type': 'string', 'description': 'Display name, e.g. VIP Clients'},
+    'description': {'type': 'string', 'description': 'Optional description of the group purpose'},
+    'color_hex':   {'type': 'string', 'description': 'Optional hex color for the group badge, e.g. #6366F1'},
+}, ['name'])
+
+_tool('create_lead_status', """
+Create a new pipeline status (stage) for leads.
+
+Required: name (must be unique within the workspace)
+Optional: order_index (board position; auto-appended if omitted),
+          color_hex, is_won, is_lost, is_active.
+A status cannot be both is_won and is_lost.
+Returns the created status with its id.
+""", {
+    'name':        {'type': 'string',  'description': 'Status name, e.g. Qualified or Closed Won'},
+    'order_index': {'type': 'integer', 'description': 'Sort position on the board (lower = earlier). Auto-appended to the end if omitted.'},
+    'color_hex':   {'type': 'string',  'description': 'Optional hex color, e.g. #22C55E'},
+    'is_won':      {'type': 'boolean', 'description': 'True if this stage represents a won deal'},
+    'is_lost':     {'type': 'boolean', 'description': 'True if this stage represents a lost deal'},
+    'is_active':   {'type': 'boolean', 'description': 'Whether the status is active (default true)'},
+}, ['name'])
 
 _tool('create_task', """
 Create a task in CRM, optionally linked to a lead.
@@ -496,9 +562,56 @@ def _dispatch(name: str, args: dict) -> Any:  # noqa: C901
 
     # ---- PHASE 1 ----
 
-    if name == 'create_lead':
+    if name == 'list_leads':
+        params = {}
+        for k in ('search', 'page', 'page_size'):
+            if args.get(k) is not None:
+                params[k] = args[k]
+        if args.get('assigned_to'):
+            params['assigned_to'] = args['assigned_to']
+        elif args.get('unassigned'):
+            params['assigned_to__isnull'] = 'true'
+        return client.get('/api/crm/leads/', params=params)
+
+    elif name == 'get_lead':
+        return client.get(f"/api/crm/leads/{args['lead_id']}/")
+
+    elif name == 'list_lead_statuses':
+        return client.get('/api/crm/statuses/')
+
+    elif name == 'list_users':
+        params = {'page_size': args.get('page_size', 100)}
+        if args.get('search'):
+            params['search'] = args['search']
+        return client.get('/api/crm/users/', params=params)
+
+    elif name == 'create_lead':
         body = {k: v for k, v in args.items() if v is not None}
         return client.post('/api/crm/leads/', body)
+
+    elif name == 'assign_lead':
+        lead_id = args['lead_id']
+        return client.patch(f'/api/crm/leads/{lead_id}/', {'assigned_to': args.get('assigned_to')})
+
+    elif name == 'bulk_assign_leads':
+        assigned_to = args.get('assigned_to')
+        success, failure, errors = 0, 0, []
+        for lead_id in args['lead_ids']:
+            try:
+                client.patch(f'/api/crm/leads/{lead_id}/', {'assigned_to': assigned_to})
+                success += 1
+            except Exception as exc:  # noqa: BLE001
+                failure += 1
+                errors.append({'lead_id': lead_id, 'error': str(exc)})
+        return {'success_count': success, 'failure_count': failure, 'errors': errors}
+
+    elif name == 'create_lead_group':
+        body = {k: v for k, v in args.items() if v is not None}
+        return client.post('/api/crm/lead-groups/', body)
+
+    elif name == 'create_lead_status':
+        body = {k: v for k, v in args.items() if v is not None}
+        return client.post('/api/crm/statuses/', body)
 
     elif name == 'update_lead':
         lead_id = args.pop('lead_id')

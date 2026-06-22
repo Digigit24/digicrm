@@ -137,9 +137,14 @@ def run_all(args):
             return None
 
     # ── Phase 1: CRM Core ────────────────────────────────────────────────────────
-    print('\n%s── Phase 1: CRM Core (10 tools)%s' % (BOLD, RESET))
+    print('\n%s── Phase 1: CRM Core (11 tools)%s' % (BOLD, RESET))
 
     run('list_lead_statuses', {})
+
+    g = run('list_lead_groups', {})
+    if g and g.get('results'):
+        sample['lead_group_id'] = g['results'][0]['id']
+        print('        i sample group id=%s  name=%s' % (sample['lead_group_id'], g['results'][0].get('name', '')))
 
     r = run('list_leads', {'page': 1, 'page_size': 3})
     if r and r.get('results'):
@@ -191,7 +196,7 @@ def run_all(args):
     if sample.get('lead_id'):
         run('add_lead_to_group', {
             'lead_id': sample['lead_id'],
-            'lead_group_id': 1,
+            'lead_group_id': sample.get('lead_group_id', 1),
         }, write=True)
 
     # ── Phase 1: Tasks & Meetings ────────────────────────────────────────────────
@@ -335,8 +340,8 @@ def run_all(args):
 
     camp = run('create_campaign', {
         'name': '_MCP_TEST_CAMP',
-        'lead_group_id': 1,
-        'template_uid':  'placeholder_uid',
+        'lead_group_id': sample.get('lead_group_id', 1),
+        'template_uid':  t_uid or 'placeholder_uid',
         'template_name': 'placeholder',
     }, write=True)
     if camp:

@@ -32,7 +32,11 @@ import logging
 import csv
 import io
 import json
+import requests
 from datetime import datetime
+from rest_framework.views import APIView
+from rest_framework.permissions import IsAuthenticated
+from .user_directory import fetch_tenant_users
 try:
     import openpyxl
     EXCEL_SUPPORT = True
@@ -40,6 +44,46 @@ except ImportError:
     EXCEL_SUPPORT = False
 
 logger = logging.getLogger(__name__)
+
+
+class TenantUserListView(APIView):
+    """
+    GET /api/crm/users/ -- list users for the current tenant.
+
+    Thin proxy to the SuperAdmin (admin.celiyo.com) user directory. Users are
+    not stored in the CRM; leads reference them by UUID via ``assigned_to``.
+    Used by the MCP ``list_users`` tool so an agent can resolve a person's name
+    to the UUID required when assigning leads.
+
+    Query params:
+        search    optional name/email filter
+        page_size max users to return (default 100)
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        search = request.query_params.get('search')
+        try:
+            page_size = int(request.query_params.get('page_size', 100))
+        except (TypeError, ValueError):
+            page_size = 100
+        try:
+            data = fetch_tenant_users(search=search, page_size=page_size)
+        except requests.HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else None
+            logger.warning('User directory upstream error: %s', code)
+            return Response(
+                {'error': 'Failed to fetch users from auth service', 'status': code},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except requests.RequestException as exc:
+            logger.error('User directory unreachable: %s', exc)
+            return Response(
+                {'error': f'Auth service unreachable: {exc}'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(data)
 
 
 class CSVRenderer(BaseRenderer):
