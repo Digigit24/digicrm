@@ -7,8 +7,31 @@ Usage:
     python mcp/test_http.py --dry-run      # skip write/destructive calls
 """
 
-import os, sys, json, argparse, requests
+import os, sys, json, re, argparse, requests
 from datetime import datetime, timedelta, timezone as tz
+
+
+def _template_components(var_count):
+    """Build dummy BODY components for a template with N {{n}} variables.
+
+    Meta rejects a template send when the number of parameters doesn't match the
+    number of placeholders, so when a template has variables we must supply that
+    many values. Returns None for variable-free templates (omit the field)."""
+    if not var_count:
+        return None
+    return [{
+        'type': 'BODY',
+        'parameters': [{'type': 'text', 'text': 'Test%d' % (i + 1)} for i in range(var_count)],
+    }]
+
+
+def _extract_users(payload):
+    """Normalise a list_users response (paginated dict or bare list) to a list."""
+    if isinstance(payload, dict):
+        return payload.get('results') or payload.get('users') or []
+    if isinstance(payload, list):
+        return payload
+    return []
 
 GREEN  = '\033[92m'
 RED    = '\033[91m'
@@ -146,6 +169,16 @@ def run_all(args):
         sample['lead_group_id'] = g['results'][0]['id']
         print('        i sample group id=%s  name=%s' % (sample['lead_group_id'], g['results'][0].get('name', '')))
 
+    u = run('list_users', {'page_size': 50})
+    users = _extract_users(u)
+    if users:
+        first_user = users[0]
+        sample['user_uid'] = (first_user.get('id') or first_user.get('uuid')
+                              or first_user.get('user_id'))
+        print('        i sample user uid=%s  name=%s' % (
+            sample.get('user_uid'),
+            first_user.get('name') or first_user.get('first_name') or first_user.get('email', '')))
+
     r = run('list_leads', {'page': 1, 'page_size': 3})
     if r and r.get('results'):
         sample['lead_id']   = r['results'][0]['id']
@@ -247,28 +280,32 @@ def run_all(args):
         print('  %sSKIP%s  get_lead_chat / get_lead_enrollments (no lead_id)' % (YELLOW, RESET))
         results['skipped'] += 2
 
-    run('get_whatsapp_templates', {})
+    tmpl_r = run('get_whatsapp_templates', {})
+    if tmpl_r and tmpl_r.get('results'):
+        first_t = tmpl_r['results'][0]
+        sample['template_uid'] = (first_t.get('_uid') or first_t.get('uid')
+                                  or first_t.get('id'))
+        body_txt = str(first_t.get('body') or first_t.get('text')
+                       or first_t.get('content') or '')
+        var_nums = set(int(n) for n in re.findall(r'{{\s*(\d+)\s*}}', body_txt))
+        sample['template_var_count'] = len(var_nums)
+        print('        i sample template uid=%s  name=%s  vars=%d' % (
+            sample['template_uid'], first_t.get('name', ''), sample['template_var_count']))
 
     # ── Phase 2: WhatsApp (writes) ────────────────────────────────────────────────
     print('\n%s── Phase 2: WhatsApp Writes (7 tools) — needs WA creds%s' % (BOLD, RESET))
     print('   (These will fail if WA_VENDOR_UID/WA_API_TOKEN not set)')
 
     if sample.get('lead_id'):
-        try:
-            templates_r = client.tool_call('get_whatsapp_templates', {}) if not dry_run else None
-        except Exception:
-            templates_r = None
-        t_uid = None
-        if templates_r and templates_r.get('results'):
-            t_uid = templates_r['results'][0].get('_uid') or templates_r['results'][0].get('uid') or templates_r['results'][0].get('id')
+        t_uid = sample.get('template_uid')
+        components = _template_components(sample.get('template_var_count', 0))
 
         if t_uid:
-            run('send_whatsapp_template', {
-                'lead_id': sample['lead_id'], 'template_uid': t_uid,
-            }, write=True)
-            run('agent_send_whatsapp', {
-                'lead_id': sample['lead_id'], 'template_uid': t_uid,
-            }, write=True)
+            tmpl_args = {'lead_id': sample['lead_id'], 'template_uid': t_uid}
+            if components:
+                tmpl_args['template_components'] = components
+            run('send_whatsapp_template', dict(tmpl_args), write=True)
+            run('agent_send_whatsapp',    dict(tmpl_args), write=True)
         else:
             print('  %sSKIP%s  send_whatsapp_template / agent_send_whatsapp (no template UID)' % (YELLOW, RESET))
             results['skipped'] += 2
@@ -277,7 +314,12 @@ def run_all(args):
             'lead_id': sample['lead_id'], 'text': 'MCP test message',
         }, write=True)
         run('mark_chat_read',   {'lead_id': sample['lead_id']}, write=True)
-        run('assign_lead_chat_user', {'lead_id': sample['lead_id'], 'user_uid': 'test-user-uid'}, write=True)
+        if sample.get('user_uid'):
+            run('assign_lead_chat_user',
+                {'lead_id': sample['lead_id'], 'user_uid': sample['user_uid']}, write=True)
+        else:
+            print('  %sSKIP%s  assign_lead_chat_user (no real user_uid from list_users)' % (YELLOW, RESET))
+            results['skipped'] += 1
         run('block_whatsapp_contact', {'lead_id': sample['lead_id'], 'block': False}, write=True)
     else:
         print('  %sSKIP%s  WhatsApp write tools (no lead_id)' % (YELLOW, RESET))
@@ -292,7 +334,7 @@ def run_all(args):
     print('\n%s── Phase 3: Sequences (4 tools)%s' % (BOLD, RESET))
 
     seq = run('create_sequence', {
-        'name': '_MCP_TEST_SEQ',
+        'name': '_MCP_TEST_SEQ_' + datetime.now().strftime('%H%M%S%f'),
         'description': 'MCP test sequence',
         'stop_on_reply': True,
     }, write=True)
@@ -304,7 +346,7 @@ def run_all(args):
             'sequence_id':  sample['seq_id'],
             'step_number':  1,
             'delay_days':   0,
-            'template_uid': 'placeholder_uid',
+            'template_uid': sample.get('template_uid') or 'placeholder_uid',
             'template_name': 'placeholder',
         }, write=True)
         if step:
@@ -339,9 +381,9 @@ def run_all(args):
     print('\n%s── Phase 3: Campaigns (3 tools)%s' % (BOLD, RESET))
 
     camp = run('create_campaign', {
-        'name': '_MCP_TEST_CAMP',
+        'name': '_MCP_TEST_CAMP_' + datetime.now().strftime('%H%M%S%f'),
         'lead_group_id': sample.get('lead_group_id', 1),
-        'template_uid':  t_uid or 'placeholder_uid',
+        'template_uid':  sample.get('template_uid') or 'placeholder_uid',
         'template_name': 'placeholder',
     }, write=True)
     if camp:

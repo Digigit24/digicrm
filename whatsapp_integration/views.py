@@ -1567,3 +1567,135 @@ class AISequencesView(APIView):
                 'steps':       steps,
             })
         return Response({'results': data, 'count': len(data)})
+
+
+# ---------------------------------------------------------------------------
+# Contact (by-phone) WhatsApp endpoints
+# ---------------------------------------------------------------------------
+#
+# These endpoints are NOT scoped to a DigiCRM Lead. They operate purely on a
+# phone number, which lets other Celiyo apps (e.g. CeliyoHMS OPD/IPD detail
+# pages) view and reply to a WhatsApp conversation for a patient who has no
+# CRM lead record.
+#
+# Security model:
+#   - authentication_classes = [JWTAuthentication] → requires a valid JWT
+#     (the whole Celiyo ecosystem shares one JWT secret, so an HMS-issued
+#     token authenticates here and the JWT middleware sets request.tenant_id).
+#   - permission_classes = [HasCRMPermission] with NO permission_resource →
+#     HasCRMPermission.has_permission() returns True for any authenticated
+#     tenant user (it only enforces crm.<resource>.<action> when a
+#     permission_resource is declared). So any logged-in tenant user may read
+#     or reply to a chat, but tenant isolation is still guaranteed because the
+#     Laravel adapter is built from this tenant's vendor credentials.
+#
+# The Laravel adapter itself keys chat history by phone
+# (contacts/by-phone/{phone}/messages), so no Lead lookup is required.
+
+def _validate_phone(raw: str):
+    """Return a non-empty phone string or None. Digits are normalised by the adapter."""
+    phone = (raw or '').strip()
+    return phone or None
+
+
+@extend_schema(
+    tags=['WhatsApp Contacts'],
+    summary='Get WhatsApp chat history by phone number',
+    description=(
+        'Fetch paginated WhatsApp chat history for an arbitrary phone number, '
+        'without requiring a DigiCRM lead. Used by other Celiyo apps (e.g. CeliyoHMS) '
+        'to show a patient\'s WhatsApp conversation. Fetched live from the Laravel adapter.'
+    ),
+    parameters=[
+        OpenApiParameter('phone', str, required=True, description='Phone number (10-digit local or full E.164 without +). Country code 91 is added if 10 digits.'),
+        OpenApiParameter('page', int, description='Page number (default 1).'),
+        OpenApiParameter('per_page', int, description='Results per page (default 50, max 100).'),
+    ],
+    responses={200: OpenApiResponse(description='Raw Laravel chat history payload (messages + pagination).')},
+)
+class ContactChatByPhoneView(APIView):
+    """GET /api/whatsapp/contacts/by-phone/chat/?phone=...&page=...&per_page=..."""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+
+    def get(self, request):
+        phone = _validate_phone(request.query_params.get('phone'))
+        if not phone:
+            return Response(
+                {'detail': 'phone query parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            page = int(request.query_params.get('page', 1))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            per_page = min(int(request.query_params.get('per_page', 50)), 100)
+        except (TypeError, ValueError):
+            per_page = 50
+
+        logger.info(
+            '[WA ContactChat] tenant=%s user=%s phone=%s page=%s per_page=%s',
+            request.tenant_id, request.user_id, phone, page, per_page,
+        )
+        try:
+            adapter = _adapter_from_request(request)
+            data = adapter.get_chat_history(phone, page, per_page)
+        except LaravelAdapterError as e:
+            logger.error('[WA ContactChat] LaravelAdapterError phone=%s error=%s status=%s',
+                         phone, str(e), e.status_code)
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(data)
+
+
+@extend_schema(
+    tags=['WhatsApp Contacts'],
+    summary='Send a plain WhatsApp text message by phone number',
+    description=(
+        'Send a plain-text WhatsApp message to an arbitrary phone number without '
+        'requiring a DigiCRM lead. Requires the 24-hour customer-service window to be '
+        'open (i.e. the contact messaged first within the last 24h). '
+        'Body: {"phone": "...", "text": "...", "name": "optional display name"}.'
+    ),
+    responses={200: OpenApiResponse(description='Text message sent.')},
+)
+class ContactSendTextByPhoneView(APIView):
+    """POST /api/whatsapp/contacts/by-phone/send_text/  body: {phone, text, name?}"""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+
+    def post(self, request):
+        phone = _validate_phone(request.data.get('phone'))
+        text = (request.data.get('text') or '').strip()
+        name = (request.data.get('name') or '').strip() or phone
+
+        if not phone:
+            return Response({'detail': 'phone is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not text:
+            return Response({'detail': 'text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        logger.info('[WA ContactSendText] tenant=%s user=%s phone=%s len=%s',
+                    request.tenant_id, request.user_id, phone, len(text))
+        try:
+            adapter = _adapter_from_request(request)
+            result = adapter.send_text_message(phone=phone, name=name, text=text)
+        except LaravelAdapterError as e:
+            logger.error('[WA ContactSendText] LaravelAdapterError phone=%s error=%s', phone, str(e))
+            _log_agent_action(
+                tenant_id=request.tenant_id,
+                action_type=AgentActionTypeEnum.SEND_WHATSAPP,
+                payload_in={'phone': phone, 'text': text, 'via': 'hms_contact'},
+                status=AgentActionStatusEnum.FAILED,
+                error_message=str(e),
+            )
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        _log_agent_action(
+            tenant_id=request.tenant_id,
+            action_type=AgentActionTypeEnum.SEND_WHATSAPP,
+            payload_in={'phone': phone, 'text': text, 'via': 'hms_contact'},
+            payload_out=result,
+            triggered_by=str(request.user_id),
+        )
+        return Response({'detail': 'Text message sent.', **(result or {})})

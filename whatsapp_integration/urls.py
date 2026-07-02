@@ -8,6 +8,8 @@ from .views import (
     LeadWhatsAppViewSet,
     LeadSequenceEnrollmentUpdateView,
     WhatsAppWebhookView,
+    ContactChatByPhoneView,
+    ContactSendTextByPhoneView,
     AgentSendWhatsAppView,
     AgentEnrollSequenceView,
     AgentCreateCampaignView,
@@ -37,6 +39,11 @@ urlpatterns = [
 
     # Inbound webhooks
     path('webhooks/<str:event_type>/', WhatsAppWebhookView.as_view(), name='whatsapp-webhook'),
+
+    # Contact (by-phone) endpoints — not scoped to a CRM lead. Used by CeliyoHMS
+    # OPD/IPD detail pages to view/reply to a patient's WhatsApp conversation.
+    path('contacts/by-phone/chat/', ContactChatByPhoneView.as_view(), name='whatsapp-contact-chat-by-phone'),
+    path('contacts/by-phone/send_text/', ContactSendTextByPhoneView.as_view(), name='whatsapp-contact-send-text-by-phone'),
 
     # Enrollment update (pause/resume/cancel)
     path('enrollments/<int:pk>/', LeadSequenceEnrollmentUpdateView.as_view(), name='enrollment-update'),
