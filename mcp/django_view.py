@@ -473,8 +473,44 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── assign_lead_chat_user ───────────────────────────────────────────────────
     if name == 'assign_lead_chat_user':
+        # Primary system of record is DigiCRM (admin.celiyo.com user UUIDs), the
+        # same fix applied to the REST view. The Laravel adapter is best-effort
+        # only — its user model is separate and a miss must NOT fail the call.
+        import uuid as _uuid
         lead = _get_lead(args['lead_id'])
-        return _adapter().assign_chat_user(phone=lead.phone, user_uid=args['user_uid'])
+        user_uid = str(args.get('user_uid', '')).strip()
+        if not user_uid:
+            raise RuntimeError('user_uid is required (resolve a name via list_users first)')
+        try:
+            _uuid.UUID(user_uid)
+        except ValueError:
+            raise RuntimeError('user_uid must be a valid UUID — resolve names via list_users')
+
+        # Primary: write Lead.assigned_to directly in DigiCRM
+        lead.assigned_to = user_uid
+        lead.save(update_fields=['assigned_to'])
+        LeadActivity.objects.create(
+            lead=lead,
+            tenant_id=TENANT_ID,
+            type='NOTE',
+            content='Chat assigned to user %s via MCP agent.' % user_uid,
+            created_by=OWNER_USER_ID or TENANT_ID,
+        )
+
+        # Secondary: best-effort sync to the Laravel WhatsApp inbox panel
+        adapter_result = {}
+        if lead.phone:
+            try:
+                adapter_result = _adapter().assign_chat_user(phone=lead.phone, user_uid=user_uid)
+            except Exception:
+                adapter_result = {'wa_inbox_sync': 'skipped — no matching Laravel user for this UID'}
+
+        return {
+            'detail': 'Chat user assigned.',
+            'lead_id': lead.id,
+            'assigned_to': user_uid,
+            **(adapter_result if isinstance(adapter_result, dict) else {}),
+        }
 
     # ── mark_chat_read ──────────────────────────────────────────────────────────
     if name == 'mark_chat_read':
