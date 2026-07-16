@@ -17,7 +17,6 @@ from django.db.models import Q
 from rest_framework import serializers, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from django.core.cache import cache
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiTypes
 
@@ -42,6 +41,7 @@ from integrations.utils.encryption import encrypt_token, decrypt_token
 from integrations.services.google_sheets import create_sheets_service, GoogleSheetsError
 from integrations.services.workflow_engine import WorkflowEngine, WorkflowEngineError
 from common.authentication import JWTRequestAuthentication
+from common.permissions import HasDigiPermission
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,9 @@ class IntegrationViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Integration.objects.filter(is_active=True)
     serializer_class = IntegrationSerializer
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'providers'
 
     def get_queryset(self):
         """Filter active integrations"""
@@ -82,7 +84,9 @@ class ConnectionViewSet(viewsets.ModelViewSet):
     about connection health.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'connections'
 
     def get_queryset(self):
         """Get connections for current tenant and user"""
@@ -679,7 +683,9 @@ class WorkflowViewSet(viewsets.ModelViewSet):
     remain available for audit and debugging.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'workflows'
 
     def get_queryset(self):
         """Get workflows for current tenant"""
@@ -983,7 +989,9 @@ class WorkflowTriggerViewSet(viewsets.ModelViewSet):
     schedule, or manual trigger. Each workflow can have one trigger.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'workflows'
     serializer_class = WorkflowTriggerSerializer
 
     def initial(self, request, *args, **kwargs):
@@ -1058,7 +1066,9 @@ class WorkflowActionViewSet(viewsets.ModelViewSet):
     tasks, send email, or call a webhook, depending on action_type.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'workflows'
     serializer_class = WorkflowActionSerializer
 
     def initial(self, request, *args, **kwargs):
@@ -1133,7 +1143,9 @@ class WorkflowMappingViewSet(viewsets.ModelViewSet):
     can include defaults, validation rules, and transformations.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'workflows'
     serializer_class = WorkflowMappingSerializer
 
     def initial(self, request, *args, **kwargs):
@@ -1206,7 +1218,9 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
     Supports both nested workflow URLs and root-level filtering by workflow_id.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'integrations'
+    permission_resource = 'workflows'
     filterset_fields = ['status', 'workflow_id']
     ordering_fields = ['started_at', 'finished_at', 'status']
     ordering = ['-started_at']

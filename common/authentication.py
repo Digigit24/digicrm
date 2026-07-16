@@ -41,6 +41,7 @@ class JWTRequestAuthentication(BaseAuthentication):
             'is_super_admin': request.is_super_admin,
             'permissions': request.permissions,
             'enabled_modules': request.enabled_modules,
+            'roles': getattr(request, 'roles', []),
         }
 
         # Return a tuple of (user, auth) as required by DRF

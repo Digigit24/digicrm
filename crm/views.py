@@ -7,7 +7,8 @@ from django_filters.rest_framework import DjangoFilterBackend
 import django_filters
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiExample
 from drf_spectacular.openapi import AutoSchema
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
+from django.utils import timezone
 from django.http import HttpResponse, StreamingHttpResponse
 from .models import (
     Lead, LeadStatus, LeadActivity, LeadOrder,
@@ -26,7 +27,8 @@ from .zata_client import upload_to_zata, delete_from_zata
 from common.mixins import TenantViewSetMixin
 from common.permissions import (
     CRMPermissionMixin, HasCRMPermission,
-    JWTAuthentication, get_nested_permission
+    JWTAuthentication, get_nested_permission, CRMPermissions,
+    get_queryset_for_permission
 )
 import logging
 import csv
@@ -243,6 +245,83 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
 
         serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
 
+    @action(detail=False, methods=['get'], url_path='sales-dashboard')
+    def sales_dashboard(self, request):
+        """Compact dashboard scoped by crm.leads.view permission."""
+        if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_VIEW):
+            raise PermissionDenied({'detail': 'Permission not granted for this module.'})
+
+        leads = self.get_queryset()
+        now = timezone.now()
+        today = now.date()
+
+        open_tasks = []
+        upcoming_meetings = []
+        recent_activities = []
+        try:
+            from tasks.models import Task
+            from tasks.serializers import TaskListSerializer
+            open_tasks_qs = Task.objects.filter(
+                tenant_id=request.tenant_id,
+                lead__in=leads,
+            ).exclude(status__in=['DONE', 'CANCELLED']).order_by('due_date', '-created_at')[:5]
+            open_tasks = TaskListSerializer(open_tasks_qs, many=True).data
+        except Exception as exc:
+            logger.warning("sales_dashboard task summary failed: %s", exc)
+
+        try:
+            from meetings.models import Meeting
+            from meetings.serializers import MeetingListSerializer
+            upcoming_meetings_qs = Meeting.objects.filter(
+                tenant_id=request.tenant_id,
+                lead__in=leads,
+                start_at__gte=now,
+            ).order_by('start_at')[:5]
+            upcoming_meetings = MeetingListSerializer(upcoming_meetings_qs, many=True).data
+        except Exception as exc:
+            logger.warning("sales_dashboard meeting summary failed: %s", exc)
+
+        try:
+            recent_activities_qs = LeadActivity.objects.filter(
+                tenant_id=request.tenant_id,
+                lead__in=leads,
+            ).select_related('lead').order_by('-happened_at')[:8]
+            recent_activities = LeadActivitySerializer(recent_activities_qs, many=True).data
+        except Exception as exc:
+            logger.warning("sales_dashboard activity summary failed: %s", exc)
+
+        status_breakdown = list(
+            leads.values('status', 'status__name', 'status__color_hex')
+            .annotate(count=Count('id'))
+            .order_by('status__order_index', 'status__name')
+        )
+        priority_breakdown = list(
+            leads.values('priority')
+            .annotate(count=Count('id'))
+            .order_by('priority')
+        )
+
+        recent_leads = LeadListSerializer(
+            leads.order_by('-created_at')[:5],
+            many=True,
+        ).data
+
+        return Response({
+            'scope': get_nested_permission(getattr(request, 'permissions', {}), CRMPermissions.CRM_LEADS_VIEW) or 'all',
+            'totals': {
+                'leads': leads.count(),
+                'high_priority': leads.filter(priority='HIGH').count(),
+                'followups_due': leads.filter(next_follow_up_at__date__lte=today).count(),
+                'estimated_value': leads.aggregate(total=Sum('value_amount')).get('total') or 0,
+            },
+            'status_breakdown': status_breakdown,
+            'priority_breakdown': priority_breakdown,
+            'recent_leads': recent_leads,
+            'open_tasks': open_tasks,
+            'upcoming_meetings': upcoming_meetings,
+            'recent_activities': recent_activities,
+        })
+
     @extend_schema(
         description='Get leads organized by status for kanban board view',
         responses={200: {
@@ -279,7 +358,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         """
         try:
             # Check permission for viewing leads
-            if not self._has_crm_permission(request, 'crm.leads.view'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_VIEW):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to view leads"
@@ -380,7 +459,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         """
         try:
             # Check permission for viewing leads
-            if not self._has_crm_permission(request, 'crm.leads.view'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_VIEW):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to export leads"
@@ -586,7 +665,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         """
         try:
             # Check permission for creating leads
-            if not self._has_crm_permission(request, 'crm.leads.create'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_CREATE):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to import leads"
@@ -901,7 +980,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         """
         try:
             # Check permission for deleting leads
-            if not self._has_crm_permission(request, 'crm.leads.delete'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_DELETE):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to delete leads"
@@ -964,7 +1043,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
     def bulk_status_update(self, request):
         """
         Bulk update status for multiple leads.
-        Requires: crm.leads.update permission
+        Requires: crm.leads.edit permission
 
         Request body:
         {
@@ -976,7 +1055,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         """
         try:
             # Check permission for updating leads
-            if not self._has_crm_permission(request, 'crm.leads.update'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_EDIT):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to update leads"
@@ -1011,7 +1090,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
             # Check permission scope for "own" permission
             update_permission = get_nested_permission(
                 getattr(request, 'permissions', {}),
-                'crm.leads.update'
+                CRMPermissions.CRM_LEADS_EDIT
             )
 
             if isinstance(update_permission, str) and update_permission == "own":
@@ -1065,7 +1144,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         lead = self.get_object()
 
         if request.method == 'GET':
-            if not self._has_crm_permission(request, 'crm.leads.view'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_VIEW):
                 raise PermissionDenied({'error': 'Permission denied', 'detail': "You don't have permission to view attachments"})
 
             qs = LeadAttachment.objects.filter(lead=lead, tenant_id=request.tenant_id)
@@ -1073,7 +1152,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
             return Response(serializer.data)
 
         # POST — upload
-        if not self._has_crm_permission(request, 'crm.leads.create'):
+        if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_CREATE):
             raise PermissionDenied({'error': 'Permission denied', 'detail': "You don't have permission to upload attachments"})
 
         uploaded_file = request.FILES.get('file')
@@ -1119,7 +1198,7 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
         DELETE /api/crm/leads/<pk>/attachments/<attachment_id>/
         Removes the DB record and optionally deletes the file from Zata.
         """
-        if not self._has_crm_permission(request, 'crm.leads.delete'):
+        if not self._has_crm_permission(request, CRMPermissions.CRM_LEADS_DELETE):
             raise PermissionDenied({'error': 'Permission denied', 'detail': "You don't have permission to delete attachments"})
 
         lead = self.get_object()
@@ -1178,7 +1257,7 @@ class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Model
     ordering = ['-happened_at']
 
     def get_queryset(self):
-        """Override to filter by by_user_id instead of owner_user_id"""
+        """For own scope, show all activities belonging to the user's leads."""
         queryset = TenantViewSetMixin.get_queryset(self)
 
         if not hasattr(self, 'request') or not self.request:
@@ -1210,21 +1289,10 @@ class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Model
             elif permission_value == "team":
                 return queryset
             elif permission_value == "own":
-                # Filter by creator (by_user_id) instead of owner_user_id
-                return queryset.filter(by_user_id=self.request.user_id)
+                return queryset.filter(lead__owner_user_id=self.request.user_id)
 
         return queryset
 
-    def check_object_permissions(self, request, obj):
-        """Override to check activity permissions based on by_user_id instead of owner_user_id"""
-        from rest_framework.exceptions import PermissionDenied
-
-        # Call parent's check_permissions (skipping CRMPermissionMixin's check_object_permissions)
-        viewsets.ModelViewSet.check_object_permissions(self, request, obj)
-
-        # Activities use by_user_id instead of owner_user_id
-        # DRF permission class handles this via has_object_permission
-        pass
 
 
 @extend_schema_view(
@@ -1341,7 +1409,7 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
         """
         try:
             # Check permission
-            if not self._has_crm_permission(request, 'crm.settings.view'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_SETTINGS_VIEW):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to view field configurations"
@@ -1447,6 +1515,9 @@ class LeadGroupViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
 
         lead_ids = serializer.validated_data['lead_ids']
         leads = Lead.objects.filter(id__in=lead_ids, tenant_id=request.tenant_id)
+        # Enforce the user's crm.leads.view scope: own/team-scoped users may only
+        # add leads they are allowed to see.
+        leads = get_queryset_for_permission(leads, request, CRMPermissions.CRM_LEADS_VIEW)
         found_ids = set(leads.values_list('id', flat=True))
         not_found = len(lead_ids) - len(found_ids)
 
@@ -1484,9 +1555,16 @@ class LeadGroupViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
         serializer.is_valid(raise_exception=True)
 
         lead_ids = serializer.validated_data['lead_ids']
+        # Enforce the user's crm.leads.view scope before removing memberships.
+        accessible_leads = get_queryset_for_permission(
+            Lead.objects.filter(id__in=lead_ids, tenant_id=request.tenant_id),
+            request,
+            CRMPermissions.CRM_LEADS_VIEW,
+        )
+        accessible_lead_ids = set(accessible_leads.values_list('id', flat=True))
         deleted_count, _ = LeadGroupMembership.objects.filter(
             group=group,
-            lead_id__in=lead_ids
+            lead_id__in=accessible_lead_ids
         ).delete()
 
         return Response({'removed': deleted_count})
@@ -1503,6 +1581,13 @@ class LeadGroupViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVie
             tenant_id=request.tenant_id,
             groups=group
         ).select_related('status').prefetch_related('groups')
+
+        view_permission = get_nested_permission(
+            getattr(request, 'permissions', {}),
+            'crm.leads.view',
+        )
+        if view_permission == 'own':
+            leads_qs = leads_qs.filter(owner_user_id=request.user_id)
 
         page = self.paginate_queryset(leads_qs)
         if page is not None:

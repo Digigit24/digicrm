@@ -10,7 +10,8 @@ from .models import Meeting
 from .serializers import MeetingSerializer, MeetingListSerializer
 from common.mixins import TenantViewSetMixin
 from common.permissions import (
-    CRMPermissionMixin, HasCRMPermission, JWTAuthentication
+    CRMPermissionMixin, HasCRMPermission, JWTAuthentication, CRMPermissions,
+    get_queryset_for_permission
 )
 import logging
 
@@ -135,7 +136,7 @@ class MeetingViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewS
         """
         try:
             # Check permission for viewing meetings
-            if not self._has_crm_permission(request, 'crm.meetings.view'):
+            if not self._has_crm_permission(request, CRMPermissions.CRM_MEETINGS_VIEW):
                 raise PermissionDenied({
                     "error": "Permission denied",
                     "detail": "You don't have permission to view meetings"
@@ -183,11 +184,14 @@ class MeetingViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewS
                 else:
                     end_date = date(today.year, today.month + 1, 1)
             
-            # Query meetings within date range
-            meetings = Meeting.objects.filter(
-                tenant_id=request.tenant_id,
-                start_at__date__gte=start_date,
-                start_at__date__lt=end_date
+            # Query meetings within date range, scoped by the user's meeting permission.
+            meetings = get_queryset_for_permission(
+                Meeting.objects.filter(
+                    start_at__date__gte=start_date,
+                    start_at__date__lt=end_date
+                ),
+                request,
+                CRMPermissions.CRM_MEETINGS_VIEW,
             ).select_related('lead').order_by('start_at')
             
             # Group meetings by date

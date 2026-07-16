@@ -120,17 +120,17 @@ class TenantViewSetMixin:
         if tenant_id is None:
             logger.warning(
                 f"Tenant ID not found in get_queryset for {self.request.method} {self.request.path}, "
-                f"returning unfiltered queryset"
+                f"returning empty queryset"
             )
-            return queryset
+            return queryset.none()
         
         # Ensure tenant_id is not empty string
         if not tenant_id or tenant_id.strip() == '':
             logger.warning(
                 f"Tenant ID is empty in get_queryset for {self.request.method} {self.request.path}, "
-                f"returning unfiltered queryset"
+                f"returning empty queryset"
             )
-            return queryset
+            return queryset.none()
         
         logger.debug(f"Filtering queryset by tenant_id: {tenant_id}")
         return queryset.filter(tenant_id=tenant_id)

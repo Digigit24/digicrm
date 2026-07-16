@@ -1,7 +1,8 @@
 from functools import wraps
 from django.http import JsonResponse
-from rest_framework.response import Response
 from rest_framework.authentication import BaseAuthentication
+from rest_framework.permissions import BasePermission
+from common.generated_permissions import CRMPermissions
 import logging
 
 logger = logging.getLogger(__name__)
@@ -42,47 +43,237 @@ class JWTAuthentication(BaseAuthentication):
         return (request.user_id, None)
 
 
+def get_permission_value(permissions, permission_key):
+    """Resolve a permission value from flat or nested JWT permission payloads."""
+    if not isinstance(permissions, dict):
+        return None
+
+    if permission_key in permissions:
+        return permissions.get(permission_key)
+
+    current = permissions
+    for part in permission_key.split('.'):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
+
+def is_admin_request(request):
+    """Return True only for explicit platform/tenant admin grants in the JWT.
+
+    Role names are intentionally NOT trusted as an admin bypass.
+    """
+    if getattr(request, 'is_super_admin', False):
+        return True
+
+    permissions = getattr(request, 'permissions', {}) or {}
+    return any(
+        get_permission_value(permissions, key) is True
+        for key in ('admin.full_access', 'admin.full_access.enabled')
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ownership registry for scoped (own/team) permissions
+# ---------------------------------------------------------------------------
+# Maps ``app_label.ModelName`` to the fields that determine whether a user
+# owns or is on the team for a record.  Scoped grants fail closed when no
+# ownership field can be resolved.
+OWNERSHIP_FIELDS = {
+    'crm.Lead': {
+        'owner': 'owner_user_id',
+        'team': ('owner_user_id', 'assigned_to'),
+    },
+    'crm.LeadActivity': {
+        'owner': 'lead__owner_user_id',
+        'team': ('lead__owner_user_id', 'by_user_id'),
+    },
+    'crm.LeadGroup': {
+        'owner': 'created_by',
+        'team': ('created_by',),
+    },
+    'meetings.Meeting': {
+        'owner': 'owner_user_id',
+        'team': ('owner_user_id',),
+    },
+}
+
+
+def _model_label(obj):
+    """Return ``app_label.ModelName`` for an object or queryset."""
+    if hasattr(obj, '_meta'):
+        return obj._meta.label
+    if hasattr(obj, 'model'):
+        return obj.model._meta.label
+    return None
+
+
+def _actor_id(request):
+    return getattr(request, 'user_id', None)
+
+
+def get_object_owner_id(obj):
+    """Resolve the owner of ``obj`` using the ownership registry.
+
+    Returns the first non-empty owner field found, or ``None`` if the model
+    is not registered or has no resolvable owner.  This is a fail-closed
+    replacement for the old best-effort helper.
+    """
+    label = _model_label(obj)
+    if not label:
+        return None
+
+    owner_field = OWNERSHIP_FIELDS.get(label, {}).get('owner')
+    if not owner_field:
+        return None
+
+    try:
+        value = obj
+        for part in owner_field.split('__'):
+            value = getattr(value, part, None)
+            if value is None:
+                return None
+        return value
+    except Exception:
+        return None
+
+
+def _team_fields_for(obj):
+    """Return the tuple of team fields registered for ``obj``'s model."""
+    label = _model_label(obj)
+    if not label:
+        return ()
+    return OWNERSHIP_FIELDS.get(label, {}).get('team', ())
+
+
+def _is_team_member(obj, user_id):
+    """Return True if ``user_id`` matches any registered team field on ``obj``."""
+    if not user_id:
+        return False
+    for field in _team_fields_for(obj):
+        try:
+            value = obj
+            for part in field.split('__'):
+                value = getattr(value, part, None)
+                if value is None:
+                    break
+            if value is not None and str(value) == str(user_id):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _team_filter_kwargs(model_label, user_id):
+    """Return OR-filter kwargs for queryset-level team scoping.
+
+    Example: ``Q(owner_user_id=user_id) | Q(assigned_to=user_id)``
+    """
+    from django.db.models import Q
+    if not model_label or not user_id:
+        return Q(pk__in=[])
+
+    fields = OWNERSHIP_FIELDS.get(model_label, {}).get('team', ())
+    if not fields:
+        return Q(pk__in=[])
+
+    q = Q()
+    for field in fields:
+        q |= Q(**{field: user_id})
+    return q
+
+
+def _permission_action(permission_key):
+    """Return the action suffix of a permission key (e.g. 'create' for 'crm.leads.create')."""
+    if permission_key and '.' in permission_key:
+        return permission_key.rsplit('.', 1)[-1]
+    return None
+
+
 def check_permission(request, permission_key, resource_owner_id=None, resource_team_id=None):
     """
-    Check if user has permission for a specific action
-    
-    Args:
-        request: Django request object with JWT attributes
-        permission_key: Permission key (e.g., 'crm.leads.view')
-        resource_owner_id: UUID of resource owner (for 'own' scope checks)
-        resource_team_id: UUID of resource team (for 'team' scope checks)
-    
-    Returns:
-        bool: True if permission granted, False otherwise
+    Check if user has permission for a specific action.
+
+    This is an *action-level* check: it answers "does the JWT grant this
+    permission to the user?"  For ``own``/``team`` scope, a matching grant is
+    accepted even without an object, because the queryset/object-level checks
+    are responsible for restricting which rows the user actually sees.
+
+    Object-level enforcement is handled by ``check_object_permission``.
     """
     if not hasattr(request, 'permissions'):
         return False
-    
+
+    if is_admin_request(request):
+        return True
+
     permissions = request.permissions
-    permission_value = permissions.get(permission_key)
-    
+    permission_value = get_permission_value(permissions, permission_key)
+
     # If permission not found, deny access
     if permission_value is None:
         return False
-    
+
     # Handle boolean permissions
     if isinstance(permission_value, bool):
         return permission_value
-    
+
     # Handle scope-based permissions
     if isinstance(permission_value, str):
         if permission_value == "all":
             return True
         elif permission_value == "team":
-            # For now, return True for team scope (team logic can be added later)
-            # In future: check if resource_team_id matches user's team
-            return True
+            if resource_team_id is None:
+                return True
+            return str(resource_team_id) == str(_actor_id(request))
         elif permission_value == "own":
-            # Check if resource belongs to the user
             if resource_owner_id is None:
-                return True  # If no owner specified, allow (for create operations)
-            return str(resource_owner_id) == str(request.user_id)
-    
+                return True
+            return str(resource_owner_id) == str(_actor_id(request))
+
+    return False
+
+
+def check_object_permission(request, obj, permission_key):
+    """Object-level permission check using the ownership registry.
+
+    ``own`` and ``team`` scopes are resolved from the object itself.  Missing or
+    unresolvable ownership results in denial (fail-closed).
+    """
+    if not hasattr(request, 'permissions'):
+        return False
+
+    if is_admin_request(request):
+        return True
+
+    permission_value = get_permission_value(request.permissions, permission_key)
+    if permission_value is None:
+        return False
+
+    if isinstance(permission_value, bool):
+        return permission_value
+
+    if not isinstance(permission_value, str):
+        return False
+
+    if permission_value == "all":
+        return True
+
+    user_id = _actor_id(request)
+    if permission_value == "team":
+        return _is_team_member(obj, user_id)
+
+    if permission_value == "own":
+        owner_id = get_object_owner_id(obj)
+        if owner_id is None:
+            # Allow create actions to proceed even though there is no object yet;
+            # object-level checks are not used for create.
+            return _permission_action(permission_key) == 'create'
+        return str(owner_id) == str(user_id)
+
     return False
 
 
@@ -111,50 +302,44 @@ def permission_required(permission_key):
 
 def get_queryset_for_permission(queryset, request, view_permission_key, owner_field='owner_user_id'):
     """
-    Filter queryset based on view permission scope
-    
-    Args:
-        queryset: Django QuerySet to filter
-        request: Django request object with JWT attributes
-        view_permission_key: Permission key for viewing (e.g., 'crm.leads.view')
-        owner_field: Field name that contains the owner user ID
-    
-    Returns:
-        Filtered QuerySet based on permission scope
+    Filter queryset based on view permission scope.
+
+    Uses the ownership registry for ``own``/``team`` scope.  Unregistered models
+    fall back to ``owner_field`` for ``own`` scope and deny ``team`` scope.
     """
     if not hasattr(request, 'permissions') or not hasattr(request, 'tenant_id'):
         return queryset.none()
-    
+
     permissions = request.permissions
     permission_value = permissions.get(view_permission_key)
-    
+
     # Always filter by tenant_id first
     base_queryset = queryset.filter(tenant_id=request.tenant_id)
-    
+
     # If permission not found, deny access
     if permission_value is None:
         return queryset.none()
-    
+
     # Handle boolean permissions
     if isinstance(permission_value, bool):
-        if permission_value:
-            return base_queryset
-        else:
-            return queryset.none()
-    
+        return base_queryset if permission_value else queryset.none()
+
     # Handle scope-based permissions
     if isinstance(permission_value, str):
         if permission_value == "all":
             return base_queryset
         elif permission_value == "team":
-            # For now, return all tenant resources (team logic can be added later)
-            # In future: add team filtering
-            return base_queryset
+            model_label = _model_label(queryset)
+            team_q = _team_filter_kwargs(model_label, _actor_id(request))
+            return base_queryset.filter(team_q)
         elif permission_value == "own":
-            # Filter by owner
-            filter_kwargs = {owner_field: request.user_id}
+            model_label = _model_label(queryset)
+            fields = OWNERSHIP_FIELDS.get(model_label, {}).get('team', ())
+            if fields:
+                owner_field = fields[0]
+            filter_kwargs = {owner_field: _actor_id(request)}
             return base_queryset.filter(**filter_kwargs)
-    
+
     return queryset.none()
 
 
@@ -210,7 +395,11 @@ def has_module_access(request, module_name):
     if not hasattr(request, 'enabled_modules'):
         return False
 
-    return module_name in request.enabled_modules
+    if is_admin_request(request):
+        return True
+
+    enabled_modules = getattr(request, 'enabled_modules', []) or []
+    return module_name in enabled_modules
 
 
 def get_nested_permission(permissions, path):
@@ -224,25 +413,32 @@ def get_nested_permission(permissions, path):
     Returns:
         Permission value or None if not found
     """
-    keys = path.split('.')
-    current = permissions
-
-    for key in keys:
-        if isinstance(current, dict) and key in current:
-            current = current[key]
-        else:
-            return None
-
-    return current
+    return get_permission_value(permissions, path)
 
 
-class HasCRMPermission:
+def get_object_owner_id(obj):
+    """Best-effort ownership resolver used for scoped permissions."""
+    for field_name in ('owner_user_id', 'by_user_id', 'created_by', 'uploaded_by'):
+        if hasattr(obj, field_name):
+            value = getattr(obj, field_name)
+            if value:
+                return value
+
+    lead = getattr(obj, 'lead', None)
+    if lead is not None and hasattr(lead, 'owner_user_id'):
+        return lead.owner_user_id
+
+    return None
+
+
+class HasDigiPermission(BasePermission):
     """
-    DRF Permission class for CRM module
+    DRF Permission class for DigiCRM modules.
     Works with JWT permissions set by middleware
 
     Usage in ViewSet:
-        permission_classes = [HasCRMPermission]
+        permission_classes = [HasDigiPermission]
+        permission_module = 'crm'
         permission_resource = 'leads'  # or 'activities', 'statuses', etc.
     """
 
@@ -256,124 +452,90 @@ class HasCRMPermission:
         'destroy': 'delete',
     }
 
+    WRITE_METHOD_ACTION_MAP = {
+        'GET': 'view',
+        'HEAD': 'view',
+        'OPTIONS': 'view',
+        'POST': 'create',
+        'PUT': 'edit',
+        'PATCH': 'edit',
+        'DELETE': 'delete',
+    }
+
     def has_permission(self, request, view):
         """
         Check if user has permission to perform the action on the resource
         """
-        # Get the resource and action from the view
         resource = getattr(view, 'permission_resource', None)
         if not resource:
-            # No permission resource defined, allow by default
-            return True
+            self.message = "Permission not granted for this module."
+            return False
 
-        # Get the action (list, create, retrieve, etc.)
-        action = view.action
-        if not action:
-            # No action defined, allow by default
-            return True
+        module = getattr(view, 'permission_module', 'crm')
 
-        # Map action to permission type
-        permission_type = self.ACTION_PERMISSION_MAP.get(action)
+        if not has_module_access(request, module):
+            self.message = f"Permission not granted for {module} module."
+            return False
+
+        action = getattr(view, 'action', None)
+        permission_type = getattr(view, 'permission_action', None)
         if not permission_type:
-            # Unknown action, allow by default (custom actions should handle their own perms)
-            return True
+            permission_type = self.ACTION_PERMISSION_MAP.get(action) if action else None
+        if not permission_type:
+            permission_type = self.WRITE_METHOD_ACTION_MAP.get(request.method.upper())
 
-        # Build permission key
-        permission_key = f"crm.{resource}.{permission_type}"
+        custom_map = getattr(view, 'action_permission_map', {}) or {}
+        if action in custom_map:
+            permission_type = custom_map[action]
 
-        # Check permission
-        return self._check_permission(request, permission_key)
+        if not permission_type:
+            self.message = "Permission not granted for this module."
+            return False
+
+        permission_key = f"{module}.{resource}.{permission_type}"
+
+        allowed = self._check_permission(request, permission_key)
+        if not allowed:
+            self.message = "Permission not granted for this module."
+        return allowed
 
     def has_object_permission(self, request, view, obj):
         """
-        Check if user has permission to perform the action on this specific object
+        Check if user has permission to perform the action on this specific object.
+
+        Uses the ownership registry so ``own``/``team`` scope is evaluated from
+        the object itself rather than an externally supplied owner ID.
         """
         # Get the resource and action from the view
         resource = getattr(view, 'permission_resource', None)
         if not resource:
-            return True
+            self.message = "Permission not granted for this module."
+            return False
 
-        action = view.action
-        if not action:
-            return True
+        module = getattr(view, 'permission_module', 'crm')
 
-        # Map action to permission type
-        permission_type = self.ACTION_PERMISSION_MAP.get(action)
+        action = getattr(view, 'action', None)
+        custom_map = getattr(view, 'action_permission_map', {}) or {}
+        permission_type = getattr(view, 'permission_action', None)
         if not permission_type:
-            return True
+            permission_type = custom_map.get(action) or self.ACTION_PERMISSION_MAP.get(action)
+        if not permission_type:
+            permission_type = self.WRITE_METHOD_ACTION_MAP.get(request.method.upper())
 
-        # Build permission key
-        permission_key = f"crm.{resource}.{permission_type}"
+        if not permission_type:
+            self.message = "Permission not granted for this module."
+            return False
 
-        # Get the owner ID from the object
-        owner_id = getattr(obj, 'owner_user_id', None)
+        permission_key = f"{module}.{resource}.{permission_type}"
 
-        # Check permission with owner context
-        return self._check_permission(request, permission_key, owner_id)
+        allowed = check_object_permission(request, obj, permission_key)
+        if not allowed:
+            self.message = "Permission not granted for this module."
+        return allowed
 
     def _check_permission(self, request, permission_key, resource_owner_id=None):
-        """
-        Internal method to check permissions using JWT data
-
-        Args:
-            request: Django request object with JWT attributes
-            permission_key: Full permission key (e.g., 'crm.leads.view')
-            resource_owner_id: UUID of resource owner (for 'own' scope checks)
-
-        Returns:
-            bool: True if permission granted
-        """
-        # Super admins bypass all permission checks
-        is_super_admin = getattr(request, 'is_super_admin', False)
-        logger.debug(f"Permission check - Key: {permission_key}, is_super_admin: {is_super_admin}, resource_owner: {resource_owner_id}")
-
-        if is_super_admin:
-            logger.debug(f"Permission granted: Super admin bypass for {permission_key}")
-            return True
-
-        # Check if request has permissions attribute (set by JWT middleware)
-        if not hasattr(request, 'permissions'):
-            logger.debug(f"Permission denied: No permissions attribute on request for {permission_key}")
-            return False
-
-        # Get the permission value from nested structure
-        permission_value = get_nested_permission(request.permissions, permission_key)
-        logger.debug(f"Permission value for {permission_key}: {permission_value}")
-
-        # If permission not found, deny access
-        if permission_value is None:
-            logger.debug(f"Permission denied: Permission key {permission_key} not found in JWT")
-            return False
-
-        # Handle boolean permissions (simple true/false)
-        if isinstance(permission_value, bool):
-            logger.debug(f"Permission {'granted' if permission_value else 'denied'}: Boolean value for {permission_key}")
-            return permission_value
-
-        # Handle scope-based permissions (all, team, own)
-        if isinstance(permission_value, str):
-            if permission_value == "all":
-                logger.debug(f"Permission granted: 'all' scope for {permission_key}")
-                return True
-            elif permission_value == "team":
-                # For now, allow team scope (team logic can be added later)
-                logger.debug(f"Permission granted: 'team' scope for {permission_key}")
-                return True
-            elif permission_value == "own":
-                # Check if resource belongs to the user
-                if resource_owner_id is None:
-                    # No owner specified, allow (for create operations)
-                    logger.debug(f"Permission granted: 'own' scope for {permission_key} (no owner specified)")
-                    return True
-                # Check if the resource owner matches the current user
-                user_id = getattr(request, 'user_id', None)
-                matches = str(resource_owner_id) == str(user_id)
-                logger.debug(f"Permission {'granted' if matches else 'denied'}: 'own' scope - owner: {resource_owner_id}, user: {user_id}")
-                return matches
-
-        # Unknown permission type, deny access
-        logger.debug(f"Permission denied: Unknown permission type '{type(permission_value)}' for {permission_key}")
-        return False
+        """Internal method now delegates to the centralized ``check_permission``."""
+        return check_permission(request, permission_key, resource_owner_id=resource_owner_id)
 
 
 class CRMPermissionMixin:
@@ -409,86 +571,26 @@ class CRMPermissionMixin:
         return f"crm.{self.permission_resource}.{permission_action}"
 
     def get_queryset(self):
-        """Override to filter queryset based on view permissions"""
+        """Override to filter queryset based on view permissions."""
         queryset = super().get_queryset()
 
         if not hasattr(self, 'request') or not self.request:
             return queryset
 
-        # Super admins bypass all permission checks
-        if getattr(self.request, 'is_super_admin', False):
+        if is_admin_request(self.request):
             return queryset
 
         # Get view permission
         view_permission_key = f"crm.{self.permission_resource}.view"
-        permission_value = get_nested_permission(
-            getattr(self.request, 'permissions', {}),
-            view_permission_key
+        return get_queryset_for_permission(
+            queryset, self.request, view_permission_key
         )
 
-        # If no permission found, return empty queryset
-        if permission_value is None:
-            return queryset.none()
-
-        # Handle boolean permissions
-        if isinstance(permission_value, bool):
-            return queryset if permission_value else queryset.none()
-
-        # Handle scope-based permissions
-        if isinstance(permission_value, str):
-            if permission_value == "all":
-                return queryset
-            elif permission_value == "team":
-                # For now, return all tenant resources (team logic can be added later)
-                return queryset
-            elif permission_value == "own":
-                # Filter by owner - only show user's own resources
-                if hasattr(queryset.model, 'owner_user_id'):
-                    return queryset.filter(owner_user_id=self.request.user_id)
-                return queryset
-
-        return queryset
-
     def _has_crm_permission(self, request, permission_key, resource_owner_id=None):
-        """
-        Internal method to check CRM permissions
+        """Internal method now delegates to the centralized action-level check."""
+        return check_permission(request, permission_key, resource_owner_id=resource_owner_id)
 
-        Args:
-            request: Django request object
-            permission_key: Full permission key (e.g., 'crm.leads.view')
-            resource_owner_id: UUID of resource owner (for 'own' scope checks)
 
-        Returns:
-            bool: True if permission granted
-        """
-        # Super admins bypass all permission checks
-        if getattr(request, 'is_super_admin', False):
-            return True
-
-        if not hasattr(request, 'permissions'):
-            return False
-
-        permission_value = get_nested_permission(request.permissions, permission_key)
-
-        # If permission not found, deny access
-        if permission_value is None:
-            return False
-
-        # Handle boolean permissions
-        if isinstance(permission_value, bool):
-            return permission_value
-
-        # Handle scope-based permissions
-        if isinstance(permission_value, str):
-            if permission_value == "all":
-                return True
-            elif permission_value == "team":
-                # For now, return True for team scope
-                return True
-            elif permission_value == "own":
-                # Check if resource belongs to the user
-                if resource_owner_id is None:
-                    return True  # If no owner specified, allow (for create operations)
-                return str(resource_owner_id) == str(request.user_id)
-
-        return False
+class HasCRMPermission(HasDigiPermission):
+    """Backward-compatible CRM permission class."""
+    pass

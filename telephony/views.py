@@ -19,12 +19,12 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 
 from common.authentication import JWTRequestAuthentication
 from common.mixins import TenantViewSetMixin
+from common.permissions import HasDigiPermission, is_admin_request
 from telephony.models import (
     TeleCMICredential, TeleCMIAgent, CallLog, SMSLog,
     CallDirectionEnum, SMSStatusEnum,
@@ -83,7 +83,9 @@ class TeleCMICredentialViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     queryset = TeleCMICredential.objects.all()
     serializer_class = TeleCMICredentialSerializer
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'settings'
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
 
@@ -97,15 +99,16 @@ class TeleCMIAgentViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     queryset = TeleCMIAgent.objects.all()
     serializer_class = TeleCMIAgentSerializer
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'agents'
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def get_queryset(self):
         qs = super().get_queryset()
         # Non-admin users only see their own agent record
         user_id = _user_id(self.request)
-        is_admin = getattr(self.request, 'is_super_admin', False)
-        if not is_admin:
+        if not is_admin_request(self.request):
             qs = qs.filter(user_id=user_id)
         return qs
 
@@ -131,7 +134,9 @@ class ClickToCallView(APIView):
     TeleCMI rings the agent's softphone first, then dials to_number.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
 
     def post(self, request):
         serializer = ClickToCallSerializer(data=request.data)
@@ -171,7 +176,9 @@ class HangupView(APIView):
     Hang up an active call by its TeleCMI cmiuuid.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
 
     def post(self, request):
         serializer = HangupSerializer(data=request.data)
@@ -205,7 +212,9 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
     queryset = CallLog.objects.select_related().order_by('-call_time')
     serializer_class = CallLogSerializer
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['direction', 'call_type', 'lead_id', 'agent_user_id']
     ordering_fields = ['call_time', 'duration', 'created_at']
@@ -283,7 +292,9 @@ class SMSSendView(APIView):
     Send an SMS via TeleCMI and log it in SMSLog + LeadActivity.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'sms'
 
     def post(self, request):
         serializer = SMSSendSerializer(data=request.data)
@@ -360,7 +371,9 @@ class SMSLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
     queryset = SMSLog.objects.order_by('-created_at')
     serializer_class = SMSLogSerializer
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'sms'
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['status', 'lead_id', 'sent_by_user_id']
     ordering_fields = ['created_at']
@@ -377,7 +390,9 @@ class CallerIDView(APIView):
     POST /api/telephony/caller-ids/  — set active caller ID
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'settings'
 
     def get(self, request):
         token, err = _get_token_or_error(request)
@@ -413,7 +428,9 @@ class BreakView(APIView):
     Returns break records for the current agent (last 24h by default).
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'agents'
 
     def get(self, request):
         token, err = _get_token_or_error(request)
@@ -440,7 +457,9 @@ class AddNoteView(APIView):
     Adds a note to a call record in TeleCMI.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
 
     def post(self, request):
         serializer = AddNoteSerializer(data=request.data)
@@ -474,7 +493,9 @@ class CallbackListView(APIView):
     Query params: from_ts, to_ts (UTC ms), page, limit.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'callbacks'
 
     def get(self, request):
         token, err = _get_token_or_error(request)
@@ -507,7 +528,9 @@ class WebRTCConfigView(APIView):
     user_id + token approach, or the superadmin sets up agent credentials.
     """
     authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
 
     def get(self, request):
         try:

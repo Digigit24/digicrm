@@ -149,18 +149,10 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
                     status=401
                 )
         
-        # Check if CRM module is enabled
         enabled_modules = payload.get('enabled_modules', [])
         logger.debug(f"JWT Middleware - Enabled modules: {enabled_modules}")
         logger.debug(f"JWT Middleware - Is super admin: {payload.get('is_super_admin')}")
         logger.debug(f"JWT Middleware - Permissions: {payload.get('permissions')}")
-
-        if 'crm' not in enabled_modules:
-            logger.warning(f"JWT Middleware - CRM module not enabled. enabled_modules={enabled_modules}")
-            return JsonResponse(
-                {'error': 'CRM module not enabled for this user'},
-                status=403
-            )
 
         # Set request attributes from JWT payload
         request.user_id = payload['user_id']
@@ -170,26 +162,10 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         request.is_super_admin = payload['is_super_admin']
         request.permissions = payload['permissions']
         request.enabled_modules = payload['enabled_modules']
+        request.roles = payload.get('roles', [])
 
         logger.debug(f"JWT Middleware - Request attributes set: user_id={request.user_id}, is_super_admin={request.is_super_admin}")
         logger.debug(f"JWT Middleware - hasattr(request, 'permissions'): {hasattr(request, 'permissions')}")
-        
-        # Check for additional tenant headers as fallback/override
-        tenant_token_header = request.META.get('HTTP_TENANTTOKEN')
-        x_tenant_id_header = request.META.get('HTTP_X_TENANT_ID')
-        x_tenant_slug_header = request.META.get('HTTP_X_TENANT_SLUG')
-        
-        # If tenanttoken header is provided, use it to override tenant_id
-        if tenant_token_header:
-            request.tenant_id = tenant_token_header
-            
-        # If x-tenant-id header is provided, use it to override tenant_id
-        if x_tenant_id_header:
-            request.tenant_id = x_tenant_id_header
-            
-        # If x-tenant-slug header is provided, use it to override tenant_slug
-        if x_tenant_slug_header:
-            request.tenant_slug = x_tenant_slug_header
 
         # Store tenant_id in thread-local storage for database routing
         set_current_tenant_id(request.tenant_id)

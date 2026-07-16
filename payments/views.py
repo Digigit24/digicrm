@@ -4,6 +4,8 @@ from drf_spectacular.utils import extend_schema, extend_schema_view
 from .models import Payment
 from .serializers import PaymentSerializer, PaymentListSerializer
 from common.mixins import TenantViewSetMixin
+from common.authentication import JWTRequestAuthentication
+from common.permissions import HasDigiPermission
 
 
 @extend_schema_view(
@@ -29,6 +31,10 @@ class PaymentViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     number, method, notes, and lead name.
     """
     queryset = Payment.objects.select_related('lead')
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'crm'
+    permission_resource = 'payments'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = {
         'lead': ['exact'],

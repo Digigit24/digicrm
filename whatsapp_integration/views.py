@@ -130,7 +130,8 @@ class WhatsAppVendorConfigViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     serializer_class = WhatsAppVendorConfigSerializer
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
-    permission_resource = 'whatsapp_config'
+    permission_module = 'whatsapp'
+    permission_resource = 'settings'
     http_method_names = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
 
 
@@ -168,7 +169,8 @@ class WhatsAppCampaignViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     queryset = WhatsAppCampaign.objects.select_related('lead_group')
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
-    permission_resource = 'whatsapp_campaigns'
+    permission_module = 'whatsapp'
+    permission_resource = 'campaigns'
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ['status', 'lead_group']
     search_fields = ['name', 'template_name']
@@ -356,7 +358,9 @@ class WhatsAppSequenceViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     queryset = WhatsAppSequence.objects.prefetch_related('steps')
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
-    permission_resource = 'whatsapp_sequences'
+    permission_module = 'whatsapp'
+    permission_resource = 'sequences'
+    permission_action = 'edit'
     filter_backends = [filters.SearchFilter, DjangoFilterBackend]
     filterset_fields = ['is_active']
     search_fields = ['name', 'description']
@@ -440,16 +444,29 @@ class WhatsAppSequenceViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
 # Lead WhatsApp Actions ViewSet
 # ---------------------------------------------------------------------------
 
-class LeadWhatsAppViewSet(viewsets.ViewSet):
+class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
     """
     WhatsApp actions scoped to a specific DigiCRM lead.
 
     All endpoints require the lead to belong to the authenticated tenant.
     Write actions (send, enroll) go through the Laravel adapter service.
     """
+    queryset = Lead.objects.all()
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
-    permission_resource = 'leads'
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    action_permission_map = {
+        'chat': 'view',
+        'send': 'send',
+        'send_text': 'send',
+        'enrollments': 'view',
+        'enroll': 'create',
+        'unenroll': 'delete',
+        'assign_chat_user': 'edit',
+        'mark_read': 'edit',
+        'block': 'edit',
+    }
 
     def _get_lead(self, request, lead_id):
         logger.debug('[WA LeadViewSet] _get_lead called. lead_id=%s tenant=%s', lead_id, request.tenant_id)
@@ -806,7 +823,8 @@ class LeadSequenceEnrollmentUpdateView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
-    permission_resource = 'leads'
+    permission_module = 'whatsapp'
+    permission_resource = 'sequences'
 
     @extend_schema(
         description='Pause, resume, or cancel a sequence enrollment. Body: {"action": "pause"|"resume"|"cancel"}',
@@ -961,6 +979,19 @@ class AgentSendWhatsAppView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    action_permission_map = {
+        'chat': 'view',
+        'send': 'send',
+        'send_text': 'send',
+        'enrollments': 'view',
+        'enroll': 'create',
+        'unenroll': 'delete',
+        'assign_chat_user': 'edit',
+        'mark_read': 'edit',
+        'block': 'edit',
+    }
 
     @extend_schema(
         request=AgentSendWhatsAppSerializer,
@@ -1009,6 +1040,8 @@ class AgentEnrollSequenceView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'sequences'
 
     @extend_schema(
         request=BulkEnrollSerializer,
@@ -1073,6 +1106,8 @@ class AgentCreateCampaignView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'campaigns'
 
     @extend_schema(
         request=AgentCreateCampaignSerializer,
@@ -1165,6 +1200,9 @@ class AgentUpdateLeadStatusView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'crm'
+    permission_resource = 'leads'
+    permission_action = 'edit'
 
     @extend_schema(
         request=AgentUpdateLeadStatusSerializer,
@@ -1208,6 +1246,8 @@ class AgentLogActivityView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'crm'
+    permission_resource = 'activities'
 
     @extend_schema(
         request=AgentLogActivitySerializer,
@@ -1246,6 +1286,8 @@ class AgentActionLogListView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'campaigns'
 
     @extend_schema(
         description='List recent agent action audit logs for this tenant.',
@@ -1276,6 +1318,8 @@ class WhatsAppTemplatesProxyView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'templates'
 
     @extend_schema(description='List available WhatsApp templates from the Laravel adapter.')
     def get(self, request):
@@ -1314,6 +1358,19 @@ class AIContextView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    action_permission_map = {
+        'chat': 'view',
+        'send': 'send',
+        'send_text': 'send',
+        'enrollments': 'view',
+        'enroll': 'create',
+        'unenroll': 'delete',
+        'assign_chat_user': 'edit',
+        'mark_read': 'edit',
+        'block': 'edit',
+    }
 
     @extend_schema(description='All AI context: templates, sequences, statuses, lead groups.')
     def get(self, request):
@@ -1383,6 +1440,8 @@ class AITemplatesView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'templates'
 
     @extend_schema(description='List WhatsApp templates (AI-friendly: uid, name, category, language).')
     def get(self, request):
@@ -1440,6 +1499,8 @@ class AICampaignLaunchView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'campaigns'
 
     @extend_schema(description='Create + launch a WhatsApp campaign in one step (AI-friendly).')
     def post(self, request):
@@ -1542,6 +1603,8 @@ class AISequencesView(APIView):
     """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'sequences'
 
     @extend_schema(description='List active sequences with steps (AI-friendly).')
     def get(self, request):
