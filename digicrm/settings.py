@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'integrations',
     'telephony',
     'whatsapp_integration',   # DigiCRM WhatsApp adapter app
+    'ai',                     # AI copilot chat endpoint (Phase 1)
 ]
 
 MIDDLEWARE = [

@@ -136,6 +136,20 @@ class LeadStatusViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelVi
     ordering_fields = ['order_index', 'name', 'created_at']
     ordering = ['order_index']
 
+    def perform_create(self, serializer):
+        """Auto-append order_index to the end of the board when omitted."""
+        order_index = serializer.validated_data.get('order_index')
+        if order_index is None:
+            last = (
+                LeadStatus.objects.filter(tenant_id=self.request.tenant_id)
+                .order_by('-order_index')
+                .values_list('order_index', flat=True)
+                .first()
+            )
+            serializer.save(order_index=(last + 1) if last is not None else 0)
+        else:
+            serializer.save()
+
 
 class LeadFilter(django_filters.FilterSet):
     """
@@ -199,6 +213,8 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'leads'
+    # append-note is an edit of the lead's notes, not a create.
+    action_permission_map = {'append_note': 'edit'}
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = LeadFilter
     search_fields = ['name', 'phone', 'email', 'company', 'notes']
@@ -244,6 +260,38 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
             raise ValidationError({'owner_user_id': 'Owner user ID is required'})
 
         serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
+
+    @action(detail=True, methods=['post'], url_path='append-note')
+    def append_note(self, request, pk=None):
+        """Atomically append a timestamped block to Lead.notes (no clobber).
+
+        Read-modify-write under a row lock so concurrent appends/edits are not
+        lost. Tenant + object-level RBAC (crm.leads.edit) are enforced via
+        get_object(). Keeps Lead.notes as the human page body.
+        """
+        from django.db import transaction
+
+        text = (request.data or {}).get('text') if isinstance(request.data, dict) else None
+        if not text or not str(text).strip():
+            return Response({'error': 'text is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Permission + tenant check on the target lead (raises 403/404 as needed).
+        lead = self.get_object()
+
+        stamp = timezone.now().strftime('%Y-%m-%d %H:%M')
+        author = getattr(request, 'user_id', None)
+        header = f"— {stamp}" + (f" · {author}" if author else "")
+        block = f"{header}\n{str(text).strip()}"
+
+        with transaction.atomic():
+            # Re-fetch with a row lock to avoid lost updates (tenant already
+            # validated by get_object above).
+            locked = Lead.objects.select_for_update().get(pk=lead.pk)
+            locked.notes = f"{locked.notes}\n\n{block}" if (locked.notes or '').strip() else block
+            locked.save(update_fields=['notes', 'updated_at'])
+
+        serializer = self.get_serializer(locked)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=False, methods=['get'], url_path='sales-dashboard')
     def sales_dashboard(self, request):
@@ -1255,6 +1303,21 @@ class LeadActivityViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.Model
     search_fields = ['content']
     ordering_fields = ['happened_at', 'created_at']
     ordering = ['-happened_at']
+
+    def perform_create(self, serializer):
+        """Set required server-managed fields from the request.
+
+        ``by_user_id`` is bound to the authenticated JWT user (read-only in the
+        serializer, so it can't be spoofed) and ``happened_at`` defaults to now
+        when the caller omits it. This lets both the frontend and the AI tool
+        create activities without passing identity/time, while staying
+        tenant/user-correct (tenant_id is set by the serializer's TenantMixin).
+        """
+        from django.utils import timezone
+        extra = {'by_user_id': getattr(self.request, 'user_id', None)}
+        if not serializer.validated_data.get('happened_at'):
+            extra['happened_at'] = timezone.now()
+        serializer.save(**extra)
 
     def get_queryset(self):
         """For own scope, show all activities belonging to the user's leads."""

@@ -59,7 +59,11 @@ class LeadStatusSerializer(TenantMixin):
     Agents use this schema to understand and manage the named stages that leads
     move through on the CRM board, such as new, contacted, qualified, won, or lost.
     """
-    
+
+    # order_index is auto-appended to the end of the board when omitted
+    # (see LeadStatusViewSet.perform_create), so callers need not compute it.
+    order_index = serializers.IntegerField(required=False)
+
     class Meta:
         model = LeadStatus
         fields = [
@@ -87,7 +91,20 @@ class LeadActivitySerializer(TenantMixin):
     Agents use this schema to log calls, emails, meetings, notes, SMS messages,
     and other interactions that explain what happened with a lead.
     """
-    
+
+    # by_user_id is set server-side from the authenticated JWT user (see
+    # LeadActivityViewSet.perform_create); clients cannot spoof it.
+    by_user_id = serializers.UUIDField(
+        read_only=True,
+        help_text='UUID of the user who recorded this activity. Set from the authenticated user.'
+    )
+    # happened_at defaults to "now" server-side when omitted, so callers (AI tool
+    # and simple integrations) need not supply it.
+    happened_at = serializers.DateTimeField(
+        required=False,
+        help_text='When the activity occurred, in ISO 8601. Defaults to now if omitted.'
+    )
+
     class Meta:
         model = LeadActivity
         fields = [
