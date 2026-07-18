@@ -17,6 +17,24 @@ from .views import (
     AgentLogActivityView,
     AgentActionLogListView,
     WhatsAppTemplatesProxyView,
+    WhatsAppTemplateDetailProxyView,
+    WhatsAppTemplateSyncProxyView,
+    WhatsAppTemplateSendProxyView,
+    WhatsAppTemplateBulkSendProxyView,
+    WhatsAppContactsProxyView,
+    WhatsAppContactDetailProxyView,
+    WhatsAppContactsImportProxyView,
+    WhatsAppContactsImportStatusProxyView,
+    WhatsAppLabelsProxyView,
+    WhatsAppLabelDetailProxyView,
+    WhatsAppContactGroupsProxyView,
+    WhatsAppContactGroupDetailProxyView,
+    WhatsAppContactGroupMembersProxyView,
+    WhatsAppFlowsProxyView,
+    WhatsAppFlowStatsProxyView,
+    WhatsAppFlowDetailProxyView,
+    WhatsAppFlowActionProxyView,
+    WhatsAppMediaProxyView,
     # AI support endpoints
     AIContextView,
     AITemplatesView,
@@ -34,8 +52,12 @@ urlpatterns = [
     # Router-generated CRUD + custom actions
     path('', include(router.urls)),
 
-    # Templates proxy (dropdown data for campaign creation)
+    # Templates proxy / CRUD
     path('templates/', WhatsAppTemplatesProxyView.as_view(), name='whatsapp-templates-proxy'),
+    path('templates/sync/', WhatsAppTemplateSyncProxyView.as_view(), name='whatsapp-templates-sync-proxy'),
+    path('templates/send/', WhatsAppTemplateSendProxyView.as_view(), name='whatsapp-template-send-proxy'),
+    path('templates/send/bulk/', WhatsAppTemplateBulkSendProxyView.as_view(), name='whatsapp-template-bulk-send-proxy'),
+    path('templates/<str:template_uid>/', WhatsAppTemplateDetailProxyView.as_view(), name='whatsapp-template-detail-proxy'),
 
     # Inbound webhooks
     path('webhooks/<str:event_type>/', WhatsAppWebhookView.as_view(), name='whatsapp-webhook'),
@@ -44,6 +66,26 @@ urlpatterns = [
     # OPD/IPD detail pages to view/reply to a patient's WhatsApp conversation.
     path('contacts/by-phone/chat/', ContactChatByPhoneView.as_view(), name='whatsapp-contact-chat-by-phone'),
     path('contacts/by-phone/send_text/', ContactSendTextByPhoneView.as_view(), name='whatsapp-contact-send-text-by-phone'),
+    path('contacts/import/', WhatsAppContactsImportProxyView.as_view(), name='whatsapp-contacts-import-proxy'),
+    path('contacts/import/<str:import_id>/status/', WhatsAppContactsImportStatusProxyView.as_view(), name='whatsapp-contacts-import-status-proxy'),
+    path('contacts/', WhatsAppContactsProxyView.as_view(), name='whatsapp-contacts-proxy'),
+    path('contacts/<str:contact_uid>/', WhatsAppContactDetailProxyView.as_view(), name='whatsapp-contact-detail-proxy'),
+
+    # Labels and contact groups for the Contacts UI
+    path('labels/', WhatsAppLabelsProxyView.as_view(), name='whatsapp-labels-proxy'),
+    path('labels/<str:label_uid>/', WhatsAppLabelDetailProxyView.as_view(), name='whatsapp-label-detail-proxy'),
+    path('contact-groups/', WhatsAppContactGroupsProxyView.as_view(), name='whatsapp-contact-groups-proxy'),
+    path('contact-groups/<str:group_uid>/', WhatsAppContactGroupDetailProxyView.as_view(), name='whatsapp-contact-group-detail-proxy'),
+    path('contact-groups/<str:group_uid>/contacts/', WhatsAppContactGroupMembersProxyView.as_view(), name='whatsapp-contact-group-members-proxy'),
+
+    # WABA flows proxy
+    path('flows/', WhatsAppFlowsProxyView.as_view(), name='whatsapp-flows-proxy'),
+    path('flows/stats/', WhatsAppFlowStatsProxyView.as_view(), name='whatsapp-flow-stats-proxy'),
+    path('flows/<str:flow_id>/', WhatsAppFlowDetailProxyView.as_view(), name='whatsapp-flow-detail-proxy'),
+    path('flows/<str:flow_id>/<str:action>/', WhatsAppFlowActionProxyView.as_view(), name='whatsapp-flow-action-proxy'),
+
+    # Authenticated proxy for Laravel-hosted media
+    path('media/<path:filename>/', WhatsAppMediaProxyView.as_view(), name='whatsapp-media-proxy'),
 
     # Enrollment update (pause/resume/cancel)
     path('enrollments/<int:pk>/', LeadSequenceEnrollmentUpdateView.as_view(), name='enrollment-update'),

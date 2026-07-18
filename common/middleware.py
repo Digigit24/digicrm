@@ -50,6 +50,7 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/schema.yaml',
         '/api/logs/',  # Logs endpoint - public for monitoring
         '/api/telephony/webhook/',  # TeleCMI CDR and live-event webhooks (secured by webhook_secret)
+        '/api/whatsapp/webhooks/',  # WhatsApp inbound callbacks (secured by X-Adapter-Secret)
         '/mcp/',                    # MCP server endpoints (Claude connector — auth handled internally)
         '/.well-known/',            # OAuth discovery (required by MCP spec)
     ]

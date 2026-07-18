@@ -3,6 +3,7 @@ from datetime import timedelta
 from decouple import config as env_config
 
 from django.utils import timezone
+from django.http import HttpResponse
 from drf_spectacular.utils import (
     extend_schema, extend_schema_view,
     OpenApiParameter, OpenApiResponse, OpenApiExample,
@@ -37,6 +38,7 @@ from .serializers import (
     AgentActionLogSerializer,
 )
 from .services.laravel_adapter import LaravelWhatsAppAdapter, LaravelAdapterError
+from .utils import normalize_msisdn
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,8 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
     """
     vendor_uid = request.headers.get('X-WA-Vendor-Uid') or None
     api_token  = request.headers.get('X-WA-Api-Token') or None
-    base_url   = request.headers.get('X-WA-Base-Url') or None
+    # Never trust a client-provided base URL for server-side adapter calls.
+    base_url = None
 
     # Env var fallback (read via decouple so .env is respected)
     env_vendor_uid = env_config('WA_VENDOR_UID', default=None)
@@ -60,7 +63,7 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
     # Fill any missing piece from env vars
     vendor_uid = vendor_uid or env_vendor_uid
     api_token  = api_token  or env_api_token
-    base_url   = base_url   or env_base_url
+    base_url = env_base_url
 
     logger.info(
         '[WA Adapter] Resolved credentials — '
@@ -236,7 +239,7 @@ class WhatsAppCampaignViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
             )
 
         contacts = [
-            {'phone': l['phone'], 'name': l['name'] or l['phone']}
+            {'phone': normalize_msisdn(l['phone']), 'name': l['name'] or l['phone']}
             for l in leads if l.get('phone')
         ]
 
@@ -502,13 +505,14 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
             logger.warning('[WA Chat] Lead has no phone. tenant=%s lead_id=%s', request.tenant_id, lead_id)
             return Response({'detail': 'Lead has no phone number.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        phone = normalize_msisdn(lead.phone)
         page     = int(request.query_params.get('page', 1))
         per_page = int(request.query_params.get('per_page', 50))
         logger.info('[WA Chat] Calling Laravel adapter. lead=%s phone=%s page=%s per_page=%s',
-                    lead_id, lead.phone, page, per_page)
+                    lead_id, phone, page, per_page)
         try:
             adapter = _adapter_from_request(request)
-            data = adapter.get_chat_history(lead.phone, page, per_page)
+            data = adapter.get_chat_history(phone, page, per_page)
             logger.info('[WA Chat] Success. lead=%s messages_returned=%s',
                         lead_id, len(data.get('data', data) if isinstance(data, dict) else data))
         except LaravelAdapterError as e:
@@ -539,13 +543,14 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
         serializer = AgentSendWhatsAppSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         d = serializer.validated_data
+        phone = normalize_msisdn(lead.phone)
 
         logger.info('[WA Send] Calling Laravel adapter. lead=%s phone=%s template=%s',
-                    lead_id, lead.phone, d.get('template_uid'))
+                    lead_id, phone, d.get('template_uid'))
         try:
             adapter = _adapter_from_request(request)
             result = adapter.send_message(
-                phone=lead.phone,
+                phone=phone,
                 name=lead.name,
                 template_uid=d['template_uid'],
                 template_components=d.get('template_components', []),
@@ -594,10 +599,11 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
         if not text:
             return Response({'detail': 'text is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        phone = normalize_msisdn(lead.phone)
         try:
             adapter = _adapter_from_request(request)
             result = adapter.send_text_message(
-                phone=lead.phone,
+                phone=phone,
                 name=lead.name or lead.phone,
                 text=text,
                 digicrm_lead_id=lead.id,
@@ -753,7 +759,7 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
         if lead.phone:
             try:
                 adapter = _adapter_from_request(request)
-                adapter_result = adapter.assign_chat_user(lead.phone, user_uid)
+                adapter_result = adapter.assign_chat_user(normalize_msisdn(lead.phone), user_uid)
             except Exception:
                 adapter_result = {'wa_inbox_sync': 'skipped — no matching Laravel user for this UID'}
 
@@ -779,7 +785,7 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
 
         try:
             adapter = _adapter_from_request(request)
-            result = adapter.mark_chat_read(lead.phone)
+            result = adapter.mark_chat_read(normalize_msisdn(lead.phone))
         except LaravelAdapterError as e:
             return Response({'detail': str(e)}, status=e.status_code)
 
@@ -802,7 +808,7 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
 
         try:
             adapter = _adapter_from_request(request)
-            result = adapter.block_contact(lead.phone, block=bool(do_block))
+            result = adapter.block_contact(normalize_msisdn(lead.phone), block=bool(do_block))
         except LaravelAdapterError as e:
             return Response({'detail': str(e)}, status=e.status_code)
 
@@ -898,7 +904,8 @@ class WhatsAppWebhookView(APIView):
         except WhatsAppVendorConfig.DoesNotExist:
             return False
         if not config.webhook_secret:
-            return True  # No secret configured = open (warn in logs)
+            logger.warning('[WA Webhook] Rejecting webhook: no secret configured for tenant=%s', tenant_id)
+            return False
         return request.headers.get('X-Adapter-Secret') == config.webhook_secret
 
     @extend_schema(
@@ -918,7 +925,7 @@ class WhatsAppWebhookView(APIView):
         if not self._verify_secret(request, tenant_id):
             return Response({'detail': 'Unauthorized.'}, status=401)
 
-        clean_phone = ''.join(filter(str.isdigit, phone))
+        clean_phone = normalize_msisdn(phone)
 
         if event_type == 'message-replied':
             # Find lead by phone
@@ -1014,7 +1021,7 @@ class AgentSendWhatsAppView(APIView):
         try:
             adapter = _adapter_from_request(request)
             result = adapter.send_message(
-                phone=lead.phone,
+                phone=normalize_msisdn(lead.phone),
                 name=lead.name,
                 template_uid=d['template_uid'],
                 template_components=d.get('template_components', []),
@@ -1144,7 +1151,7 @@ class AgentCreateCampaignView(APIView):
         ).values('id', 'name', 'phone')
 
         contacts = [
-            {'phone': l['phone'], 'name': l['name'] or l['phone']}
+            {'phone': normalize_msisdn(l['phone']), 'name': l['name'] or l['phone']}
             for l in leads if l.get('phone')
         ]
 
@@ -1329,6 +1336,461 @@ class WhatsAppTemplatesProxyView(APIView):
         except LaravelAdapterError as e:
             return Response({'detail': str(e)}, status=503)
         return Response({'templates': templates})
+
+    @extend_schema(description='Create a WhatsApp template via the Laravel gateway.')
+    def post(self, request):
+        try:
+            adapter = _adapter_from_request(request)
+            result = adapter.create_template(request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+class WhatsAppTemplateDetailProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'templates'
+
+    def get(self, request, template_uid):
+        try:
+            result = _adapter_from_request(request).get_template(template_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def put(self, request, template_uid):
+        try:
+            result = _adapter_from_request(request).update_template(template_uid, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def patch(self, request, template_uid):
+        return self.put(request, template_uid)
+
+    def delete(self, request, template_uid):
+        try:
+            result = _adapter_from_request(request).delete_template(template_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppTemplateSyncProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'templates'
+    permission_action = 'edit'
+
+    def post(self, request):
+        try:
+            result = _adapter_from_request(request).sync_templates()
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppTemplateSendProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'templates'
+    permission_action = 'send'
+
+    def post(self, request):
+        payload = dict(request.data)
+        if not payload.get('phone_number'):
+            return Response({'detail': 'phone_number is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not payload.get('template_name'):
+            return Response({'detail': 'template_name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not payload.get('template_language'):
+            return Response({'detail': 'template_language is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload['phone_number'] = normalize_msisdn(payload.get('phone_number'))
+        try:
+            result = _adapter_from_request(request).send_template_message(payload)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppTemplateBulkSendProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'templates'
+    permission_action = 'send'
+
+    @staticmethod
+    def _field_payload(template_name, language, phone, parameters):
+        parameters = parameters or {}
+        return {
+            'phone_number': normalize_msisdn(phone),
+            'template_name': template_name,
+            'template_language': language,
+            'field_1': parameters.get('1') or parameters.get('field_1'),
+            'field_2': parameters.get('2') or parameters.get('field_2'),
+            'field_3': parameters.get('3') or parameters.get('field_3'),
+            'field_4': parameters.get('4') or parameters.get('field_4'),
+            'header_field_1': parameters.get('header_1') or parameters.get('header_field_1'),
+            'header_image': parameters.get('header_image'),
+            'header_video': parameters.get('header_video'),
+            'header_document': parameters.get('header_document'),
+            'button_0': parameters.get('button_0'),
+            'button_1': parameters.get('button_1'),
+        }
+
+    def post(self, request):
+        template_name = request.data.get('template_name')
+        language = request.data.get('language') or request.data.get('template_language')
+        recipients = request.data.get('recipients') or []
+        per_recipient = request.data.get('parameters_per_recipient') or []
+        default_parameters = request.data.get('default_parameters') or {}
+
+        if not template_name:
+            return Response({'detail': 'template_name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not language:
+            return Response({'detail': 'language or template_language is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not isinstance(recipients, list) or not recipients:
+            return Response({'detail': 'recipients must be a non-empty list.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        adapter = _adapter_from_request(request)
+        sent = 0
+        failed = 0
+        results = []
+
+        for index, phone in enumerate(recipients):
+            parameters = per_recipient[index] if index < len(per_recipient) else default_parameters
+            payload = self._field_payload(template_name, language, phone, parameters)
+            try:
+                result = adapter.send_template_message(payload)
+                sent += 1
+                results.append({'phone_number': payload['phone_number'], 'ok': True, 'response': result})
+            except LaravelAdapterError as e:
+                failed += 1
+                results.append({'phone_number': payload['phone_number'], 'ok': False, 'error': str(e), 'status_code': e.status_code})
+
+        response_status = status.HTTP_200_OK if sent else status.HTTP_502_BAD_GATEWAY
+        return Response({'sent': sent, 'failed': failed, 'total': len(recipients), 'results': results}, status=response_status)
+
+
+class WhatsAppContactsProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def get(self, request):
+        params = {
+            key: value
+            for key, value in request.query_params.items()
+            if key in {'page', 'limit', 'search', 'labels', 'groups'}
+        }
+        try:
+            result = _adapter_from_request(request).get_contacts(params=params)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def post(self, request):
+        try:
+            payload = dict(request.data)
+            if payload.get('phone_number'):
+                payload['phone_number'] = normalize_msisdn(payload.get('phone_number'))
+            elif payload.get('phone'):
+                payload['phone'] = normalize_msisdn(payload.get('phone'))
+            result = _adapter_from_request(request).create_contact(payload)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+class WhatsAppContactDetailProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def get(self, request, contact_uid):
+        try:
+            result = _adapter_from_request(request).get_contact(contact_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def put(self, request, contact_uid):
+        try:
+            result = _adapter_from_request(request).update_contact(contact_uid, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def patch(self, request, contact_uid):
+        return self.put(request, contact_uid)
+
+    def delete(self, request, contact_uid):
+        try:
+            result = _adapter_from_request(request).delete_contact(contact_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppContactsImportProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def post(self, request):
+        try:
+            payload = dict(request.data)
+            contacts = payload.get('contacts')
+            if isinstance(contacts, list):
+                payload['contacts'] = [
+                    {
+                        **contact,
+                        'phone': normalize_msisdn(contact.get('phone') or contact.get('phone_number')),
+                    }
+                    for contact in contacts
+                    if isinstance(contact, dict)
+                ]
+            result = _adapter_from_request(request).import_contacts(payload)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result, status=status.HTTP_202_ACCEPTED)
+
+
+class WhatsAppContactsImportStatusProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+    permission_action = 'view'
+
+    def get(self, request, import_id):
+        try:
+            result = _adapter_from_request(request).get_import_status(import_id)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppLabelsProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def get(self, request):
+        try:
+            result = _adapter_from_request(request).get_labels()
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def post(self, request):
+        try:
+            result = _adapter_from_request(request).create_label(request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+class WhatsAppLabelDetailProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def put(self, request, label_uid):
+        try:
+            result = _adapter_from_request(request).update_label(label_uid, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def patch(self, request, label_uid):
+        return self.put(request, label_uid)
+
+    def delete(self, request, label_uid):
+        try:
+            result = _adapter_from_request(request).delete_label(label_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppContactGroupsProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def get(self, request):
+        try:
+            result = _adapter_from_request(request).get_contact_groups()
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def post(self, request):
+        try:
+            result = _adapter_from_request(request).create_contact_group(request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+class WhatsAppContactGroupDetailProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+
+    def put(self, request, group_uid):
+        try:
+            result = _adapter_from_request(request).update_contact_group(group_uid, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def patch(self, request, group_uid):
+        return self.put(request, group_uid)
+
+    def delete(self, request, group_uid):
+        try:
+            result = _adapter_from_request(request).delete_contact_group(group_uid)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppContactGroupMembersProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'contacts'
+    permission_action = 'edit'
+
+    def post(self, request, group_uid):
+        try:
+            result = _adapter_from_request(request).add_contacts_to_group(group_uid, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def delete(self, request, group_uid):
+        try:
+            result = _adapter_from_request(request).remove_contacts_from_group(group_uid, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppFlowsProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'flows'
+
+    def get(self, request):
+        try:
+            result = _adapter_from_request(request).get_flows(params=dict(request.query_params.items()))
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def post(self, request):
+        try:
+            result = _adapter_from_request(request).create_flow(request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+class WhatsAppFlowStatsProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'flows'
+    permission_action = 'view'
+
+    def get(self, request):
+        try:
+            result = _adapter_from_request(request).get_flow_stats()
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppFlowDetailProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'flows'
+
+    def get(self, request, flow_id):
+        try:
+            result = _adapter_from_request(request).get_flow(flow_id)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def put(self, request, flow_id):
+        try:
+            result = _adapter_from_request(request).update_flow(flow_id, request.data)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+    def patch(self, request, flow_id):
+        return self.put(request, flow_id)
+
+    def delete(self, request, flow_id):
+        try:
+            result = _adapter_from_request(request).delete_flow(flow_id)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppFlowActionProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'flows'
+    permission_action = 'edit'
+
+    def post(self, request, flow_id, action):
+        try:
+            result = _adapter_from_request(request).flow_action(
+                flow_id,
+                action,
+                payload=request.data,
+                params=dict(request.query_params.items()),
+            )
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return Response(result)
+
+
+class WhatsAppMediaProxyView(APIView):
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'view'
+
+    def get(self, request, filename):
+        try:
+            content, content_type = _adapter_from_request(request).fetch_media(filename)
+        except LaravelAdapterError as e:
+            return Response({'detail': str(e)}, status=e.status_code)
+        return HttpResponse(content, content_type=content_type)
 
 
 # ---------------------------------------------------------------------------
@@ -1525,7 +1987,7 @@ class AICampaignLaunchView(APIView):
             return Response({'detail': 'No valid leads found for given lead_ids'}, status=404)
 
         contacts = [
-            {'phone': lead.phone, 'name': lead.name or lead.phone}
+            {'phone': normalize_msisdn(lead.phone), 'name': lead.name or lead.phone}
             for lead in leads
             if lead.phone
         ]
@@ -1565,7 +2027,7 @@ class AICampaignLaunchView(APIView):
                 digicrm_campaign_id=campaign.id,
             )
             campaign.laravel_campaign_uid = result.get('campaign_uid')
-            campaign.status = CampaignStatusEnum.LAUNCHED
+            campaign.status = CampaignStatusEnum.RUNNING
             campaign.save(update_fields=['laravel_campaign_uid', 'status'])
         except LaravelAdapterError as e:
             campaign.status = CampaignStatusEnum.FAILED
@@ -1581,7 +2043,6 @@ class AICampaignLaunchView(APIView):
             action_type=AgentActionTypeEnum.CREATE_CAMPAIGN,
             payload_in=request.data,
             payload_out=result,
-            lead_id=None,
             status=AgentActionStatusEnum.SUCCESS,
         )
 
@@ -1618,8 +2079,8 @@ class AISequencesView(APIView):
         for s in seqs:
             steps = list(
                 s.steps.order_by('step_number').values(
-                    'id', 'step_number', 'message_type',
-                    'template_uid', 'text_content', 'delay_hours'
+                    'id', 'step_number', 'delay_days',
+                    'template_uid', 'template_name', 'template_variable_mapping'
                 )
             )
             data.append({
@@ -1656,8 +2117,8 @@ class AISequencesView(APIView):
 # (contacts/by-phone/{phone}/messages), so no Lead lookup is required.
 
 def _validate_phone(raw: str):
-    """Return a non-empty phone string or None. Digits are normalised by the adapter."""
-    phone = (raw or '').strip()
+    """Return a normalized MSISDN phone string or None."""
+    phone = normalize_msisdn(raw)
     return phone or None
 
 
@@ -1680,6 +2141,9 @@ class ContactChatByPhoneView(APIView):
     """GET /api/whatsapp/contacts/by-phone/chat/?phone=...&page=...&per_page=..."""
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'view'
 
     def get(self, request):
         phone = _validate_phone(request.query_params.get('phone'))
@@ -1727,6 +2191,9 @@ class ContactSendTextByPhoneView(APIView):
     """POST /api/whatsapp/contacts/by-phone/send_text/  body: {phone, text, name?}"""
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'send'
 
     def post(self, request):
         phone = _validate_phone(request.data.get('phone'))

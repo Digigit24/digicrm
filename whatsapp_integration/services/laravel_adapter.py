@@ -10,10 +10,12 @@ Rules:
 """
 
 import logging
+import re
 import requests
 from django.core.cache import cache
 
 from whatsapp_integration.models import WhatsAppVendorConfig
+from whatsapp_integration.utils import normalize_msisdn
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,17 @@ def _make_request(method: str, url: str, token: str, **kwargs) -> dict:
     return data
 
 
+def _unwrap_data(data):
+    """Return Laravel's nested data payload when present."""
+    if isinstance(data, dict) and data.get('data') is not None:
+        return data.get('data')
+    return data
+
+
+def _looks_like_uuid(value: str) -> bool:
+    return bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', value or '', re.I))
+
+
 class LaravelWhatsAppAdapter:
     """
     Facade for all DigiCRM → Laravel WhatsApp API calls.
@@ -112,6 +125,13 @@ class LaravelWhatsAppAdapter:
     def _url(self, path: str) -> str:
         return f"{self.base_url}/{self.vendor_uid}/adapter/{path.lstrip('/')}"
 
+    def _vendor_url(self, path: str) -> str:
+        return f"{self.base_url}/{self.vendor_uid}/{path.lstrip('/')}"
+
+    def vendor_request(self, method: str, path: str, **kwargs) -> dict:
+        """Call a standard vendor-scoped Laravel API route."""
+        return _make_request(method, self._vendor_url(path), self.api_token, **kwargs)
+
     @staticmethod
     def _normalize_phone(phone: str) -> str:
         """
@@ -122,10 +142,7 @@ class LaravelWhatsAppAdapter:
             '+919876543210' → '919876543210'
             '919876543210'  → '919876543210'  (already correct, untouched)
         """
-        digits = ''.join(filter(str.isdigit, phone or ''))
-        if len(digits) == 10:
-            digits = '91' + digits
-        return digits
+        return normalize_msisdn(phone)
 
     # ------------------------------------------------------------------
     # 1. SEND SINGLE MESSAGE TO A PHONE NUMBER
@@ -323,3 +340,128 @@ class LaravelWhatsAppAdapter:
         templates = result.get('data', result) if isinstance(result, dict) else result
         cache.set(cache_key, templates, timeout=600)  # 10 min
         return templates
+
+    def get_template(self, template_uid: str) -> dict:
+        return self.vendor_request('GET', f'templates/{template_uid}')
+
+    def create_template(self, payload: dict) -> dict:
+        cache.delete(f'wa_templates_{self.vendor_uid}')
+        return self.vendor_request('POST', 'templates', json=payload)
+
+    def update_template(self, template_uid: str, payload: dict) -> dict:
+        cache.delete(f'wa_templates_{self.vendor_uid}')
+        return self.vendor_request('PUT', f'templates/{template_uid}', json=payload)
+
+    def delete_template(self, template_uid: str) -> dict:
+        cache.delete(f'wa_templates_{self.vendor_uid}')
+        return self.vendor_request('DELETE', f'templates/{template_uid}')
+
+    def sync_templates(self) -> dict:
+        cache.delete(f'wa_templates_{self.vendor_uid}')
+        return self.vendor_request('POST', 'templates/sync', json={})
+
+    def send_template_message(self, payload: dict) -> dict:
+        normalized_payload = {**(payload or {})}
+        if normalized_payload.get('phone_number'):
+            normalized_payload['phone_number'] = self._normalize_phone(normalized_payload.get('phone_number'))
+        return self.vendor_request('POST', 'contact/send-template-message', json=normalized_payload)
+
+    def get_contacts(self, params: dict = None) -> dict:
+        return _unwrap_data(self.vendor_request('GET', 'contacts', params=params or {}))
+
+    def get_contact(self, contact_uid: str) -> dict:
+        contact_lookup = str(contact_uid or '')
+        if not _looks_like_uuid(contact_lookup):
+            contact_lookup = self._normalize_phone(contact_lookup)
+        return self.vendor_request('GET', f'contacts/{contact_lookup}')
+
+    def create_contact(self, payload: dict) -> dict:
+        normalized_payload = {**(payload or {})}
+        if normalized_payload.get('phone_number'):
+            normalized_payload['phone_number'] = self._normalize_phone(normalized_payload.get('phone_number'))
+        elif normalized_payload.get('phone'):
+            normalized_payload['phone'] = self._normalize_phone(normalized_payload.get('phone'))
+        return self.vendor_request('POST', 'contact/create', json=normalized_payload)
+
+    def update_contact(self, phone_number: str, payload: dict) -> dict:
+        return self.vendor_request('POST', f'contact/update/{self._normalize_phone(phone_number)}', json=payload)
+
+    def delete_contact(self, contact_uid: str) -> dict:
+        return self.vendor_request('DELETE', f'contacts/{contact_uid}')
+
+    def import_contacts(self, payload: dict) -> dict:
+        return self.vendor_request('POST', 'contacts/import', json=payload)
+
+    def get_import_status(self, import_id: str) -> dict:
+        return self.vendor_request('GET', f'contacts/import/{import_id}/status')
+
+    def get_labels(self) -> list:
+        return _unwrap_data(self.vendor_request('GET', 'labels'))
+
+    def create_label(self, payload: dict) -> dict:
+        return self.vendor_request('POST', 'labels', json=payload)
+
+    def update_label(self, label_uid: str, payload: dict) -> dict:
+        return self.vendor_request('PUT', f'labels/{label_uid}', json=payload)
+
+    def delete_label(self, label_uid: str) -> dict:
+        return self.vendor_request('DELETE', f'labels/{label_uid}')
+
+    def get_contact_groups(self) -> list:
+        return _unwrap_data(self.vendor_request('GET', 'contact-groups'))
+
+    def create_contact_group(self, payload: dict) -> dict:
+        return self.vendor_request('POST', 'contact-groups', json=payload)
+
+    def update_contact_group(self, group_uid: str, payload: dict) -> dict:
+        return self.vendor_request('PUT', f'contact-groups/{group_uid}', json=payload)
+
+    def delete_contact_group(self, group_uid: str) -> dict:
+        return self.vendor_request('DELETE', f'contact-groups/{group_uid}')
+
+    def add_contacts_to_group(self, group_uid: str, payload: dict) -> dict:
+        return self.vendor_request('POST', f'contact-groups/{group_uid}/contacts', json=payload)
+
+    def remove_contacts_from_group(self, group_uid: str, payload: dict) -> dict:
+        return self.vendor_request('DELETE', f'contact-groups/{group_uid}/contacts', json=payload)
+
+    def get_flows(self, params: dict = None) -> dict:
+        return self.vendor_request('GET', 'flows', params=params or {})
+
+    def get_flow(self, flow_id: str) -> dict:
+        return self.vendor_request('GET', f'flows/{flow_id}')
+
+    def create_flow(self, payload: dict) -> dict:
+        return self.vendor_request('POST', 'flows', json=payload)
+
+    def update_flow(self, flow_id: str, payload: dict) -> dict:
+        return self.vendor_request('PUT', f'flows/{flow_id}', json=payload)
+
+    def delete_flow(self, flow_id: str) -> dict:
+        return self.vendor_request('DELETE', f'flows/{flow_id}')
+
+    def flow_action(self, flow_id: str, action: str, payload: dict = None, params: dict = None) -> dict:
+        if action not in {'publish', 'unpublish', 'duplicate', 'validate'}:
+            raise LaravelAdapterError("Unsupported flow action", status_code=400)
+        return self.vendor_request(
+            'POST',
+            f'flows/{flow_id}/{action}',
+            json=payload or {},
+            params=params or {},
+        )
+
+    def get_flow_stats(self) -> dict:
+        return self.vendor_request('GET', 'flows/stats')
+
+    def fetch_media(self, filename: str):
+        """Fetch public Laravel media via the configured gateway URL."""
+        url = self._vendor_url(f"media/{filename.lstrip('/')}")
+        try:
+            resp = requests.get(url, timeout=15)
+        except requests.exceptions.Timeout:
+            raise LaravelAdapterError("Laravel media request timed out", status_code=504)
+        except requests.exceptions.ConnectionError as e:
+            raise LaravelAdapterError(f"Cannot connect to Laravel media: {e}", status_code=503)
+        if resp.status_code >= 400:
+            raise LaravelAdapterError(f"Laravel media error: HTTP {resp.status_code}", status_code=resp.status_code)
+        return resp.content, resp.headers.get('Content-Type', 'application/octet-stream')
