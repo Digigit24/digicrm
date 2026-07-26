@@ -48,7 +48,8 @@ class TeleCMIClientTest(TestCase):
         from telephony.services.telecmi_client import click_to_call
         click_to_call('tok', '9190000', caller_id='18000000', extra_params={'crm': 'true'})
         payload = mock_post.call_args[1]['json']
-        self.assertEqual(payload['callerid'], '18000000')
+        self.assertEqual(payload['to'], 9190000)
+        self.assertEqual(payload['callerid'], 18000000)
         self.assertEqual(payload['extra_params'], {'crm': 'true'})
 
     @patch('telephony.services.telecmi_client.requests.post')

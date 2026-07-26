@@ -431,6 +431,24 @@ FRONTEND_OAUTH_CALLBACK_URL = config('FRONTEND_OAUTH_CALLBACK_URL', default=f"{c
 INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)
 
 # ===========================
+# PUSHER (real-time telephony live events)
+# ===========================
+# Server-side credentials for PUBLISHING events from CDRWebhookView /
+# LiveEventWebhookView (telephony/services/realtime.py). Must be the SAME
+# Pusher app the frontend subscribes to — sepratecrm's
+# src/hooks/useTelephonyLiveEvents.ts and src/services/pusherService.ts
+# already hardcode PUSHER_KEY='649db422ae8f2e9c7a9d' / cluster='ap2' for that
+# existing app, so those two default below match it. Only PUSHER_APP_ID and
+# PUSHER_SECRET (both private, server-only) need to come from your real
+# Pusher dashboard — get them from the same Pusher account/app that issued
+# that key. Leave PUSHER_SECRET blank to no-op (live events silently won't
+# publish; nothing else breaks).
+PUSHER_APP_ID = config('PUSHER_APP_ID', default='')
+PUSHER_KEY = config('PUSHER_KEY', default='649db422ae8f2e9c7a9d')
+PUSHER_SECRET = config('PUSHER_SECRET', default='')
+PUSHER_CLUSTER = config('PUSHER_CLUSTER', default='ap2')
+
+# ===========================
 # CACHE CONFIGURATION
 # ===========================
 CACHES = {
@@ -471,5 +489,10 @@ CELERY_BEAT_SCHEDULE = {
     'check-connection-health': {
         'task': 'integrations.tasks.check_connection_health',
         'schedule': 86400.0,  # Every 24 hours
+    },
+    'sync-telecmi-cdrs': {
+        'task': 'telephony.tasks.sync_all_telecmi_cdrs',
+        'schedule': 300.0,  # Every 5 minutes
+        'kwargs': {'hours_back': 1},
     },
 }

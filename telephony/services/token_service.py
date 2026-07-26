@@ -51,7 +51,11 @@ def _refresh_token(agent) -> str:
     try:
         password = decrypt_token(agent.password_encrypted)
     except EncryptionError as exc:
-        raise TokenServiceError(f'Failed to decrypt TeleCMI agent password: {exc}')
+        raise TokenServiceError(
+            'TeleCMI agent password cannot be decrypted. '
+            'The encryption key may have changed. '
+            'Go to Settings → TeleCMI → Agents, re-enter the password for this agent, and save.'
+        ) from exc
 
     try:
         token = get_user_login_token(agent.telecmi_user_id, password)

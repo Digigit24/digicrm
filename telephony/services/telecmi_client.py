@@ -24,6 +24,7 @@ class TeleCMIError(Exception):
 def _post(path, payload, timeout=DEFAULT_TIMEOUT):
     """Internal POST helper. Returns parsed JSON dict."""
     url = f'{TELECMI_BASE_URL}{path}'
+    logger.debug('TeleCMI outgoing POST %s payload: %s', path, payload)
     try:
         response = requests.post(url, json=payload, timeout=timeout)
     except requests.RequestException as exc:
@@ -41,6 +42,7 @@ def _post(path, payload, timeout=DEFAULT_TIMEOUT):
         error_code = data.get('code', response.status_code)
         msg = data.get('msg') or data.get('error') or f'TeleCMI error {error_code}'
         logger.warning('TeleCMI API error %s on %s: %s', error_code, path, msg)
+        logger.debug('TeleCMI error response body for %s: %s', path, response.text)
         raise TeleCMIError(msg, status_code=error_code, response_data=data)
 
     return data
@@ -83,10 +85,20 @@ def click_to_call(token: str, to_number: str, caller_id: str = None, extra_param
     POST /v2/click2call
     Rings the agent's softphone first, then dials to_number.
     Returns {'code': 200, 'msg': 'Call initiated', 'request_id': '...'}.
+
+    TeleCMI expects 'to' and 'callerid' as numeric JSON values, not strings.
     """
-    payload = {'token': token, 'to': to_number}
+    try:
+        numeric_to = int(to_number)
+    except (ValueError, TypeError) as exc:
+        raise TeleCMIError(f'Invalid to_number, expected numeric string: {to_number!r}') from exc
+
+    payload = {'token': token, 'to': numeric_to}
     if caller_id:
-        payload['callerid'] = caller_id
+        try:
+            payload['callerid'] = int(caller_id)
+        except (ValueError, TypeError) as exc:
+            raise TeleCMIError(f'Invalid caller_id, expected numeric string: {caller_id!r}') from exc
     if extra_params:
         payload['extra_params'] = extra_params
     return _post('/click2call', payload)

@@ -41,6 +41,7 @@ from telephony.services.token_service import (
 )
 from telephony.services.call_log_service import process_cdr_record, sync_cdr_for_agent
 from telephony.services.callback_service import create_callback_task_if_needed
+from telephony.services.realtime import publish_live_event
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +264,14 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
             secret = decrypt_token(credential.secret_encrypted)
         except EncryptionError as exc:
             logger.error('Failed to decrypt TeleCMI secret for tenant %s: %s', _tenant_id(request), exc)
-            return Response({'error': 'Could not decrypt TeleCMI credentials'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {
+                    'error': 'TeleCMI credentials cannot be decrypted. '
+                             'The encryption key may have changed. '
+                             'Go to Settings → TeleCMI, re-enter the App Secret, and save.'
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         try:
             telecmi_resp = client.stream_recording(credential.app_id, secret, call_log.recording_file)
@@ -595,6 +603,22 @@ class CDRWebhookView(APIView):
         if log and log.call_type == 'missed':
             create_callback_task_if_needed(tenant_id, log)
 
+        if log:
+            # Final event for this call — the CDR is the only place the
+            # recording filename becomes available, so this is what tells
+            # the frontend "the recording (if any) is ready to fetch now".
+            publish_live_event(tenant_id, 'ended', {
+                'cmiuid': log.cmiuid,
+                'call_log_id': log.id,
+                'lead_id': log.lead_id,
+                'direction': log.direction,
+                'call_type': log.call_type,
+                'duration': log.duration,
+                'from': log.from_number,
+                'to': log.to_number,
+                'has_recording': bool(log.recording_file),
+            })
+
         return Response({'status': 'ok'})
 
 
@@ -603,8 +627,18 @@ class LiveEventWebhookView(APIView):
     """
     POST /api/telephony/webhook/live/
 
-    Receives TeleCMI live call events (ringing, answered, ended).
-    Currently logs the event; future: push to frontend via Redis/SSE.
+    Receives TeleCMI live call events (ringing, answered, ended-mid-call) and
+    republishes them to the frontend via Pusher on channel
+    `telephony.<tenant_id>` — see telephony/services/realtime.py and
+    sepratecrm src/hooks/useTelephonyLiveEvents.ts.
+
+    TeleCMI's public docs don't fully enumerate this payload's field names,
+    so _normalize_live_event() below is deliberately defensive: it tries a
+    handful of common shapes and falls back to logging + skipping the
+    publish (never guesses wrong and mislabels an event) rather than
+    crashing the webhook. Tighten the field list here once you've captured
+    a few real payloads from the TeleCMI dashboard's webhook log.
+
     Configure this URL in the TeleCMI dashboard under Settings → Webhooks.
     """
     authentication_classes = []
@@ -615,10 +649,47 @@ class LiveEventWebhookView(APIView):
         tenant_id = request.query_params.get('tenant_id')
         logger.info('Live event webhook (tenant=%s): %s', tenant_id, payload)
 
-        # Future: push to Redis channel for WebSocket/SSE delivery to browser
-        # channel_layer.group_send(f'telephony_{tenant_id}', payload)
+        event_name, cmiuid = _normalize_live_event(payload)
+        if event_name:
+            publish_live_event(tenant_id, event_name, {
+                'cmiuid': cmiuid,
+                'from': payload.get('from') or payload.get('from_number'),
+                'to': payload.get('to') or payload.get('to_number'),
+            })
+        else:
+            logger.warning(
+                'Live event webhook (tenant=%s): could not classify payload as '
+                'ringing/answered/ended, skipping Pusher publish: %s',
+                tenant_id, payload,
+            )
 
         return Response({'status': 'ok'})
+
+
+def _normalize_live_event(payload: dict):
+    """
+    Best-effort mapping of a TeleCMI live-event payload to one of
+    ('ringing' | 'answered' | 'ended', cmiuid). Returns (None, None) if the
+    payload doesn't match a recognized shape — callers must not publish in
+    that case.
+    """
+    if not isinstance(payload, dict):
+        return None, None
+
+    cmiuid = payload.get('cmiuid') or payload.get('cmiuuid') or payload.get('uuid')
+
+    # Some TeleCMI live endpoints send an explicit 'event' or 'status' field;
+    # others only send a hangup-style payload with no explicit event name.
+    raw_event = (payload.get('event') or payload.get('status') or '').strip().lower()
+
+    if raw_event in ('ringing', 'ring', 'incoming', 'dialing'):
+        return 'ringing', cmiuid
+    if raw_event in ('answered', 'in-progress', 'active'):
+        return 'answered', cmiuid
+    if raw_event in ('ended', 'hangup', 'completed', 'bye') or 'hangup' in payload:
+        return 'ended', cmiuid
+
+    return None, None
 
 
 def _detect_direction(payload: dict) -> str:
