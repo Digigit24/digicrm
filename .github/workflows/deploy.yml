@@ -2,8 +2,7 @@ name: Deploy DigiCRM
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -17,17 +16,26 @@ jobs:
     steps:
       - name: Setup SSH
         run: |
+          set -e
           mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/digicrm_key
-          sed -i 's/\r$//' ~/.ssh/digicrm_key
-          chmod 600 ~/.ssh/digicrm_key
-          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          chmod 700 ~/.ssh
 
-      - name: Deploy
+          echo "${{ secrets.VPS_SSH_KEY_B64 }}" \
+            | base64 --decode > ~/.ssh/digicrm_key
+
+          chmod 600 ~/.ssh/digicrm_key
+
+          ssh-keygen -y -f ~/.ssh/digicrm_key > /dev/null
+
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" \
+            >> ~/.ssh/known_hosts
+
+      - name: Deploy DigiCRM
         run: |
           ssh -4 -T \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
+            -o ConnectTimeout=20 \
             -i ~/.ssh/digicrm_key \
             "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" 'bash -s' <<'EOS'
           set -euo pipefail
@@ -37,7 +45,10 @@ jobs:
           SERVICE="digicrm.service"
 
           exec 9>/tmp/digicrm-deploy.lock
-          flock -n 9 || exit 1
+          flock -n 9 || {
+            echo "Another deployment is running."
+            exit 1
+          }
 
           cd "$APP_DIR"
 
@@ -53,5 +64,5 @@ jobs:
           sudo -n systemctl restart "$SERVICE"
           sudo -n systemctl is-active --quiet "$SERVICE"
 
-          echo "DigiCRM deployment completed"
+          echo "DigiCRM deployment completed successfully."
           EOS
