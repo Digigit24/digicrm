@@ -2,7 +2,9 @@ name: Deploy DigiCRM
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   workflow_dispatch:
 
 concurrency:
@@ -12,32 +14,65 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Setup SSH
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          echo "${{ secrets.VPS_SSH_KEY_B64 }}" \
+          echo "Decoding SSH private key..."
+
+          printf '%s' "${{ secrets.VPS_SSH_KEY_B64 }}" \
             | base64 --decode > ~/.ssh/digicrm_key
 
           chmod 600 ~/.ssh/digicrm_key
 
-          ssh-keygen -y -f ~/.ssh/digicrm_key > /dev/null
+          echo "Validating SSH private key..."
 
-          ssh-keyscan -H "${{ secrets.VPS_HOST }}" \
-            >> ~/.ssh/known_hosts
+          ssh-keygen -y \
+            -f ~/.ssh/digicrm_key \
+            > /dev/null
 
-      - name: Deploy DigiCRM
+          echo "SSH private key is valid."
+
+      - name: Test SSH Connection
+        shell: bash
         run: |
+          set -euo pipefail
+
           ssh -4 -T \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
             -o ConnectTimeout=20 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=5 \
             -i ~/.ssh/digicrm_key \
-            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" 'bash -s' <<'EOS'
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "echo 'SSH connection successful'; whoami; hostname"
+
+      - name: Deploy DigiCRM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ssh -4 -T \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=20 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=10 \
+            -i ~/.ssh/digicrm_key \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            'bash -s' <<'EOS'
           set -euo pipefail
 
           APP_DIR="/srv/apps/digicrm/app/digicrm"
@@ -45,24 +80,69 @@ jobs:
           SERVICE="digicrm.service"
 
           exec 9>/tmp/digicrm-deploy.lock
+
           flock -n 9 || {
-            echo "Another deployment is running."
+            echo "Another DigiCRM deployment is running."
             exit 1
           }
 
+          echo "Starting DigiCRM deployment..."
+
           cd "$APP_DIR"
+
+          test -f manage.py || {
+            echo "manage.py not found in $APP_DIR"
+            exit 1
+          }
+
+          test -f requirements.txt || {
+            echo "requirements.txt not found"
+            exit 1
+          }
+
+          test -x "$VENV/bin/python" || {
+            echo "Python not found in $VENV"
+            exit 1
+          }
+
+          echo "Fetching latest code..."
 
           git fetch origin main
           git reset --hard origin/main
           git clean -fd
 
-          "$VENV/bin/pip" install --no-cache-dir -r requirements.txt
+          echo "Installing dependencies..."
+
+          "$VENV/bin/pip" install \
+            --no-cache-dir \
+            -r requirements.txt
+
+          echo "Running Django checks..."
+
           "$VENV/bin/python" manage.py check
+
+          echo "Applying migrations..."
+
           "$VENV/bin/python" manage.py migrate --noinput
+
+          echo "Collecting static files..."
+
           "$VENV/bin/python" manage.py collectstatic --noinput
 
+          echo "Restarting DigiCRM service..."
+
           sudo -n systemctl restart "$SERVICE"
-          sudo -n systemctl is-active --quiet "$SERVICE"
+
+          if ! sudo -n systemctl is-active --quiet "$SERVICE"; then
+            echo "DigiCRM service failed to start."
+
+            sudo -n systemctl status "$SERVICE" \
+              --no-pager \
+              --full || true
+
+            exit 1
+          fi
 
           echo "DigiCRM deployment completed successfully."
+          echo "Revision: $(git rev-parse --short HEAD)"
           EOS
