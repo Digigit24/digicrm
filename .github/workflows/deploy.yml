@@ -1,0 +1,57 @@
+name: Deploy DigiCRM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: digicrm-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/digicrm_key
+          sed -i 's/\r$//' ~/.ssh/digicrm_key
+          chmod 600 ~/.ssh/digicrm_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy
+        run: |
+          ssh -4 -T \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -i ~/.ssh/digicrm_key \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" 'bash -s' <<'EOS'
+          set -euo pipefail
+
+          APP_DIR="/srv/apps/digicrm/app/digicrm"
+          VENV="/srv/apps/digicrm/venv"
+          SERVICE="digicrm.service"
+
+          exec 9>/tmp/digicrm-deploy.lock
+          flock -n 9 || exit 1
+
+          cd "$APP_DIR"
+
+          git fetch origin main
+          git reset --hard origin/main
+          git clean -fd
+
+          "$VENV/bin/pip" install --no-cache-dir -r requirements.txt
+          "$VENV/bin/python" manage.py check
+          "$VENV/bin/python" manage.py migrate --noinput
+          "$VENV/bin/python" manage.py collectstatic --noinput
+
+          sudo -n systemctl restart "$SERVICE"
+          sudo -n systemctl is-active --quiet "$SERVICE"
+
+          echo "DigiCRM deployment completed"
+          EOS
