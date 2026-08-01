@@ -49,6 +49,11 @@ actions_router.register(
 app_name = 'integrations'
 
 urlpatterns = [
+    # Public inbound webhook (push-based integrations: Make, Zapier, generic).
+    # Must come before the routers so its <uuid:public_id> segment can't be
+    # swallowed by a router pattern.
+    path('webhook/inbound/<uuid:public_id>/', views.InboundWebhookView.as_view(), name='webhook-inbound'),
+
     # Include main router URLs
     path('', include(router.urls)),
 

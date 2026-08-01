@@ -13,8 +13,9 @@ class ActivityTypeEnum(models.TextChoices):
     EMAIL = 'EMAIL', 'Email'
     MEETING = 'MEETING', 'Meeting'
     NOTE = 'NOTE', 'Note'
-    
+
     SMS = 'SMS', 'SMS'
+    REAL_ESTATE = 'REAL_ESTATE', 'Real Estate'
     OTHER = 'OTHER', 'Other'
 
 

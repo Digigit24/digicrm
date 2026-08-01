@@ -155,7 +155,12 @@ class CallLog(models.Model):
     call_time = models.DateTimeField(db_index=True, help_text='When the call occurred (UTC)')
     # Link to CRM entities - nullable because call may come from unknown number
     lead_id = models.BigIntegerField(null=True, blank=True, db_index=True)
-    agent_user_id = models.UUIDField(null=True, blank=True, db_index=True)
+    agent_user_id = models.UUIDField(
+        null=True, blank=True, db_index=True,
+        help_text='CRM user UUID who handled this call (no FK constraint — '
+                   'user records live outside this app, same pattern as '
+                   'sent_by_user_id / created_by_id elsewhere in this app)'
+    )
     recording_file = models.CharField(
         max_length=300,
         null=True,
@@ -170,6 +175,27 @@ class CallLog(models.Model):
     )
     # Track if we already created a CRM Activity for this call
     activity_created = models.BooleanField(default=False)
+
+    # Outbound call dedup fields
+    call_leg = models.CharField(max_length=1, null=True, blank=True, help_text='"a" or "b" for outbound legs')
+    telecmi_call_id = models.CharField(max_length=64, null=True, blank=True, db_index=True, help_text='Links Leg A and Leg B of outbound calls')
+    conversation_uuid = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    # Routing metadata
+    ivr_name = models.CharField(max_length=128, null=True, blank=True)
+    team_name = models.CharField(max_length=128, null=True, blank=True)
+    # Voicemail support (inbound missed)
+    is_voicemail = models.BooleanField(default=False)
+    voicemail_filename = models.CharField(max_length=256, null=True, blank=True)
+    wait_seconds = models.IntegerField(null=True, blank=True, help_text='Ring wait time for missed calls')
+    hangup_reason = models.CharField(max_length=32, null=True, blank=True)
+    # Disposition (agent-set after call)
+    call_outcome = models.CharField(
+        max_length=32, null=True, blank=True,
+        help_text='Agent disposition: interested/not_interested/follow_up/callback/converted/dnd'
+    )
+    call_outcome_note = models.CharField(max_length=512, null=True, blank=True)
+    call_outcome_set_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -185,6 +211,9 @@ class CallLog(models.Model):
             models.Index(fields=['from_number'], name='idx_tel_calls_from'),
             models.Index(fields=['to_number'], name='idx_tel_calls_to'),
             models.Index(fields=['lead_id'], name='idx_tel_calls_lead'),
+            models.Index(fields=['tenant_id', 'agent_user_id', 'call_time'], name='idx_tel_calls_agent_time'),
+            models.Index(fields=['telecmi_call_id', 'call_leg'], name='idx_tel_calls_legs'),
+            models.Index(fields=['conversation_uuid'], name='idx_tel_calls_conv'),
         ]
 
     def __str__(self):
@@ -222,3 +251,53 @@ class SMSLog(models.Model):
 
     def __str__(self):
         return f'SMS to {self.to_number} ({self.get_status_display()})'
+
+
+class CampaignRingRuleEnum(models.TextChoices):
+    RING_ALL = 'ring-all', 'Ring All'
+    ROUND_ROBIN = 'round-robin', 'Round Robin'
+
+
+class TeleCMICampaign(models.Model):
+    """Auto-dialer campaign backed by TeleCMI Campaigns API."""
+    INTERVAL_CHOICES = [(10,'10s'),(20,'20s'),(30,'30s'),(40,'40s'),(50,'50s'),(60,'1 min'),(120,'2 min')]
+
+    tenant_id = models.UUIDField(db_index=True)
+    telecmi_campaign_id = models.CharField(max_length=64, null=True, blank=True, help_text='UUID from TeleCMI after creation')
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=False)
+    timezone = models.CharField(max_length=64, default='Asia/Kolkata')
+    start_date = models.DateField()
+    end_date = models.DateField()
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    call_interval = models.IntegerField(default=30, choices=INTERVAL_CHOICES)
+    ring_rule = models.CharField(max_length=20, default='round-robin', choices=CampaignRingRuleEnum.choices)
+    agent_user_ids = models.JSONField(default=list, help_text='CRM user UUIDs assigned to this campaign')
+    source_group = models.ForeignKey(
+        'crm.LeadGroup',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='telephony_campaigns',
+        db_column='source_group_id',
+        help_text='CRM lead group this campaign is seeded from, if any',
+    )
+    lead_count = models.IntegerField(default=0)
+    leads_called = models.IntegerField(default=0)
+    telecmi_lead_list_name = models.CharField(max_length=255, null=True, blank=True)
+    notes = models.TextField(blank=True)
+    created_by_id = models.UUIDField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'telephony_campaigns'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_tel_camp_tenant'),
+            models.Index(fields=['tenant_id', 'is_active'], name='idx_tel_camp_active'),
+        ]
+
+    def __str__(self):
+        return f'Campaign: {self.name} (tenant {self.tenant_id})'

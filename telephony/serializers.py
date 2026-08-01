@@ -1,6 +1,10 @@
 from rest_framework import serializers
 from common.mixins import TenantMixin
-from telephony.models import TeleCMICredential, TeleCMIAgent, CallLog, SMSLog
+from telephony.models import (
+    TeleCMICredential, TeleCMIAgent, CallLog, SMSLog, TeleCMICampaign,
+)
+from crm.models import LeadGroup
+from crm.serializers import LeadGroupMinimalSerializer
 from integrations.utils.encryption import encrypt_token
 
 
@@ -100,8 +104,12 @@ class CallLogSerializer(serializers.ModelSerializer):
             'caller_name', 'telecmi_notes', 'call_time',
             'lead_id', 'agent_user_id', 'synced_via',
             'recording_file', 'has_recording', 'created_at',
+            'call_leg', 'telecmi_call_id', 'conversation_uuid',
+            'ivr_name', 'team_name', 'is_voicemail', 'voicemail_filename',
+            'wait_seconds', 'hangup_reason',
+            'call_outcome', 'call_outcome_note', 'call_outcome_set_at',
         ]
-        read_only_fields = fields
+        read_only_fields = [f for f in fields if f not in ('call_outcome', 'call_outcome_note')]
 
 
 class SMSLogSerializer(serializers.ModelSerializer):
@@ -163,3 +171,79 @@ class AddNoteSerializer(serializers.Serializer):
     caller_name = serializers.CharField(default='', allow_blank=True)
     timestamp_ms = serializers.IntegerField(help_text='UTC millisecond timestamp of the call')
     message = serializers.CharField(help_text='Note text to add to this call')
+
+
+# ──────────────────────────────────────────────────────────────
+# Call outcome (disposition)
+# ──────────────────────────────────────────────────────────────
+
+from telephony.services.analytics_service import OUTCOME_CHOICES
+
+
+class CallOutcomeSerializer(serializers.Serializer):
+    """PATCH body for /api/telephony/calls/<pk>/outcome/"""
+    outcome = serializers.ChoiceField(choices=OUTCOME_CHOICES, help_text='Call disposition outcome')
+    note = serializers.CharField(required=False, allow_blank=True, default='', help_text='Optional note about the outcome')
+
+
+# ──────────────────────────────────────────────────────────────
+# Campaigns (auto-dialer)
+# ──────────────────────────────────────────────────────────────
+
+class TeleCMICampaignSerializer(serializers.ModelSerializer):
+    """CRUD serializer for auto-dialer campaigns."""
+
+    # Read: nested {id, name, color_hex} (matches the LeadGroupMinimal shape
+    # used on Lead responses). Write: source_group_id (tenant-scoped PK).
+    source_group = LeadGroupMinimalSerializer(read_only=True)
+    source_group_id = serializers.PrimaryKeyRelatedField(
+        source='source_group',
+        queryset=LeadGroup.objects.all(),
+        required=False,
+        allow_null=True,
+        write_only=True,
+        help_text='CRM LeadGroup ID this campaign is seeded from',
+    )
+
+    class Meta:
+        model = TeleCMICampaign
+        fields = [
+            'id', 'tenant_id', 'telecmi_campaign_id', 'name', 'is_active',
+            'timezone', 'start_date', 'end_date', 'start_time', 'end_time',
+            'call_interval', 'ring_rule', 'agent_user_ids',
+            'source_group', 'source_group_id',
+            'lead_count', 'leads_called', 'telecmi_lead_list_name', 'notes',
+            'created_by_id', 'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'tenant_id', 'telecmi_campaign_id', 'lead_count',
+            'leads_called', 'telecmi_lead_list_name', 'created_by_id',
+            'created_at', 'updated_at',
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Scope the writable source_group_id choices to the caller's tenant so a
+        # campaign can only be seeded from a group it owns.
+        request = self.context.get('request')
+        tenant_id = getattr(request, 'tenant_id', None) if request else None
+        if tenant_id is not None and 'source_group_id' in self.fields:
+            self.fields['source_group_id'].queryset = LeadGroup.objects.filter(
+                tenant_id=tenant_id
+            )
+
+
+class CampaignLeadPushSerializer(serializers.Serializer):
+    """POST body for /api/telephony/campaigns/<pk>/push-leads/"""
+    lead_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        allow_empty=False,
+        help_text='CRM Lead IDs to push into this campaign',
+    )
+
+
+class CampaignGroupPushSerializer(serializers.Serializer):
+    """POST body for /api/telephony/campaigns/<pk>/push-group/"""
+    group_id = serializers.IntegerField(
+        help_text='CRM LeadGroup ID whose members seed this campaign',
+    )

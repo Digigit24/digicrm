@@ -12,7 +12,9 @@ import logging
 import hmac
 import hashlib
 import json
+from datetime import timedelta
 
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import viewsets, status
@@ -27,19 +29,32 @@ from common.mixins import TenantViewSetMixin
 from common.permissions import HasDigiPermission, is_admin_request
 from telephony.models import (
     TeleCMICredential, TeleCMIAgent, CallLog, SMSLog,
-    CallDirectionEnum, SMSStatusEnum,
+    TeleCMICampaign, CallDirectionEnum, SMSStatusEnum,
 )
 from telephony.serializers import (
     TeleCMICredentialSerializer, TeleCMIAgentSerializer,
     CallLogSerializer, SMSLogSerializer,
     ClickToCallSerializer, HangupSerializer, SMSSendSerializer,
     CallerIDUpdateSerializer, CDRSyncSerializer, AddNoteSerializer,
+    CallOutcomeSerializer, TeleCMICampaignSerializer,
+    CampaignLeadPushSerializer, CampaignGroupPushSerializer,
 )
 from telephony.services import telecmi_client as client
 from telephony.services.token_service import (
     get_agent_token, invalidate_token, get_tenant_credential, TokenServiceError,
 )
-from telephony.services.call_log_service import process_cdr_record, sync_cdr_for_agent
+from telephony.services.call_log_service import (
+    process_cdr_record, sync_cdr_for_agent, set_call_outcome,
+)
+from telephony.services.analytics_service import (
+    get_agent_summary, get_team_summary, get_missed_unattended,
+    get_outcome_breakdown, get_agent_daily_stats,
+)
+from telephony.services.campaign_service import (
+    create_campaign_in_telecmi, sync_campaign_to_telecmi,
+    delete_campaign_in_telecmi, push_leads_to_campaign_sync,
+    push_group_to_campaign_sync,
+)
 from telephony.services.callback_service import create_callback_task_if_needed
 from telephony.services.realtime import publish_live_event
 
@@ -293,6 +308,155 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
 # ──────────────────────────────────────────────────────────────
 # SMS
 # ──────────────────────────────────────────────────────────────
+
+class CallOutcomeView(APIView):
+    """Set the disposition and optional note for a call."""
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
+
+    def patch(self, request, pk):
+        serializer = CallOutcomeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            call_log = set_call_outcome(
+                pk,
+                _tenant_id(request),
+                data['outcome'],
+                data.get('note', ''),
+                _user_id(request),
+            )
+        except CallLog.DoesNotExist:
+            return Response(
+                {'detail': 'Call log not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(CallLogSerializer(call_log).data)
+
+
+def _days_query_param(request, default):
+    try:
+        return max(1, int(request.query_params.get('days', default)))
+    except (TypeError, ValueError):
+        return default
+
+
+class AnalyticsDashboardView(APIView):
+    """Return team and per-agent analytics for the requested date window."""
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'analytics'
+
+    def get(self, request):
+        days = _days_query_param(request, 30)
+        date_to = timezone.localdate()
+        date_from = date_to - timedelta(days=days - 1)
+        tenant_id = _tenant_id(request)
+        return Response({
+            'date_from': date_from,
+            'date_to': date_to,
+            'team_summary': get_team_summary(tenant_id, date_from, date_to),
+            'agent_summary': get_agent_summary(tenant_id, date_from, date_to),
+            'missed_unattended': get_missed_unattended(tenant_id),
+            'outcome_breakdown': get_outcome_breakdown(
+                tenant_id, date_from, date_to,
+            ),
+        })
+
+
+class AgentDailyStatsView(APIView):
+    """Return daily stats, restricted to the current agent for non-admins."""
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'analytics'
+
+    def get(self, request):
+        days = _days_query_param(request, 7)
+        date_to = timezone.localdate()
+        date_from = date_to - timedelta(days=days - 1)
+        agent_user_id = None if is_admin_request(request) else _user_id(request)
+        return Response({
+            'date_from': date_from,
+            'date_to': date_to,
+            'results': get_agent_daily_stats(
+                _tenant_id(request),
+                date_from,
+                date_to,
+                agent_user_id=agent_user_id,
+            ),
+        })
+
+
+class CampaignViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+    """Manage tenant campaigns and synchronize them with TeleCMI."""
+    queryset = TeleCMICampaign.objects.all()
+    serializer_class = TeleCMICampaignSerializer
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'campaigns'
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    def perform_create(self, serializer):
+        campaign = serializer.save(
+            tenant_id=_tenant_id(self.request),
+            created_by_id=_user_id(self.request),
+        )
+        create_campaign_in_telecmi(_tenant_id(self.request), campaign)
+
+    def perform_update(self, serializer):
+        campaign = serializer.save()
+        sync_campaign_to_telecmi(_tenant_id(self.request), campaign)
+
+    def perform_destroy(self, instance):
+        delete_campaign_in_telecmi(_tenant_id(self.request), instance)
+        instance.delete()
+
+    @action(detail=True, methods=['post'], url_path='push-leads')
+    def push_leads(self, request, pk=None):
+        serializer = CampaignLeadPushSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        result = push_leads_to_campaign_sync(
+            _tenant_id(request),
+            serializer.validated_data['lead_ids'],
+            self.get_object(),
+        )
+        return Response(result)
+
+    @action(detail=True, methods=['post'], url_path='push-group')
+    def push_group(self, request, pk=None):
+        """Seed this campaign from a CRM lead group's current members."""
+        from crm.models import LeadGroup
+
+        serializer = CampaignGroupPushSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tenant_id = _tenant_id(request)
+        group_id = serializer.validated_data['group_id']
+
+        if not LeadGroup.objects.filter(tenant_id=tenant_id, id=group_id).exists():
+            return Response(
+                {'detail': 'Lead group not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        campaign = self.get_object()
+        campaign.source_group_id = group_id
+        campaign.save(update_fields=['source_group', 'updated_at'])
+
+        result = push_group_to_campaign_sync(tenant_id, group_id, campaign)
+        return Response(result)
+
+    @action(detail=True, methods=['post'], url_path='toggle-active')
+    def toggle_active(self, request, pk=None):
+        campaign = self.get_object()
+        campaign.is_active = not campaign.is_active
+        campaign.save(update_fields=['is_active', 'updated_at'])
+        sync_campaign_to_telecmi(_tenant_id(request), campaign)
+        return Response(self.get_serializer(campaign).data)
 
 class SMSSendView(APIView):
     """

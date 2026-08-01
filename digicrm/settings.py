@@ -36,6 +36,7 @@ INSTALLED_APPS = [
     # Local apps - order matters for migrations
     'common',
     'crm',
+    'real_estate',
     'meetings',
     'payments',
     'tasks',

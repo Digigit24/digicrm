@@ -34,6 +34,7 @@ urlpatterns = [
 
     # App URLs
     path('api/crm/', include('crm.urls')),
+    path('api/real-estate/', include('real_estate.urls')),
     path('api/ai/', include('ai.urls')),
     path('api/meetings/', include('meetings.urls')),
     path('api/payments/', include('payments.urls')),

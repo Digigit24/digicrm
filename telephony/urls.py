@@ -11,6 +11,7 @@ Authenticated endpoints:
   GET        /api/telephony/calls/<id>/               CDR detail
   POST       /api/telephony/calls/sync/               Manual CDR sync
   POST       /api/telephony/calls/add-note/           Add note to a call
+  PATCH      /api/telephony/calls/<pk>/outcome/       Set call disposition
   POST       /api/telephony/sms/send/                 Send SMS
   GET        /api/telephony/sms/                      SMS log list
   GET        /api/telephony/caller-ids/               List caller IDs
@@ -18,6 +19,12 @@ Authenticated endpoints:
   GET        /api/telephony/break/                    Get break records
   GET        /api/telephony/callbacks/                List callbacks from TeleCMI
   GET        /api/telephony/webrtc-config/            PIOPIY SDK config for browser
+  GET        /api/telephony/analytics/                Admin analytics dashboard
+  GET        /api/telephony/analytics/daily/          Per-agent per-day stats
+  GET/POST   /api/telephony/campaigns/                Campaign list/create
+  PATCH/DEL  /api/telephony/campaigns/<pk>/           Campaign detail/update/delete
+  POST       /api/telephony/campaigns/<pk>/push-leads/ Push leads to campaign
+  POST       /api/telephony/campaigns/<pk>/toggle-active/ Toggle campaign active state
 
 Public webhook endpoints (configure in TeleCMI dashboard):
   POST       /api/telephony/webhook/cdr/?tenant_id=<uuid>    CDR (post-call)
@@ -33,6 +40,7 @@ router.register(r'credentials', views.TeleCMICredentialViewSet, basename='teleph
 router.register(r'agents', views.TeleCMIAgentViewSet, basename='telephony-agent')
 router.register(r'calls', views.CallLogViewSet, basename='telephony-call')
 router.register(r'sms', views.SMSLogViewSet, basename='telephony-sms')
+router.register(r'campaigns', views.CampaignViewSet, basename='telephony-campaign')
 
 app_name = 'telephony'
 
@@ -45,6 +53,9 @@ urlpatterns = [
     path('calls/hangup/', views.HangupView.as_view(), name='hangup'),
     path('calls/add-note/', views.AddNoteView.as_view(), name='add-note'),
 
+    # Call outcome (disposition)
+    path('calls/<int:pk>/outcome/', views.CallOutcomeView.as_view(), name='call-outcome'),
+
     # SMS
     path('sms/send/', views.SMSSendView.as_view(), name='sms-send'),
 
@@ -53,6 +64,10 @@ urlpatterns = [
     path('break/', views.BreakView.as_view(), name='break'),
     path('callbacks/', views.CallbackListView.as_view(), name='callbacks'),
     path('webrtc-config/', views.WebRTCConfigView.as_view(), name='webrtc-config'),
+
+    # Analytics
+    path('analytics/', views.AnalyticsDashboardView.as_view(), name='analytics-dashboard'),
+    path('analytics/daily/', views.AgentDailyStatsView.as_view(), name='analytics-daily'),
 
     # Public webhooks
     path('webhook/cdr/', views.CDRWebhookView.as_view(), name='webhook-cdr'),

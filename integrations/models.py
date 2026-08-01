@@ -10,6 +10,8 @@ from django.db import models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 import json
+import secrets
+import uuid
 
 
 class IntegrationTypeEnum(models.TextChoices):
@@ -17,6 +19,7 @@ class IntegrationTypeEnum(models.TextChoices):
     GOOGLE_SHEETS = 'GOOGLE_SHEETS', 'Google Sheets'
     WEBHOOK = 'WEBHOOK', 'Webhook'
     ZAPIER = 'ZAPIER', 'Zapier'
+    MAKE = 'MAKE', 'Make.com'
     API = 'API', 'Generic API'
     EMAIL = 'EMAIL', 'Email'
     TELECMI = 'TELECMI', 'TeleCMI Telephony'
@@ -109,6 +112,20 @@ class Connection(models.Model):
     Each user can have multiple connections to the same integration type.
     """
     id = models.BigAutoField(primary_key=True)
+    public_id = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        db_index=True,
+        help_text=(
+            'Stable, non-sequential identifier safe to expose in public inbound '
+            'webhook URLs (unlike the auto-increment id). Used by push-based '
+            'integrations — Make.com, Zapier, generic webhooks — where the '
+            'external service POSTs to us instead of us polling it. The actual '
+            'auth is the inbound key (see access_token_encrypted / '
+            'generate_inbound_key); public_id alone does not grant access.'
+        )
+    )
     tenant_id = models.UUIDField(db_index=True, help_text='Tenant ID for multi-tenancy')
     user_id = models.UUIDField(db_index=True, help_text='User who owns this connection')
 
@@ -198,6 +215,47 @@ class Connection(models.Model):
         self.last_error = error_message
         self.last_error_at = timezone.now()
         self.save(update_fields=['status', 'last_error', 'last_error_at', 'updated_at'])
+
+    # ── Inbound (push-based) webhook auth ──────────────────────────────
+    # For provider-initiated integrations (Make.com, Zapier, generic webhooks)
+    # the external service pushes data to us, so there's no OAuth handshake —
+    # instead we hand the tenant a per-connection secret key that must be sent
+    # back on every inbound POST. We reuse access_token_encrypted as the
+    # storage slot (same encrypted-secret shape as an OAuth token) rather than
+    # adding a parallel field.
+
+    def generate_inbound_key(self) -> str:
+        """
+        Generate a new inbound webhook key, store it encrypted, and mark the
+        connection CONNECTED. Returns the PLAINTEXT key — this is the only
+        time it is ever available in plaintext; only the encrypted form is
+        persisted. Callers (the rotate_inbound_key API action) must return
+        this value to the caller and never log it.
+        """
+        from integrations.utils.encryption import encrypt_token
+        raw_key = secrets.token_urlsafe(32)
+        self.access_token_encrypted = encrypt_token(raw_key)
+        self.status = ConnectionStatusEnum.CONNECTED
+        self.connected_at = timezone.now()
+        self.save(update_fields=['access_token_encrypted', 'status', 'connected_at', 'updated_at'])
+        return raw_key
+
+    def verify_inbound_key(self, provided_key: str) -> bool:
+        """Constant-time comparison of a provided key against the stored one."""
+        from integrations.utils.encryption import decrypt_token, EncryptionError
+        import hmac
+        if not self.access_token_encrypted or not provided_key:
+            return False
+        try:
+            stored = decrypt_token(self.access_token_encrypted)
+        except EncryptionError:
+            return False
+        return hmac.compare_digest(stored, provided_key)
+
+    @property
+    def inbound_webhook_path(self) -> str:
+        """Relative URL path Make/Zapier/etc. should POST leads to."""
+        return f'/api/integrations/webhook/inbound/{self.public_id}/'
 
 
 class Workflow(models.Model):

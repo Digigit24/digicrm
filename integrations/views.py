@@ -13,17 +13,20 @@ Provides REST API endpoints for:
 import logging
 import uuid
 from django.utils import timezone
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from django.db.models import Q
 from rest_framework import serializers, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from django.core.cache import cache
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiTypes
 
 from integrations.models import (
     Integration, Connection, Workflow, WorkflowTrigger,
     WorkflowAction, WorkflowMapping, ExecutionLog,
-    ConnectionStatusEnum, IntegrationTypeEnum
+    ConnectionStatusEnum, IntegrationTypeEnum, TriggerTypeEnum
 )
 from integrations.serializers import (
     IntegrationSerializer, ConnectionListSerializer, ConnectionDetailSerializer,
@@ -390,6 +393,81 @@ class ConnectionViewSet(viewsets.ModelViewSet):
                 {"error": f"Internal error: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+    @action(detail=False, methods=['post'])
+    def create_webhook_connection(self, request):
+        """
+        Create (or return the existing) push-based connection for this tenant —
+        Make.com, Zapier, or a generic webhook. Unlike Google Sheets, there is
+        no OAuth handshake: we generate a secret key the tenant configures on
+        their side (in the Make/Zapier scenario's HTTP module) and hand back
+        the inbound webhook URL once.
+
+        POST /api/integrations/connections/create_webhook_connection/
+        { "provider": "MAKE" | "ZAPIER" | "WEBHOOK", "name": "Meta Lead Ads (Make)" }
+
+        Returns the connection plus the PLAINTEXT inbound key — shown only
+        this once. If the key is lost, call rotate_inbound_key to issue a new
+        one (this invalidates the old one).
+        """
+        provider = (request.data.get('provider') or 'WEBHOOK').upper()
+        if provider not in (IntegrationTypeEnum.MAKE, IntegrationTypeEnum.ZAPIER, IntegrationTypeEnum.WEBHOOK):
+            return Response(
+                {"error": "provider must be one of MAKE, ZAPIER, WEBHOOK"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        integration, _ = Integration.objects.get_or_create(
+            type=provider,
+            defaults={
+                'name': dict(IntegrationTypeEnum.choices).get(provider, provider),
+                'description': f'Inbound push webhook — {provider.title()} POSTs lead data to this CRM.',
+                'requires_oauth': False,
+                'is_active': True,
+            }
+        )
+
+        connection = Connection.objects.filter(
+            tenant_id=request.tenant_id,
+            integration=integration,
+        ).first()
+
+        if connection is None:
+            connection = Connection.objects.create(
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                integration=integration,
+                name=request.data.get('name') or f'{integration.name} inbound webhook',
+                status=ConnectionStatusEnum.DISCONNECTED,
+            )
+
+        raw_key = connection.generate_inbound_key()
+
+        return Response({
+            'connection': ConnectionDetailSerializer(connection).data,
+            'webhook_url': request.build_absolute_uri(connection.inbound_webhook_path),
+            'webhook_key': raw_key,
+            'header_name': 'X-Webhook-Key',
+            'warning': 'This key is shown only once. Store it in your Make/Zapier scenario now — '
+                       'if lost, call rotate_inbound_key to issue a new one (invalidates this one).',
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def rotate_inbound_key(self, request, pk=None):
+        """
+        Issue a new inbound webhook key for this connection, invalidating the
+        old one. Use when a key may have leaked, or the tenant lost it.
+
+        POST /api/integrations/connections/:id/rotate_inbound_key/
+        """
+        connection = self.get_object()
+        raw_key = connection.generate_inbound_key()
+        return Response({
+            'webhook_url': request.build_absolute_uri(connection.inbound_webhook_path),
+            'webhook_key': raw_key,
+            'header_name': 'X-Webhook-Key',
+            'warning': 'This key is shown only once and replaces the previous key immediately.',
+        })
 
     @action(detail=True, methods=['post'])
     def disconnect(self, request, pk=None):
@@ -1273,3 +1351,79 @@ class ExecutionLogViewSet(viewsets.ReadOnlyModelViewSet):
         if self.action == 'retrieve':
             return ExecutionLogSerializer
         return ExecutionLogListSerializer
+
+
+# ──────────────────────────────────────────────────────────────
+# Public inbound webhook (push-based integrations: Make, Zapier, generic)
+# ──────────────────────────────────────────────────────────────
+
+@method_decorator(csrf_exempt, name='dispatch')
+class InboundWebhookView(APIView):
+    """
+    POST /api/integrations/webhook/inbound/<uuid:public_id>/
+
+    Receives lead data pushed FROM an external automation tool (a Make.com
+    scenario, a Zapier zap, or any generic webhook sender) instead of us
+    polling it — the counterpart to the Google Sheets NEW_ROW polling trigger.
+
+    Auth: the request must include the connection's inbound key, either as
+    header `X-Webhook-Key: <key>` or query param `?key=<key>`. The key is
+    issued once via ConnectionViewSet.create_webhook_connection /
+    rotate_inbound_key and is never retrievable again — only re-issuable.
+
+    The connection's public_id (not its database id) identifies which tenant
+    and which Workflow(s) to run: any active, non-deleted Workflow attached
+    to this connection with trigger_type=WEBHOOK_RECEIVED is executed with
+    the POSTed JSON body as trigger_data, through the exact same
+    WorkflowEngine.execute_workflow() path used by the "Test workflow" button
+    — so the same field mappings, duplicate detection, and execution logging
+    apply regardless of whether the data came from a poll or a push.
+    """
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request, public_id):
+        try:
+            connection = Connection.objects.select_related('integration').get(public_id=public_id)
+        except (Connection.DoesNotExist, ValueError):
+            # ValueError: malformed UUID in the URL — treat the same as unknown.
+            return Response({'error': 'Unknown webhook'}, status=status.HTTP_404_NOT_FOUND)
+
+        provided_key = request.headers.get('X-Webhook-Key') or request.query_params.get('key')
+        if not connection.verify_inbound_key(provided_key):
+            logger.warning('Inbound webhook auth failed for connection public_id=%s', public_id)
+            return Response({'error': 'Invalid or missing webhook key'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        if connection.status != ConnectionStatusEnum.CONNECTED:
+            return Response({'error': 'This connection is not active'}, status=status.HTTP_403_FORBIDDEN)
+
+        workflows = Workflow.objects.filter(
+            connection=connection,
+            is_active=True,
+            is_deleted=False,
+            trigger__trigger_type=TriggerTypeEnum.WEBHOOK_RECEIVED,
+        )
+
+        if not workflows.exists():
+            return Response(
+                {'error': 'No active webhook workflow is configured for this connection yet'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payload = request.data
+        total_executions = 0
+        for workflow in workflows:
+            try:
+                engine = WorkflowEngine(workflow)
+                logs = engine.execute_workflow([payload])
+                total_executions += len(logs)
+            except WorkflowEngineError as e:
+                logger.error('Inbound webhook workflow %s failed: %s', workflow.id, e)
+                # Keep processing other workflows attached to this connection;
+                # the failure itself is already recorded as an ExecutionLog.
+                continue
+
+        connection.last_used_at = timezone.now()
+        connection.save(update_fields=['last_used_at'])
+
+        return Response({'status': 'ok', 'executions': total_executions})

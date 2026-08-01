@@ -19,6 +19,23 @@ logger = logging.getLogger(__name__)
 MS_PER_SECOND = 1000
 
 
+def set_call_outcome(call_log_id, tenant_id, outcome, note, user_id):
+    """Set an agent disposition on a tenant-scoped call log."""
+    from telephony.models import CallLog
+
+    call_log = CallLog.objects.get(id=call_log_id, tenant_id=tenant_id)
+    call_log.call_outcome = outcome
+    call_log.call_outcome_note = note
+    call_log.call_outcome_set_at = timezone.now()
+    call_log.save(update_fields=[
+        'call_outcome',
+        'call_outcome_note',
+        'call_outcome_set_at',
+        'updated_at',
+    ])
+    return call_log
+
+
 def process_cdr_record(tenant_id, raw_cdr: dict, direction: str, synced_via: str = 'webhook') -> 'CallLog':
     """
     Create or update a CallLog from a single TeleCMI CDR dict.

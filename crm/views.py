@@ -261,6 +261,41 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
 
         serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
 
+    @action(detail=False, methods=['get'], url_path='lookup-by-phone')
+    def lookup_by_phone(self, request):
+        """Resolve a single lead from a phone number for softphone matching.
+
+        Matches on the last 10 significant digits (mirrors the CDR pipeline's
+        `_find_lead_id`), so `+91XXXXXXXXXX`, `0XXXXXXXXXX`, and bare 10-digit
+        forms all resolve to the same lead. Tenant + view-scope are enforced
+        via the standard queryset. Returns a compact payload or null.
+        """
+        raw = request.query_params.get('phone', '') or ''
+        digits = ''.join(ch for ch in raw if ch.isdigit())
+        if len(digits) < 6:
+            return Response(None)
+
+        last10 = digits[-10:]
+        qs = self.get_queryset()
+        lead = (
+            qs.filter(phone__endswith=last10).first()
+            or qs.filter(phone__endswith=digits).first()
+        )
+        if not lead:
+            return Response(None)
+
+        lead_status = lead.status
+        return Response({
+            'id': lead.id,
+            'name': lead.name,
+            'phone': lead.phone,
+            'status': {
+                'id': lead_status.id,
+                'name': lead_status.name,
+                'color_hex': lead_status.color_hex,
+            } if lead_status else None,
+        })
+
     @action(detail=True, methods=['post'], url_path='append-note')
     def append_note(self, request, pk=None):
         """Atomically append a timestamped block to Lead.notes (no clobber).
