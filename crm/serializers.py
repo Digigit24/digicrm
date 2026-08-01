@@ -253,7 +253,7 @@ class LeadListSerializer(TenantMixin):
         fields = [
             'id', 'name', 'phone', 'email', 'company', 'status',
             'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
-            'owner_user_id', 'assigned_to', 'metadata', 'next_follow_up_at',
+            'owner_user_id', 'assigned_to', 'metadata', 'notes', 'next_follow_up_at',
             'groups', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -271,6 +271,7 @@ class LeadListSerializer(TenantMixin):
             'owner_user_id': {'help_text': 'UUID of the lead owner.'},
             'assigned_to': {'help_text': 'Optional UUID of the user currently assigned to work this lead.'},
             'metadata': {'help_text': 'Optional JSON object for source-specific details, including external IDs and attribution data.'},
+            'notes': {'help_text': 'Free-form notes about the lead. Editable inline from the leads table, so it must be present in list responses.'},
             'next_follow_up_at': {'help_text': 'Planned next follow-up timestamp in ISO 8601 date-time format, or null if none is scheduled.'},
             'created_at': {'help_text': 'Timestamp when this lead was created, in ISO 8601 date-time format. Read-only.'},
             'updated_at': {'help_text': 'Timestamp when this lead was last updated, in ISO 8601 date-time format. Read-only.'},
