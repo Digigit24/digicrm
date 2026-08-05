@@ -10,7 +10,10 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from crm.models import Lead, LeadStatus, LeadActivity, LeadGroup, LeadGroupMembership
+from crm.models import (
+    Lead, LeadStatus, LeadActivity, LeadFieldConfiguration,
+    LeadGroup, LeadGroupMembership,
+)
 from common.generated_permissions import CRMPermissions
 
 
@@ -35,6 +38,73 @@ def _make_token(user_id, tenant_id=TENANT_A, permissions=None):
         'exp': datetime.now(timezone.utc).replace(hour=23, minute=59),
     }
     return pyjwt.encode(payload, TEST_JWT_SECRET, algorithm=TEST_JWT_ALGO)
+
+
+class LeadFieldLayoutTest(APITestCase):
+    def setUp(self):
+        self.first = LeadFieldConfiguration.objects.create(
+            tenant_id=TENANT_A,
+            field_name='name',
+            field_label='Name',
+            is_standard=True,
+            is_visible=True,
+            display_order=10,
+        )
+        self.second = LeadFieldConfiguration.objects.create(
+            tenant_id=TENANT_A,
+            field_name='phone',
+            field_label='Phone',
+            is_standard=True,
+            is_visible=True,
+            display_order=20,
+        )
+        self.third = LeadFieldConfiguration.objects.create(
+            tenant_id=TENANT_A,
+            field_name='industry',
+            field_label='Industry',
+            field_type='TEXT',
+            is_visible=True,
+            display_order=30,
+        )
+        token = _make_token(
+            USER_A,
+            permissions={'crm': {'settings': {'view': True, 'edit': True}}},
+        )
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
+
+    def test_layout_atomically_updates_order_and_visibility(self):
+        response = self.client.patch(
+            reverse('leadfieldconfiguration-layout'),
+            {
+                'fields': [
+                    {'id': self.third.id, 'is_visible': False},
+                    {'id': self.first.id, 'is_visible': True},
+                    {'id': self.second.id, 'is_visible': False},
+                ]
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([item['id'] for item in response.data], [self.third.id, self.first.id, self.second.id])
+        self.third.refresh_from_db()
+        self.second.refresh_from_db()
+        self.assertEqual(self.third.display_order, 1)
+        self.assertFalse(self.third.is_visible)
+        self.assertEqual(self.second.display_order, 3)
+        self.assertFalse(self.second.is_visible)
+
+    def test_layout_rejects_incomplete_payload_without_changes(self):
+        response = self.client.patch(
+            reverse('leadfieldconfiguration-layout'),
+            {'fields': [{'id': self.second.id, 'is_visible': False}]},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.second.refresh_from_db()
+        self.assertEqual(self.second.display_order, 20)
+        self.assertTrue(self.second.is_visible)
 
 
 class LeadActivityObjectPermissionTest(APITestCase):

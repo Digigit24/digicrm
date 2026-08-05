@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'meetings',
     'payments',
     'tasks',
+    'notifications',
     'integrations',
     'telephony',
     'whatsapp_integration',   # DigiCRM WhatsApp adapter app
@@ -431,6 +432,21 @@ FRONTEND_OAUTH_CALLBACK_URL = config('FRONTEND_OAUTH_CALLBACK_URL', default=f"{c
 # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)
 
+# TeleCMI master key (KEK) — wraps each tenant's own data key.
+#
+# TeleCMI credentials use envelope encryption (telephony/services/crypto.py):
+# every tenant gets its own Fernet key, generated server-side and stored on the
+# credential row in encrypted form. THIS value is the single key that wraps all
+# of them. It is one constant per database, not one per tenant.
+#
+# Every deployment that talks to the same database MUST set the same value.
+# Leaving it unset falls back to SECRET_KEY, which is what caused secrets saved
+# on one environment to be unreadable on another.
+#
+# Generate once with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+TELECMI_MASTER_KEY = config('TELECMI_MASTER_KEY', default=None)
+
 # ===========================
 # PUSHER (real-time telephony live events)
 # ===========================
@@ -496,4 +512,12 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': 300.0,  # Every 5 minutes
         'kwargs': {'hours_back': 1},
     },
+    'dispatch-due-reminders': {
+        'task': 'notifications.tasks.dispatch_due_reminders',
+        'schedule': 30.0,
+    },
 }
+
+# Due reminders older than this are marked missed instead of surfacing as stale alerts.
+REMINDER_DELIVERY_GRACE_HOURS = config('REMINDER_DELIVERY_GRACE_HOURS', default=24, cast=int)
+REMINDER_MAX_ATTEMPTS = config('REMINDER_MAX_ATTEMPTS', default=5, cast=int)

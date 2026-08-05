@@ -41,6 +41,15 @@ class TeleCMICredential(models.Model):
     tenant_id = models.UUIDField(unique=True, db_index=True)
     app_id = models.CharField(max_length=100, help_text='TeleCMI App ID (appid)')
     secret_encrypted = models.TextField(help_text='Encrypted TeleCMI app secret')
+    dek_wrapped = models.TextField(
+        blank=True,
+        default='',
+        help_text=(
+            "This tenant's data-encryption key, itself encrypted with "
+            'TELECMI_MASTER_KEY. Empty means the row still uses the legacy '
+            'shared key derived from SECRET_KEY.'
+        ),
+    )
     sbc_region = models.CharField(
         max_length=10,
         choices=SBCRegionEnum.choices,

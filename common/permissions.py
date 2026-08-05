@@ -311,7 +311,7 @@ def get_queryset_for_permission(queryset, request, view_permission_key, owner_fi
         return queryset.none()
 
     permissions = request.permissions
-    permission_value = permissions.get(view_permission_key)
+    permission_value = get_permission_value(permissions, view_permission_key)
 
     # Always filter by tenant_id first
     base_queryset = queryset.filter(tenant_id=request.tenant_id)

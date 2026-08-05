@@ -5,6 +5,40 @@ from .models import (
     LeadGroup, LeadGroupMembership
 )
 from common.mixins import TenantMixin
+from notifications.models import Reminder, ReminderStatus
+from notifications.serializers import ReminderSerializer
+
+
+class FollowUpReminderInputSerializer(serializers.Serializer):
+    enabled = serializers.BooleanField()
+    offset_minutes = serializers.IntegerField(min_value=0, max_value=525600, default=0)
+    remind_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class LeadFollowUpScheduleSerializer(serializers.Serializer):
+    follow_up_at = serializers.DateTimeField(allow_null=True)
+    reminder = FollowUpReminderInputSerializer()
+
+    def validate(self, attrs):
+        follow_up_at = attrs.get('follow_up_at')
+        reminder = attrs.get('reminder') or {}
+        if reminder.get('enabled') and follow_up_at is None:
+            raise serializers.ValidationError({
+                'reminder': 'Choose a follow-up date before enabling a reminder.'
+            })
+        return attrs
+
+
+class LeadReminderRepresentationMixin:
+    def get_follow_up_reminder(self, obj):
+        reminders = getattr(obj, '_active_follow_up_reminders', None)
+        if reminders is None:
+            reminders = Reminder.objects.filter(
+                lead=obj,
+                status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+            ).order_by('-updated_at')[:1]
+        reminder = next(iter(reminders), None)
+        return ReminderSerializer(reminder).data if reminder else None
 
 
 class LeadGroupSerializer(TenantMixin):
@@ -147,7 +181,7 @@ class LeadOrderSerializer(TenantMixin):
         }
 
 
-class LeadSerializer(TenantMixin):
+class LeadSerializer(LeadReminderRepresentationMixin, TenantMixin):
     """
     Serialize complete CRM lead records.
 
@@ -177,6 +211,7 @@ class LeadSerializer(TenantMixin):
         write_only=True,
         help_text='List of group IDs to assign this lead to (write-only).'
     )
+    follow_up_reminder = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
@@ -184,7 +219,7 @@ class LeadSerializer(TenantMixin):
             'id', 'name', 'phone', 'email', 'company', 'title',
             'status', 'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
             'source', 'owner_user_id', 'assigned_to', 'metadata', 'last_contacted_at',
-            'next_follow_up_at', 'notes', 'address_line1', 'address_line2', 'city',
+            'next_follow_up_at', 'follow_up_reminder', 'notes', 'address_line1', 'address_line2', 'city',
             'state', 'country', 'postal_code', 'groups', 'group_ids',
             'created_at', 'updated_at', 'activities'
         ]
@@ -230,7 +265,7 @@ class LeadSerializer(TenantMixin):
         return value
 
 
-class LeadListSerializer(TenantMixin):
+class LeadListSerializer(LeadReminderRepresentationMixin, TenantMixin):
     """
     Serialize compact lead records for list, search, and board views.
 
@@ -247,13 +282,14 @@ class LeadListSerializer(TenantMixin):
         read_only=True,
         help_text='Groups this lead belongs to. Read-only.'
     )
+    follow_up_reminder = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
         fields = [
             'id', 'name', 'phone', 'email', 'company', 'status',
             'status_name', 'priority', 'lead_score', 'value_amount', 'value_currency',
-            'owner_user_id', 'assigned_to', 'metadata', 'notes', 'next_follow_up_at',
+            'owner_user_id', 'assigned_to', 'metadata', 'notes', 'next_follow_up_at', 'follow_up_reminder',
             'groups', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
@@ -406,6 +442,25 @@ class LeadFieldConfigurationSerializer(TenantMixin):
         representation['category'] = 'standard' if instance.is_standard else 'custom'
 
         return representation
+
+
+class LeadFieldLayoutItemSerializer(serializers.Serializer):
+    """One field in the tenant-wide lead column layout."""
+
+    id = serializers.IntegerField(min_value=1)
+    is_visible = serializers.BooleanField()
+
+
+class LeadFieldLayoutSerializer(serializers.Serializer):
+    """Ordered, complete field layout submitted by the settings screen."""
+
+    fields = LeadFieldLayoutItemSerializer(many=True, allow_empty=False)
+
+    def validate_fields(self, value):
+        field_ids = [item['id'] for item in value]
+        if len(field_ids) != len(set(field_ids)):
+            raise serializers.ValidationError('Each field may appear only once in the layout.')
+        return value
 
 
 class LeadAttachmentSerializer(serializers.ModelSerializer):

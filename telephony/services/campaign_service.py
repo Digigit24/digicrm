@@ -5,7 +5,7 @@ import logging
 from typing import List
 
 import requests
-from integrations.utils.encryption import decrypt_token
+from telephony.services.crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ def _agent_telecmi_ids(tenant_id: str, crm_user_ids: List[str]) -> List[str]:
 def create_campaign_in_telecmi(tenant_id: str, campaign) -> dict:
     """Create a campaign in TeleCMI and update campaign.telecmi_campaign_id."""
     cred = _get_credential(tenant_id)
-    secret = decrypt_token(cred.secret_encrypted)
+    secret = decrypt_secret(cred)
     telecmi_agent_ids = _agent_telecmi_ids(tenant_id, campaign.agent_user_ids)
 
     payload = {
@@ -69,7 +69,7 @@ def sync_campaign_to_telecmi(tenant_id: str, campaign) -> dict:
         return create_campaign_in_telecmi(tenant_id, campaign)
 
     cred = _get_credential(tenant_id)
-    secret = decrypt_token(cred.secret_encrypted)
+    secret = decrypt_secret(cred)
     telecmi_agent_ids = _agent_telecmi_ids(tenant_id, campaign.agent_user_ids)
 
     payload = {
@@ -99,7 +99,7 @@ def delete_campaign_in_telecmi(tenant_id: str, campaign) -> dict:
         return {}
 
     cred = _get_credential(tenant_id)
-    secret = decrypt_token(cred.secret_encrypted)
+    secret = decrypt_secret(cred)
 
     payload = {
         'campaign_id': campaign.telecmi_campaign_id,
@@ -121,7 +121,7 @@ def push_leads_to_campaign_sync(tenant_id: str, lead_ids: List[str], campaign) -
     from crm.models import Lead
 
     cred = _get_credential(tenant_id)
-    secret = decrypt_token(cred.secret_encrypted)
+    secret = decrypt_secret(cred)
 
     leads = Lead.objects.filter(tenant_id=tenant_id, id__in=lead_ids).only(
         'id', 'name', 'phone', 'email'

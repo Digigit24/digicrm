@@ -261,7 +261,8 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
         Uses tenant app_id + secret — never exposes credentials to frontend.
         """
         from django.http import StreamingHttpResponse
-        from integrations.utils.encryption import decrypt_token, EncryptionError
+        from integrations.utils.encryption import EncryptionError
+        from telephony.services.crypto import decrypt_secret
 
         call_log = self.get_object()
         if not call_log.recording_file:
@@ -276,16 +277,20 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
             return Response({'error': str(exc)}, status=status.HTTP_424_FAILED_DEPENDENCY)
 
         try:
-            secret = decrypt_token(credential.secret_encrypted)
+            secret = decrypt_secret(credential)
         except EncryptionError as exc:
             logger.error('Failed to decrypt TeleCMI secret for tenant %s: %s', _tenant_id(request), exc)
+            # 424, not 500: the server is healthy, the stored credential just
+            # can't be read with this environment's ENCRYPTION_KEY (typical on a
+            # local box pointed at a database seeded elsewhere). 500 makes this
+            # look like a crash and buries the actionable message.
             return Response(
                 {
                     'error': 'TeleCMI credentials cannot be decrypted. '
                              'The encryption key may have changed. '
                              'Go to Settings → TeleCMI, re-enter the App Secret, and save.'
                 },
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status=status.HTTP_424_FAILED_DEPENDENCY,
             )
 
         try:
@@ -294,14 +299,25 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
             http_status = status.HTTP_404_NOT_FOUND if exc.status_code == 404 else status.HTTP_502_BAD_GATEWAY
             return Response({'error': str(exc)}, status=http_status)
 
-        content_type = telecmi_resp.headers.get('Content-Type', 'audio/wav')
+        # stream_recording() has already rejected non-audio bodies, so anything
+        # reaching here is real audio. Still normalise the type: TeleCMI sends
+        # application/octet-stream for some files and browsers won't decode an
+        # octet-stream in <audio>, which is what makes a player sit at 0:00.
+        upstream_type = (telecmi_resp.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+        if not upstream_type.startswith('audio/'):
+            upstream_type = 'audio/mpeg' if str(call_log.recording_file).lower().endswith('.mp3') else 'audio/wav'
+
         streaming = StreamingHttpResponse(
             telecmi_resp.iter_content(chunk_size=8192),
-            content_type=content_type,
+            content_type=upstream_type,
         )
         streaming['Content-Disposition'] = f'inline; filename="{call_log.recording_file}"'
+        # Content-Length is what lets the browser compute a duration up front;
+        # without it the scrubber stays at 0:00 even while audio plays.
         if 'Content-Length' in telecmi_resp.headers:
             streaming['Content-Length'] = telecmi_resp.headers['Content-Length']
+        streaming['Accept-Ranges'] = 'none'
+        streaming['Cache-Control'] = 'private, max-age=300'
         return streaming
 
 

@@ -4,7 +4,9 @@ TeleCMI REST API Client — low-level HTTP adapter.
 One function per TeleCMI endpoint. No CRM business logic here.
 All functions raise TeleCMIError on non-200 responses or network failures.
 """
+import json
 import logging
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -279,6 +281,42 @@ def stream_recording(app_id: str, secret: str, filename: str):
             f'TeleCMI recording error {response.status_code}',
             status_code=response.status_code,
         )
+
+    # TeleCMI signals recording failures with HTTP 200 and a small JSON error
+    # body (the same "200 with code in the payload" convention _post() already
+    # handles). Without this check we happily stream ~48 bytes of JSON to the
+    # browser labelled as audio: the player mounts, shows 0:00 and never plays,
+    # and nothing anywhere reports an error because the status was 200.
+    content_type = (response.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+    is_audio = content_type.startswith('audio/') or content_type in (
+        'application/octet-stream',
+        'binary/octet-stream',
+        '',
+    )
+    if not is_audio:
+        body = response.text[:500]
+        response.close()
+        message = f'TeleCMI returned {content_type or "an unknown type"} instead of audio'
+        code = None
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            code = payload.get('code')
+            message = payload.get('msg') or payload.get('error') or message
+        logger.warning(
+            'TeleCMI /play returned non-audio content (%s) for file %s: %s',
+            content_type, filename, body,
+        )
+        raise TeleCMIError(message, status_code=code or 502, response_data=body)
+
+    # A zero-byte body is likewise unplayable — fail loudly rather than handing
+    # the browser an empty blob that renders as a 0:00 player.
+    if response.headers.get('Content-Length') == '0':
+        response.close()
+        raise TeleCMIError('TeleCMI returned an empty recording file', status_code=404)
+
     return response
 
 

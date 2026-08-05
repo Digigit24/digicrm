@@ -6,6 +6,7 @@ from telephony.models import (
 from crm.models import LeadGroup
 from crm.serializers import LeadGroupMinimalSerializer
 from integrations.utils.encryption import encrypt_token
+from telephony.services.crypto import encrypt_secret
 
 
 class TeleCMICredentialSerializer(TenantMixin):
@@ -35,7 +36,10 @@ class TeleCMICredentialSerializer(TenantMixin):
     def create(self, validated_data):
         secret = validated_data.pop('secret', None)
         if secret:
-            validated_data['secret_encrypted'] = encrypt_token(secret)
+            # Envelope encryption: mint a per-tenant key, store it wrapped.
+            encrypted, dek_wrapped = encrypt_secret(secret)
+            validated_data['secret_encrypted'] = encrypted
+            validated_data['dek_wrapped'] = dek_wrapped
         elif not validated_data.get('secret_encrypted'):
             raise serializers.ValidationError({'secret': 'Secret is required when creating credentials.'})
         return super().create(validated_data)
@@ -43,7 +47,12 @@ class TeleCMICredentialSerializer(TenantMixin):
     def update(self, instance, validated_data):
         secret = validated_data.pop('secret', None)
         if secret:
-            validated_data['secret_encrypted'] = encrypt_token(secret)
+            # Reuse this tenant's existing key when it has one; saving a secret
+            # from any environment therefore also repairs a row left unreadable
+            # by the old shared-key scheme.
+            encrypted, dek_wrapped = encrypt_secret(secret, instance.dek_wrapped)
+            validated_data['secret_encrypted'] = encrypted
+            validated_data['dek_wrapped'] = dek_wrapped
         return super().update(instance, validated_data)
 
 

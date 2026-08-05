@@ -39,6 +39,7 @@ urlpatterns = [
     path('api/meetings/', include('meetings.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/tasks/', include('tasks.urls')),
+    path('api/notifications/', include('notifications.urls')),
     path('api/integrations/', include('integrations.urls')),
     path('api/telephony/', include('telephony.urls')),
     path('api/whatsapp/', include('whatsapp_integration.urls')),  # WhatsApp adapter

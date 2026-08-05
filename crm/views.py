@@ -7,7 +7,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 import django_filters
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter, OpenApiExample
 from drf_spectacular.openapi import AutoSchema
-from django.db.models import Count, Q, Sum
+from django.db import transaction
+from django.db.models import Count, Prefetch, Q, Sum
+from datetime import timedelta
 from django.utils import timezone
 from django.http import HttpResponse, StreamingHttpResponse
 from .models import (
@@ -16,9 +18,9 @@ from .models import (
     LeadGroup, LeadGroupMembership
 )
 from .serializers import (
-    LeadSerializer, LeadListSerializer, LeadStatusSerializer,
+    LeadSerializer, LeadListSerializer, LeadStatusSerializer, LeadFollowUpScheduleSerializer,
     LeadActivitySerializer, LeadOrderSerializer,
-    LeadFieldConfigurationSerializer,
+    LeadFieldConfigurationSerializer, LeadFieldLayoutSerializer,
     BulkLeadDeleteSerializer, BulkLeadStatusUpdateSerializer,
     LeadAttachmentSerializer,
     LeadGroupSerializer, BulkLeadGroupMembershipSerializer
@@ -35,6 +37,8 @@ import csv
 import io
 import json
 import requests
+from notifications.models import Reminder, ReminderStatus
+from notifications.serializers import ReminderSerializer
 from datetime import datetime
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -209,12 +213,22 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
 
     Required permissions are based on crm.leads actions.
     """
-    queryset = Lead.objects.select_related('status').prefetch_related('activities', 'groups')
+    queryset = Lead.objects.select_related('status').prefetch_related(
+        'activities',
+        'groups',
+        Prefetch(
+            'reminders',
+            queryset=Reminder.objects.filter(
+                status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+            ).order_by('-updated_at'),
+            to_attr='_active_follow_up_reminders',
+        ),
+    )
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_resource = 'leads'
     # append-note is an edit of the lead's notes, not a create.
-    action_permission_map = {'append_note': 'edit'}
+    action_permission_map = {'append_note': 'edit', 'follow_up_schedule': 'edit'}
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_class = LeadFilter
     search_fields = ['name', 'phone', 'email', 'company', 'notes']
@@ -260,6 +274,135 @@ class LeadViewSet(CRMPermissionMixin, TenantViewSetMixin, viewsets.ModelViewSet)
             raise ValidationError({'owner_user_id': 'Owner user ID is required'})
 
         serializer.save(tenant_id=tenant_id, owner_user_id=owner_user_id)
+
+    def perform_update(self, serializer):
+        """Keep existing reminders aligned when older clients patch the lead directly."""
+        follow_up_was_supplied = 'next_follow_up_at' in serializer.validated_data
+        with transaction.atomic():
+            lead = serializer.save()
+            if not follow_up_was_supplied:
+                return
+
+            active = Reminder.objects.select_for_update().filter(
+                tenant_id=self.request.tenant_id,
+                lead=lead,
+                status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+            )
+            now = timezone.now()
+            if lead.next_follow_up_at is None:
+                active.update(
+                    status=ReminderStatus.CANCELLED,
+                    cancelled_at=now,
+                    locked_at=None,
+                )
+                return
+
+            for reminder in active:
+                next_remind_at = lead.next_follow_up_at - timedelta(minutes=reminder.offset_minutes)
+                if next_remind_at <= now:
+                    reminder.status = ReminderStatus.CANCELLED
+                    reminder.cancelled_at = now
+                    reminder.locked_at = None
+                    reminder.save(update_fields=['status', 'cancelled_at', 'locked_at', 'updated_at'])
+                else:
+                    reminder.follow_up_at = lead.next_follow_up_at
+                    reminder.remind_at = next_remind_at
+                    reminder.status = ReminderStatus.PENDING
+                    reminder.locked_at = None
+                    reminder.save(update_fields=[
+                        'follow_up_at', 'remind_at', 'status', 'locked_at', 'updated_at',
+                    ])
+
+    @extend_schema(
+        request=LeadFollowUpScheduleSerializer,
+        description='Read or atomically update a lead follow-up and its personal reminder.',
+    )
+    @action(detail=True, methods=['get', 'patch'], url_path='follow-up-schedule')
+    def follow_up_schedule(self, request, pk=None):
+        if request.method == 'GET':
+            lead = self.get_object()
+            reminders = getattr(lead, '_active_follow_up_reminders', [])
+            reminder = reminders[0] if reminders else None
+            return Response({
+                'lead': LeadSerializer(lead, context={'request': request}).data,
+                'reminder': ReminderSerializer(reminder).data if reminder else None,
+            })
+
+        payload = LeadFollowUpScheduleSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        follow_up_at = payload.validated_data['follow_up_at']
+        reminder_input = payload.validated_data['reminder']
+        reminder_enabled = reminder_input['enabled']
+        now = timezone.now()
+
+        remind_at = None
+        offset_minutes = reminder_input.get('offset_minutes', 0)
+        if reminder_enabled:
+            remind_at = reminder_input.get('remind_at') or (
+                follow_up_at - timedelta(minutes=offset_minutes)
+            )
+            if remind_at > follow_up_at:
+                raise ValidationError({'reminder': 'Reminder time cannot be after the follow-up.'})
+            if remind_at <= now:
+                raise ValidationError({'reminder': 'Reminder time must be in the future.'})
+
+        authorized_lead = self.get_object()
+        with transaction.atomic():
+            # Lock only the lead row. The normal queryset joins nullable status,
+            # which PostgreSQL correctly refuses to lock as an outer-join side.
+            lead = Lead.objects.select_for_update().get(
+                pk=authorized_lead.pk,
+                tenant_id=request.tenant_id,
+            )
+            lead.next_follow_up_at = follow_up_at
+            lead.save(update_fields=['next_follow_up_at', 'updated_at'])
+
+            active_reminders = Reminder.objects.select_for_update().filter(
+                tenant_id=request.tenant_id,
+                lead=lead,
+                recipient_user_id=request.user_id,
+                status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+            ).order_by('-updated_at')
+            reminder = active_reminders.first()
+
+            if reminder_enabled:
+                if reminder is None:
+                    reminder = Reminder.objects.create(
+                        tenant_id=request.tenant_id,
+                        lead=lead,
+                        recipient_user_id=request.user_id,
+                        created_by_user_id=request.user_id,
+                        follow_up_at=follow_up_at,
+                        remind_at=remind_at,
+                        offset_minutes=offset_minutes,
+                    )
+                else:
+                    reminder.follow_up_at = follow_up_at
+                    reminder.remind_at = remind_at
+                    reminder.offset_minutes = offset_minutes
+                    reminder.status = ReminderStatus.PENDING
+                    reminder.locked_at = None
+                    reminder.cancelled_at = None
+                    reminder.last_error = ''
+                    reminder.save(update_fields=[
+                        'follow_up_at', 'remind_at', 'offset_minutes', 'status',
+                        'locked_at', 'cancelled_at', 'last_error', 'updated_at',
+                    ])
+            else:
+                active_reminders.update(
+                    status=ReminderStatus.CANCELLED,
+                    cancelled_at=now,
+                    locked_at=None,
+                )
+                reminder = None
+
+        lead = self.get_queryset().get(pk=pk)
+        reminders = getattr(lead, '_active_follow_up_reminders', [])
+        active_reminder = reminders[0] if reminders else None
+        return Response({
+            'lead': LeadSerializer(lead, context={'request': request}).data,
+            'reminder': ReminderSerializer(active_reminder).data if active_reminder else None,
+        })
 
     @action(detail=False, methods=['get'], url_path='lookup-by-phone')
     def lookup_by_phone(self, request):
@@ -1478,6 +1621,52 @@ class LeadFieldConfigurationViewSet(CRMPermissionMixin, TenantViewSetMixin, view
             logger.error(f"Error in field configuration list: {str(e)}")
             # Fall back to normal list behavior even if auto-population fails
             return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        request=LeadFieldLayoutSerializer,
+        responses={200: LeadFieldConfigurationSerializer(many=True)},
+        description='Atomically save the complete field order and list visibility layout.'
+    )
+    @action(detail=False, methods=['patch'], url_path='layout')
+    def layout(self, request):
+        """
+        Save field order and visibility in one transaction.
+
+        The payload must contain every field for the tenant. Requiring a complete
+        layout prevents paginated or filtered settings views from accidentally
+        assigning duplicate positions or dropping fields from the order.
+        """
+        payload = LeadFieldLayoutSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        submitted_fields = payload.validated_data['fields']
+        submitted_ids = [item['id'] for item in submitted_fields]
+
+        tenant_fields = list(
+            LeadFieldConfiguration.objects.filter(tenant_id=request.tenant_id)
+            .order_by('display_order', 'field_label')
+        )
+        fields_by_id = {field.id: field for field in tenant_fields}
+
+        if set(submitted_ids) != set(fields_by_id):
+            raise ValidationError({
+                'fields': 'The layout must contain every field configuration for this tenant exactly once.'
+            })
+
+        updated_at = timezone.now()
+        for display_order, item in enumerate(submitted_fields, start=1):
+            field = fields_by_id[item['id']]
+            field.display_order = display_order
+            field.is_visible = item['is_visible']
+            field.updated_at = updated_at
+
+        with transaction.atomic():
+            LeadFieldConfiguration.objects.bulk_update(
+                tenant_fields,
+                ['display_order', 'is_visible', 'updated_at'],
+            )
+
+        ordered_fields = sorted(tenant_fields, key=lambda field: field.display_order)
+        return Response(LeadFieldConfigurationSerializer(ordered_fields, many=True).data)
 
     @extend_schema(
         description='Get field schema organized by standard and custom fields',
