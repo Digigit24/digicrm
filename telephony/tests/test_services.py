@@ -233,6 +233,55 @@ class CallLogServiceTest(TestCase):
         self.assertEqual(log.call_type, CallTypeEnum.ANSWERED)
         self.assertEqual(log.duration, 45)
 
+    def test_record_flag_is_not_mistaken_for_recording_filename(self):
+        log = process_cdr_record(
+            TENANT_ID,
+            self._raw_cdr(record='true'),
+            'outbound',
+        )
+        self.assertFalse(log.recording_file)
+
+    def test_uses_telecmi_filename_for_recording(self):
+        log = process_cdr_record(
+            TENANT_ID,
+            self._raw_cdr(record='true', filename='call_123.mp3'),
+            'outbound',
+        )
+        self.assertEqual(log.recording_file, 'call_123.mp3')
+
+    def test_normalizes_official_webhook_field_names(self):
+        raw = self._raw_cdr()
+        raw.pop('cmiuid')
+        raw.pop('duration')
+        raw.update({
+            'cmiuuid': 'webhook-uuid',
+            'answeredsec': 19,
+            'direction': 'outbound',
+            'status': 'answered',
+            'record': True,
+            'filename': 'webhook-call.mp3',
+        })
+        log = process_cdr_record(TENANT_ID, raw)
+        self.assertEqual(log.cmiuid, 'webhook-uuid')
+        self.assertEqual(log.duration, 19)
+        self.assertEqual(log.direction, CallDirectionEnum.OUTBOUND)
+        self.assertEqual(log.recording_file, 'webhook-call.mp3')
+
+    def test_resync_repairs_invalid_recording_reference(self):
+        log = process_cdr_record(
+            TENANT_ID,
+            self._raw_cdr(record='true'),
+            'outbound',
+        )
+        log.recording_file = 'true'
+        log.save(update_fields=['recording_file'])
+        repaired = process_cdr_record(
+            TENANT_ID,
+            self._raw_cdr(record='true', filename='repaired.mp3'),
+            'outbound',
+        )
+        self.assertEqual(repaired.recording_file, 'repaired.mp3')
+
     def test_process_cdr_idempotent(self):
         raw = self._raw_cdr()
         log1 = process_cdr_record(TENANT_ID, raw, 'inbound')

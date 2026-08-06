@@ -12,8 +12,10 @@ import logging
 import hmac
 import hashlib
 import json
+import uuid
 from datetime import timedelta
 
+from django.db import transaction
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
@@ -28,11 +30,11 @@ from common.authentication import JWTRequestAuthentication
 from common.mixins import TenantViewSetMixin
 from common.permissions import HasDigiPermission, is_admin_request
 from telephony.models import (
-    TeleCMICredential, TeleCMIAgent, CallLog, SMSLog,
-    TeleCMICampaign, CallDirectionEnum, SMSStatusEnum,
+    TeleCMICredential, TeleCMIAgent, ZataStorageCredential, CallLog, SMSLog,
+    TeleCMICampaign, CallDirectionEnum, SMSStatusEnum, RecordingStorageStatusEnum,
 )
 from telephony.serializers import (
-    TeleCMICredentialSerializer, TeleCMIAgentSerializer,
+    TeleCMICredentialSerializer, TeleCMIAgentSerializer, ZataStorageCredentialSerializer,
     CallLogSerializer, SMSLogSerializer,
     ClickToCallSerializer, HangupSerializer, SMSSendSerializer,
     CallerIDUpdateSerializer, CDRSyncSerializer, AddNoteSerializer,
@@ -103,6 +105,37 @@ class TeleCMICredentialViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
     permission_module = 'telephony'
     permission_resource = 'settings'
     http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+
+class ZataStorageCredentialViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+    """Manage the current tenant's private Zata recording storage."""
+
+    queryset = ZataStorageCredential.objects.order_by('-created_at')
+    serializer_class = ZataStorageCredentialSerializer
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'settings'
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
+
+    @action(detail=False, methods=['post'], url_path='test')
+    def test_storage(self, request):
+        from telephony.services.zata_storage import test_connection, ZataStorageError
+
+        credential = self.get_queryset().first()
+        if not credential:
+            return Response({'error': 'Configure and save Zata storage first.'}, status=404)
+        try:
+            test_connection(credential)
+        except ZataStorageError as exc:
+            credential.last_tested_at = timezone.now()
+            credential.last_test_error = str(exc)[:2000]
+            credential.save(update_fields=['last_tested_at', 'last_test_error', 'updated_at'])
+            return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+        credential.last_tested_at = timezone.now()
+        credential.last_test_error = ''
+        credential.save(update_fields=['last_tested_at', 'last_test_error', 'updated_at'])
+        return Response({'detail': 'Zata bucket connection is working.'})
 
 
 class TeleCMIAgentViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
@@ -183,6 +216,28 @@ class ClickToCallView(APIView):
                 invalidate_token(_tenant_id(request), _user_id(request))
             return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
+        # Webhook delivery is primary. This finite delayed reconciliation is a
+        # safety net for misconfigured/delayed webhooks and never polls the UI.
+        initiated_at = timezone.now().isoformat()
+
+        def enqueue_reconciliation():
+            try:
+                from telephony.tasks import reconcile_outbound_call
+                reconcile_outbound_call.apply_async(
+                    kwargs={
+                        'tenant_id': str(_tenant_id(request)),
+                        'user_id': str(_user_id(request)),
+                        'to_number': data['to_number'],
+                        'initiated_at': initiated_at,
+                        'lead_id': data.get('lead_id'),
+                    },
+                    countdown=60,
+                )
+            except Exception as exc:
+                logger.error('Could not queue post-call reconciliation: %s', exc)
+
+        transaction.on_commit(enqueue_reconciliation)
+
         return Response(result, status=status.HTTP_200_OK)
 
 
@@ -251,6 +306,10 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
             _user_id(request),
             hours_back=serializer.validated_data['hours_back'],
         )
+        if result.get('status') == 'failed' or result.get('error'):
+            return Response(result, status=status.HTTP_502_BAD_GATEWAY)
+        if result.get('status') == 'partial':
+            return Response(result, status=status.HTTP_207_MULTI_STATUS)
         return Response(result)
 
     @action(detail=True, methods=['get'], url_path='recording')
@@ -265,11 +324,39 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
         from telephony.services.crypto import decrypt_secret
 
         call_log = self.get_object()
-        if not call_log.recording_file:
+        if not call_log.recording_file and not call_log.recording_object_key:
             return Response(
                 {'error': 'No recording available for this call'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        if (
+            call_log.recording_storage_status == RecordingStorageStatusEnum.ARCHIVED
+            and call_log.recording_object_key
+        ):
+            from telephony.services.zata_storage import get_archived_recording, ZataStorageError
+            try:
+                stored = get_archived_recording(
+                    call_log, request.headers.get('Range')
+                )
+            except ZataStorageError as exc:
+                logger.warning('Zata playback failed for call %s: %s', call_log.id, exc)
+                if not call_log.recording_file:
+                    return Response({'error': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+            else:
+                streaming = StreamingHttpResponse(
+                    iter(lambda: stored['Body'].read(64 * 1024), b''),
+                    status=stored.get('ResponseMetadata', {}).get('HTTPStatusCode', 200),
+                    content_type=stored.get('ContentType') or call_log.recording_content_type or 'audio/mpeg',
+                )
+                if stored.get('ContentLength') is not None:
+                    streaming['Content-Length'] = stored['ContentLength']
+                if stored.get('ContentRange'):
+                    streaming['Content-Range'] = stored['ContentRange']
+                streaming['Accept-Ranges'] = stored.get('AcceptRanges') or 'bytes'
+                streaming['Content-Disposition'] = 'inline'
+                streaming['Cache-Control'] = 'private, max-age=300'
+                return streaming
 
         try:
             credential = get_tenant_credential(_tenant_id(request))
@@ -319,6 +406,27 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
         streaming['Accept-Ranges'] = 'none'
         streaming['Cache-Control'] = 'private, max-age=300'
         return streaming
+
+    @action(detail=True, methods=['get'], url_path='recording-access')
+    def recording_access(self, request, pk=None):
+        """Return a short-lived Zata URL, or signal TeleCMI proxy fallback."""
+        call_log = self.get_object()
+        if (
+            call_log.recording_storage_status == RecordingStorageStatusEnum.ARCHIVED
+            and call_log.recording_object_key
+        ):
+            from telephony.services.zata_storage import (
+                create_presigned_playback_url, ZataStorageError,
+            )
+            try:
+                url = create_presigned_playback_url(call_log, expires_in=600)
+            except ZataStorageError as exc:
+                logger.warning('Could not create Zata playback URL for call %s: %s', call_log.id, exc)
+            else:
+                return Response({'source': 'zata', 'url': url, 'expires_in': 600})
+        if call_log.recording_file:
+            return Response({'source': 'telecmi', 'url': None, 'expires_in': 0})
+        return Response({'error': 'No recording available for this call'}, status=404)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -772,13 +880,25 @@ class CDRWebhookView(APIView):
         tenant_id = request.query_params.get('tenant_id')
         if not tenant_id:
             return Response({'error': 'tenant_id query param required'}, status=400)
+        try:
+            tenant_id = str(uuid.UUID(tenant_id))
+        except (TypeError, ValueError, AttributeError):
+            return Response({'error': 'tenant_id must be a valid UUID'}, status=400)
 
         # Optional webhook secret verification
         if not _verify_webhook_secret(request, tenant_id):
             return Response({'error': 'Invalid webhook secret'}, status=401)
+        if not _verify_webhook_app_id(payload, tenant_id):
+            return Response({'error': 'Webhook app_id does not match this tenant'}, status=403)
 
         direction = _detect_direction(payload)
-        log = process_cdr_record(tenant_id, payload, direction, synced_via='webhook')
+        log = process_cdr_record(
+            tenant_id,
+            payload,
+            direction,
+            synced_via='webhook',
+            queue_archive=True,
+        )
 
         if log and log.call_type == 'missed':
             create_callback_task_if_needed(tenant_id, log)
@@ -796,7 +916,7 @@ class CDRWebhookView(APIView):
                 'duration': log.duration,
                 'from': log.from_number,
                 'to': log.to_number,
-                'has_recording': bool(log.recording_file),
+                'has_recording': bool(log.recording_file or log.recording_object_key),
             })
 
         return Response({'status': 'ok'})
@@ -827,6 +947,16 @@ class LiveEventWebhookView(APIView):
     def post(self, request):
         payload = request.data
         tenant_id = request.query_params.get('tenant_id')
+        if not tenant_id:
+            return Response({'error': 'tenant_id query param required'}, status=400)
+        try:
+            tenant_id = str(uuid.UUID(tenant_id))
+        except (TypeError, ValueError, AttributeError):
+            return Response({'error': 'tenant_id must be a valid UUID'}, status=400)
+        if not _verify_webhook_secret(request, tenant_id):
+            return Response({'error': 'Invalid webhook secret'}, status=401)
+        if not _verify_webhook_app_id(payload, tenant_id):
+            return Response({'error': 'Webhook app_id does not match this tenant'}, status=403)
         logger.info('Live event webhook (tenant=%s): %s', tenant_id, payload)
 
         event_name, cmiuid = _normalize_live_event(payload)
@@ -878,6 +1008,9 @@ def _detect_direction(payload: dict) -> str:
     TeleCMI CDR webhook uses 'call_type': 'inbound' / 'outbound' in some fields.
     Fall back to 'inbound' if unclear.
     """
+    direct = str(payload.get('direction') or '').lower()
+    if direct in ('inbound', 'outbound'):
+        return direct
     ct = payload.get('call_type') or payload.get('type') or ''
     if 'out' in str(ct).lower():
         return 'outbound'
@@ -885,15 +1018,37 @@ def _detect_direction(payload: dict) -> str:
 
 
 def _verify_webhook_secret(request, tenant_id) -> bool:
-    """Return True if no secret is configured or the header matches."""
+    """Verify a header or URL key (TeleCMI dashboard only guarantees a URL)."""
     try:
         from telephony.models import TeleCMICredential
         cred = TeleCMICredential.objects.filter(
             tenant_id=tenant_id, is_active=True
         ).values('webhook_secret').first()
-        if not cred or not cred['webhook_secret']:
+        if not cred:
+            return False
+        if not cred['webhook_secret']:
             return True
-        incoming = request.headers.get('X-Webhook-Secret', '')
+        incoming = (
+            request.headers.get('X-Webhook-Secret', '')
+            or request.query_params.get('key', '')
+        )
         return hmac.compare_digest(incoming, cred['webhook_secret'])
     except Exception:
+        logger.exception('Could not verify TeleCMI webhook secret for tenant=%s', tenant_id)
+        return False
+
+
+def _verify_webhook_app_id(payload, tenant_id) -> bool:
+    """Reject a payload explicitly claiming another tenant's TeleCMI app."""
+    incoming_app_id = payload.get('appid') or payload.get('app_id')
+    if not incoming_app_id:
         return True
+    try:
+        from telephony.models import TeleCMICredential
+        expected = TeleCMICredential.objects.filter(
+            tenant_id=tenant_id, is_active=True
+        ).values_list('app_id', flat=True).first()
+        return not expected or hmac.compare_digest(str(incoming_app_id), str(expected))
+    except Exception:
+        logger.exception('Could not verify TeleCMI webhook app_id for tenant=%s', tenant_id)
+        return False

@@ -11,7 +11,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from telephony.models import (
-    TeleCMICredential, TeleCMIAgent, CallLog, SMSLog,
+    TeleCMICredential, TeleCMIAgent, ZataStorageCredential, CallLog, SMSLog,
     SBCRegionEnum, CallDirectionEnum, CallTypeEnum, SMSStatusEnum,
 )
 
@@ -33,8 +33,15 @@ def _make_jwt(tenant_id, user_id, is_super_admin=False):
         'tenant_id': str(tenant_id),
         'tenant_slug': 'test-tenant',
         'is_super_admin': is_super_admin,
-        'permissions': {'crm': {'leads': {'view': 'all', 'create': True}}},
-        'enabled_modules': ['crm'],
+        'permissions': {
+            'crm': {'leads': {'view': 'all', 'create': True}},
+            'telephony': {
+                'calls': {'view': 'all', 'create': True, 'edit': True},
+                'sms': {'view': 'all', 'create': True},
+                'settings': {'view': 'all', 'create': True, 'edit': True, 'delete': True},
+            },
+        },
+        'enabled_modules': ['crm', 'telephony'],
     }
     token = pyjwt.encode(payload, TEST_JWT_SECRET, algorithm=TEST_JWT_ALGO)
     return f'Bearer {token}'
@@ -101,6 +108,31 @@ class ClickToCallViewTest(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['code'], 200)
+
+    @patch('telephony.tasks.reconcile_outbound_call.apply_async')
+    @patch('telephony.views.client.click_to_call')
+    @patch('telephony.views.get_agent_token')
+    def test_click_to_call_schedules_one_minute_reconciliation(
+        self, mock_token, mock_call, mock_apply_async,
+    ):
+        mock_token.return_value = 'valid-tok'
+        mock_call.return_value = {'code': 200, 'msg': 'Call initiated'}
+
+        client = _authed_client(TENANT_A, USER_A)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = client.post(
+                '/api/telephony/calls/click-to-call/',
+                {'to_number': '919000000000', 'lead_id': 42},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_apply_async.call_args.kwargs['countdown'], 60)
+        queued = mock_apply_async.call_args.kwargs['kwargs']
+        self.assertEqual(queued['tenant_id'], str(TENANT_A))
+        self.assertEqual(queued['user_id'], str(USER_A))
+        self.assertEqual(queued['to_number'], '919000000000')
+        self.assertEqual(queued['lead_id'], 42)
 
     @patch('telephony.views.client.click_to_call')
     @patch('telephony.views.get_agent_token')
@@ -221,6 +253,15 @@ class SMSSendViewTest(TestCase):
 class CDRWebhookViewTest(TestCase):
     """Webhook tests — public endpoints, no JWT needed."""
 
+    def setUp(self):
+        for tenant_id, app_id in ((TENANT_A, 'app-a'), (TENANT_B, 'app-b')):
+            TeleCMICredential.objects.create(
+                tenant_id=tenant_id,
+                app_id=app_id,
+                secret_encrypted='enc',
+                sbc_region=SBCRegionEnum.INDIA,
+            )
+
     def _cdr_payload(self, cmiuid='wh-001', duration=30):
         return {
             'cmiuid': cmiuid,
@@ -242,6 +283,14 @@ class CDRWebhookViewTest(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    def test_webhook_rejects_invalid_tenant_id(self):
+        response = APIClient().post(
+            '/api/telephony/webhook/cdr/?tenant_id=not-a-uuid',
+            self._cdr_payload(),
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
     def test_webhook_creates_call_log(self):
         response = APIClient().post(
             f'/api/telephony/webhook/cdr/?tenant_id={TENANT_A}',
@@ -250,6 +299,29 @@ class CDRWebhookViewTest(TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertTrue(CallLog.objects.filter(tenant_id=TENANT_A, cmiuid='wh-001').exists())
+
+    def test_webhook_accepts_official_telecmi_shape(self):
+        payload = {
+            'cmiuuid': 'official-wh-001',
+            'direction': 'outbound',
+            'status': 'answered',
+            'answeredsec': 18,
+            'record': 'true',
+            'filename': 'official-wh-001.mp3',
+            'from': 919000000001,
+            'to': 918000000001,
+            'time': 1639554230000,
+            'leg': 'b',
+        }
+        response = APIClient().post(
+            f'/api/telephony/webhook/cdr/?tenant_id={TENANT_A}',
+            payload,
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        log = CallLog.objects.get(tenant_id=TENANT_A, cmiuid='official-wh-001')
+        self.assertEqual(log.duration, 18)
+        self.assertEqual(log.recording_file, 'official-wh-001.mp3')
 
     def test_webhook_idempotent(self):
         payload = self._cdr_payload()
@@ -276,12 +348,8 @@ class CDRWebhookViewTest(TestCase):
         self.assertFalse(CallLog.objects.filter(tenant_id=TENANT_A, cmiuid='wh-b').exists())
 
     def test_webhook_secret_rejection(self):
-        TeleCMICredential.objects.create(
-            tenant_id=TENANT_A,
-            app_id='app1',
-            secret_encrypted='enc',
-            sbc_region=SBCRegionEnum.INDIA,
-            webhook_secret='mysecret',
+        TeleCMICredential.objects.filter(tenant_id=TENANT_A).update(
+            webhook_secret='mysecret'
         )
         response = APIClient().post(
             f'/api/telephony/webhook/cdr/?tenant_id={TENANT_A}',
@@ -292,12 +360,8 @@ class CDRWebhookViewTest(TestCase):
         self.assertEqual(response.status_code, 401)
 
     def test_webhook_secret_accepted(self):
-        TeleCMICredential.objects.create(
-            tenant_id=TENANT_A,
-            app_id='app1',
-            secret_encrypted='enc',
-            sbc_region=SBCRegionEnum.INDIA,
-            webhook_secret='mysecret',
+        TeleCMICredential.objects.filter(tenant_id=TENANT_A).update(
+            webhook_secret='mysecret'
         )
         response = APIClient().post(
             f'/api/telephony/webhook/cdr/?tenant_id={TENANT_A}',
@@ -307,9 +371,30 @@ class CDRWebhookViewTest(TestCase):
         )
         self.assertEqual(response.status_code, 200)
 
+    def test_webhook_rejects_mismatched_app_id(self):
+        TeleCMICredential.objects.filter(tenant_id=TENANT_A).update(
+            app_id='expected-app'
+        )
+        payload = self._cdr_payload('wh-wrong-app')
+        payload['appid'] = 'another-app'
+        response = APIClient().post(
+            f'/api/telephony/webhook/cdr/?tenant_id={TENANT_A}',
+            payload,
+            format='json',
+        )
+        self.assertEqual(response.status_code, 403)
+
 
 @override_settings(JWT_SECRET_KEY=TEST_JWT_SECRET, JWT_ALGORITHM=TEST_JWT_ALGO)
 class LiveEventWebhookViewTest(TestCase):
+
+    def setUp(self):
+        TeleCMICredential.objects.create(
+            tenant_id=TENANT_A,
+            app_id='app-a',
+            secret_encrypted='enc',
+            sbc_region=SBCRegionEnum.INDIA,
+        )
 
     def test_live_event_returns_ok(self):
         response = APIClient().post(
@@ -369,3 +454,45 @@ class TeleCMICredentialViewSetTest(TestCase):
     def test_unauthenticated_rejected(self):
         response = APIClient().get('/api/telephony/credentials/')
         self.assertEqual(response.status_code, 401)
+
+
+@override_settings(
+    JWT_SECRET_KEY=TEST_JWT_SECRET,
+    JWT_ALGORITHM=TEST_JWT_ALGO,
+    TELECMI_MASTER_KEY='stable-test-master-key',
+)
+class ZataStorageCredentialViewSetTest(TestCase):
+
+    def test_create_encrypts_secret_and_never_returns_it(self):
+        response = _authed_client(TENANT_A, USER_A).post(
+            '/api/telephony/storage-credentials/',
+            {
+                'endpoint_url': 'https://idr01.zata.ai/',
+                'bucket_name': 'tenant-recordings',
+                'access_key_id': 'access-id',
+                'secret_access_key': 'very-secret-key',
+                'object_prefix': '/telephony/recordings/',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertNotIn('secret_access_key', response.data)
+        self.assertTrue(response.data['secret_configured'])
+        credential = ZataStorageCredential.objects.get(tenant_id=TENANT_A)
+        self.assertNotEqual(credential.secret_access_key_encrypted, 'very-secret-key')
+        self.assertEqual(credential.endpoint_url, 'https://idr01.zata.ai')
+        self.assertEqual(credential.object_prefix, 'telephony/recordings')
+
+    def test_list_is_tenant_scoped(self):
+        ZataStorageCredential.objects.create(
+            tenant_id=TENANT_B,
+            bucket_name='tenant-b',
+            access_key_id='access-b',
+            secret_access_key_encrypted='encrypted',
+        )
+        response = _authed_client(TENANT_A, USER_A).get(
+            '/api/telephony/storage-credentials/'
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['count'], 0)

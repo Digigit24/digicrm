@@ -37,6 +37,7 @@ from telephony import views
 
 router = DefaultRouter()
 router.register(r'credentials', views.TeleCMICredentialViewSet, basename='telephony-credential')
+router.register(r'storage-credentials', views.ZataStorageCredentialViewSet, basename='telephony-storage-credential')
 router.register(r'agents', views.TeleCMIAgentViewSet, basename='telephony-agent')
 router.register(r'calls', views.CallLogViewSet, basename='telephony-call')
 router.register(r'sms', views.SMSLogViewSet, basename='telephony-sms')

@@ -26,7 +26,11 @@ class TeleCMIError(Exception):
 def _post(path, payload, timeout=DEFAULT_TIMEOUT):
     """Internal POST helper. Returns parsed JSON dict."""
     url = f'{TELECMI_BASE_URL}{path}'
-    logger.debug('TeleCMI outgoing POST %s payload: %s', path, payload)
+    safe_payload = {
+        key: ('***' if key.lower() in {'token', 'secret', 'password'} else value)
+        for key, value in payload.items()
+    }
+    logger.debug('TeleCMI outgoing POST %s payload: %s', path, safe_payload)
     try:
         response = requests.post(url, json=payload, timeout=timeout)
     except requests.RequestException as exc:

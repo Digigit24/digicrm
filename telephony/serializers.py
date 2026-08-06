@@ -1,7 +1,8 @@
 from rest_framework import serializers
 from common.mixins import TenantMixin
 from telephony.models import (
-    TeleCMICredential, TeleCMIAgent, CallLog, SMSLog, TeleCMICampaign,
+    TeleCMICredential, TeleCMIAgent, ZataStorageCredential,
+    CallLog, SMSLog, TeleCMICampaign,
 )
 from crm.models import LeadGroup
 from crm.serializers import LeadGroupMinimalSerializer
@@ -15,13 +16,15 @@ class TeleCMICredentialSerializer(TenantMixin):
     The secret is write-only; it is encrypted before storage.
     """
     secret = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    webhook_secret = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    webhook_secret_configured = serializers.SerializerMethodField()
     sbc_host = serializers.CharField(read_only=True)
 
     class Meta:
         model = TeleCMICredential
         fields = [
             'id', 'app_id', 'secret', 'sbc_region', 'sbc_host',
-            'default_caller_id', 'webhook_secret', 'is_active',
+            'default_caller_id', 'webhook_secret', 'webhook_secret_configured', 'is_active',
             'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'sbc_host', 'created_at', 'updated_at']
@@ -32,6 +35,9 @@ class TeleCMICredentialSerializer(TenantMixin):
             'default_caller_id': {'help_text': 'Default outbound caller ID phone number'},
             'webhook_secret': {'help_text': 'Optional secret to verify TeleCMI webhook POST requests'},
         }
+
+    def get_webhook_secret_configured(self, obj):
+        return bool(obj.webhook_secret)
 
     def create(self, validated_data):
         secret = validated_data.pop('secret', None)
@@ -95,6 +101,59 @@ class TeleCMIAgentSerializer(TenantMixin):
         return super().update(instance, validated_data)
 
 
+class ZataStorageCredentialSerializer(TenantMixin):
+    """Tenant Zata S3 settings; the secret key is write-only."""
+
+    secret_access_key = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        trim_whitespace=False,
+    )
+    secret_configured = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ZataStorageCredential
+        fields = [
+            'id', 'endpoint_url', 'bucket_name', 'access_key_id',
+            'secret_access_key', 'secret_configured', 'object_prefix',
+            'region_name', 'is_active', 'last_tested_at', 'last_test_error',
+            'created_at', 'updated_at',
+        ]
+        read_only_fields = [
+            'id', 'secret_configured', 'last_tested_at', 'last_test_error',
+            'created_at', 'updated_at',
+        ]
+
+    def get_secret_configured(self, obj):
+        return bool(obj.secret_access_key_encrypted)
+
+    def validate_endpoint_url(self, value):
+        return value.rstrip('/')
+
+    def validate_object_prefix(self, value):
+        return value.strip().strip('/')
+
+    def create(self, validated_data):
+        secret = validated_data.pop('secret_access_key', None)
+        if not secret:
+            raise serializers.ValidationError({
+                'secret_access_key': 'Secret access key is required when configuring Zata.'
+            })
+        encrypted, dek_wrapped = encrypt_secret(secret)
+        validated_data['secret_access_key_encrypted'] = encrypted
+        validated_data['dek_wrapped'] = dek_wrapped
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        secret = validated_data.pop('secret_access_key', None)
+        if secret:
+            encrypted, dek_wrapped = encrypt_secret(secret, instance.dek_wrapped)
+            validated_data['secret_access_key_encrypted'] = encrypted
+            validated_data['dek_wrapped'] = dek_wrapped
+        return super().update(instance, validated_data)
+
+
 class CallLogSerializer(serializers.ModelSerializer):
     """Read-only CDR record."""
     direction_display = serializers.CharField(source='get_direction_display', read_only=True)
@@ -102,7 +161,7 @@ class CallLogSerializer(serializers.ModelSerializer):
     has_recording = serializers.SerializerMethodField()
 
     def get_has_recording(self, obj):
-        return bool(obj.recording_file)
+        return bool(obj.recording_file or obj.recording_object_key)
 
     class Meta:
         model = CallLog
@@ -113,6 +172,8 @@ class CallLogSerializer(serializers.ModelSerializer):
             'caller_name', 'telecmi_notes', 'call_time',
             'lead_id', 'agent_user_id', 'synced_via',
             'recording_file', 'has_recording', 'created_at',
+            'recording_storage_status', 'recording_content_type',
+            'recording_size', 'recording_archived_at',
             'call_leg', 'telecmi_call_id', 'conversation_uuid',
             'ivr_name', 'team_name', 'is_voicemail', 'voicemail_filename',
             'wait_seconds', 'hangup_reason',

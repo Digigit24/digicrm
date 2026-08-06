@@ -19,6 +19,14 @@ class CallTypeEnum(models.TextChoices):
     ANSWERED = 'answered', 'Answered'
 
 
+class RecordingStorageStatusEnum(models.TextChoices):
+    TELECMI = 'telecmi', 'Available from TeleCMI'
+    PENDING = 'pending', 'Waiting to archive'
+    ARCHIVING = 'archiving', 'Archiving to Zata'
+    ARCHIVED = 'archived', 'Archived in Zata'
+    FAILED = 'failed', 'Archive failed'
+
+
 class SMSStatusEnum(models.TextChoices):
     SENT = 'sent', 'Sent'
     FAILED = 'failed', 'Failed'
@@ -47,7 +55,7 @@ class TeleCMICredential(models.Model):
         help_text=(
             "This tenant's data-encryption key, itself encrypted with "
             'TELECMI_MASTER_KEY. Empty means the row still uses the legacy '
-            'shared key derived from SECRET_KEY.'
+            'shared key.'
         ),
     )
     sbc_region = models.CharField(
@@ -133,6 +141,38 @@ class TeleCMIAgent(models.Model):
         return age.total_seconds() > 72000  # 20 hours
 
 
+class ZataStorageCredential(models.Model):
+    """Tenant-owned private Zata S3 configuration for call recordings."""
+
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(unique=True, db_index=True)
+    endpoint_url = models.URLField(default='https://idr01.zata.ai')
+    bucket_name = models.CharField(max_length=255)
+    access_key_id = models.CharField(max_length=255)
+    secret_access_key_encrypted = models.TextField()
+    dek_wrapped = models.TextField(blank=True, default='')
+    object_prefix = models.CharField(
+        max_length=255,
+        default='telephony/recordings',
+        help_text='Key prefix inside the private bucket.',
+    )
+    region_name = models.CharField(max_length=64, default='us-east-1')
+    is_active = models.BooleanField(default=True)
+    last_tested_at = models.DateTimeField(null=True, blank=True)
+    last_test_error = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'telephony_zata_storage_credentials'
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_tel_zata_tenant'),
+        ]
+
+    def __str__(self):
+        return f'Zata storage for tenant {self.tenant_id}'
+
+
 class CallLog(models.Model):
     """
     Normalized TeleCMI CDR record. Populated by webhook (real-time) or manual sync.
@@ -176,6 +216,19 @@ class CallLog(models.Model):
         blank=True,
         help_text='TeleCMI recording filename (e.g. demo_1111113.wav)'
     )
+    recording_storage_status = models.CharField(
+        max_length=20,
+        choices=RecordingStorageStatusEnum.choices,
+        default=RecordingStorageStatusEnum.TELECMI,
+    )
+    recording_object_key = models.CharField(max_length=512, null=True, blank=True)
+    recording_content_type = models.CharField(max_length=100, null=True, blank=True)
+    recording_size = models.BigIntegerField(null=True, blank=True)
+    recording_sha256 = models.CharField(max_length=64, null=True, blank=True)
+    recording_archived_at = models.DateTimeField(null=True, blank=True)
+    recording_archive_error = models.TextField(blank=True, default='')
+    recording_archive_attempts = models.PositiveIntegerField(default=0)
+    raw_payload = models.JSONField(null=True, blank=True)
     # Track how this record was created
     synced_via = models.CharField(
         max_length=20,
@@ -189,6 +242,7 @@ class CallLog(models.Model):
     call_leg = models.CharField(max_length=1, null=True, blank=True, help_text='"a" or "b" for outbound legs')
     telecmi_call_id = models.CharField(max_length=64, null=True, blank=True, db_index=True, help_text='Links Leg A and Leg B of outbound calls')
     conversation_uuid = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    request_id = models.CharField(max_length=128, null=True, blank=True, db_index=True)
     # Routing metadata
     ivr_name = models.CharField(max_length=128, null=True, blank=True)
     team_name = models.CharField(max_length=128, null=True, blank=True)

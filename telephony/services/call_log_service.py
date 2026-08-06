@@ -9,14 +9,19 @@ Responsibilities:
 - Upsert CallLog records (idempotent via cmiuid)
 """
 import logging
+import json
+import re
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone as dt_timezone
 
+from django.db import transaction
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
 # TeleCMI timestamps are in UTC milliseconds
 MS_PER_SECOND = 1000
+VALID_RECORDING_RE = re.compile(r'^[A-Za-z0-9_.\-/]+\.(?:mp3|wav|ogg|m4a)$', re.IGNORECASE)
 
 
 def set_call_outcome(call_log_id, tenant_id, outcome, note, user_id):
@@ -36,7 +41,101 @@ def set_call_outcome(call_log_id, tenant_id, outcome, note, user_id):
     return call_log
 
 
-def process_cdr_record(tenant_id, raw_cdr: dict, direction: str, synced_via: str = 'webhook') -> 'CallLog':
+def _first_value(payload, *keys, default=None):
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != '':
+            return value
+    return default
+
+
+def _as_int(value, default=0):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_decimal(value, default=Decimal('0')):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def _recording_filename(raw_cdr):
+    """Return TeleCMI's filename; `record` is only an enabled flag."""
+    value = _first_value(raw_cdr, 'filename', 'recording_file', 'file', default='')
+    if isinstance(value, bool):
+        return ''
+    value = str(value).strip()
+    if value.lower() in {'true', 'false', '1', '0', 'yes', 'no'}:
+        return ''
+    return value if VALID_RECORDING_RE.match(value) else ''
+
+
+def _payload_lead_id(raw_cdr):
+    for key in ('extra_params', 'custom'):
+        value = raw_cdr.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                value = None
+        if isinstance(value, dict) and value.get('lead_id'):
+            return _as_int(value.get('lead_id'), None)
+    return None
+
+
+def _resolve_agent_user_id(tenant_id, raw_cdr, explicit_user_id=None):
+    if explicit_user_id:
+        return explicit_user_id
+    telecmi_user_id = _first_value(raw_cdr, 'user', 'agent')
+    if not telecmi_user_id:
+        return None
+    from telephony.models import TeleCMIAgent
+    return (
+        TeleCMIAgent.objects.filter(
+            tenant_id=tenant_id,
+            telecmi_user_id=str(telecmi_user_id),
+            is_active=True,
+        ).values_list('user_id', flat=True).first()
+    )
+
+
+def _queue_recording_archive(call_log):
+    from telephony.models import ZataStorageCredential, RecordingStorageStatusEnum
+
+    if not call_log.recording_file or not ZataStorageCredential.objects.filter(
+        tenant_id=call_log.tenant_id, is_active=True
+    ).exists():
+        return
+    if call_log.recording_storage_status == RecordingStorageStatusEnum.ARCHIVED:
+        return
+    CallLog = call_log.__class__
+    CallLog.objects.filter(pk=call_log.pk).update(
+        recording_storage_status=RecordingStorageStatusEnum.PENDING,
+        recording_archive_error='',
+    )
+
+    def enqueue():
+        try:
+            from telephony.tasks import archive_call_recording
+            archive_call_recording.delay(call_log.pk)
+        except Exception as exc:
+            logger.error('Could not queue recording archive for call %s: %s', call_log.pk, exc)
+
+    transaction.on_commit(enqueue)
+
+
+def process_cdr_record(
+    tenant_id,
+    raw_cdr: dict,
+    direction: str = None,
+    synced_via: str = 'webhook',
+    agent_user_id=None,
+    queue_archive: bool = False,
+) -> 'CallLog':
     """
     Create or update a CallLog from a single TeleCMI CDR dict.
     Also creates a LeadActivity if a matching Lead is found.
@@ -49,63 +148,99 @@ def process_cdr_record(tenant_id, raw_cdr: dict, direction: str, synced_via: str
     from telephony.models import CallLog, CallDirectionEnum, CallTypeEnum
     from crm.models import LeadActivity, ActivityTypeEnum
 
-    cmiuid = raw_cdr.get('cmiuid')
+    cmiuid = _first_value(raw_cdr, 'cmiuid', 'cmiuuid')
     if not cmiuid:
-        logger.warning('CDR record missing cmiuid, skipping: %s', raw_cdr)
+        logger.warning('CDR record missing cmiuid/cmiuuid; keys=%s', sorted(raw_cdr.keys()))
         return None
 
-    duration = raw_cdr.get('duration', 0)
-    call_type = CallTypeEnum.MISSED if duration == 0 else CallTypeEnum.ANSWERED
-    from_number = str(raw_cdr.get('from', ''))
-    to_number = str(raw_cdr.get('to', from_number))
-    call_time_ms = raw_cdr.get('time', 0)
-    call_time = datetime.fromtimestamp(call_time_ms / MS_PER_SECOND, tz=dt_timezone.utc)
+    direction = str(raw_cdr.get('direction') or direction or '').lower()
+    if direction not in (CallDirectionEnum.INBOUND, CallDirectionEnum.OUTBOUND):
+        direction = CallDirectionEnum.INBOUND
+    duration = _as_int(_first_value(raw_cdr, 'duration', 'answeredsec', 'answered_sec', default=0))
+    status_value = str(raw_cdr.get('status') or '').lower()
+    missed_statuses = {'missed', 'failed', 'no-answer', 'no_answer', 'busy', 'rejected'}
+    call_type = CallTypeEnum.MISSED if status_value in missed_statuses or duration <= 0 else CallTypeEnum.ANSWERED
+    from_number = str(raw_cdr.get('from') or '')
+    to_number = str(raw_cdr.get('to') or from_number)
+    call_time_ms = _as_int(_first_value(raw_cdr, 'time', 'start_time', default=0))
+    if call_time_ms <= 0:
+        call_time = timezone.now()
+    else:
+        if call_time_ms < 10_000_000_000:
+            call_time_ms *= MS_PER_SECOND
+        call_time = datetime.fromtimestamp(call_time_ms / MS_PER_SECOND, tz=dt_timezone.utc)
 
     # Find matching lead by phone number (tenant-scoped)
-    lead_id = _find_lead_id(tenant_id, from_number if direction == 'inbound' else to_number)
-
-    recording_file = raw_cdr.get('record') or raw_cdr.get('file') or ''
-
-    log, created = CallLog.objects.get_or_create(
-        tenant_id=tenant_id,
-        cmiuid=cmiuid,
-        defaults={
-            'direction': direction,
-            'call_type': call_type,
-            'from_number': from_number,
-            'to_number': to_number,
-            'duration': duration,
-            'billed_sec': raw_cdr.get('billedsec', 0),
-            'rate': raw_cdr.get('rate', 0),
-            'caller_name': raw_cdr.get('name') or '',
-            'telecmi_notes': raw_cdr.get('notes'),
-            'recording_file': recording_file,
-            'call_time': call_time,
-            'lead_id': lead_id,
-            'synced_via': synced_via,
-        },
+    lead_id = _payload_lead_id(raw_cdr) or _find_lead_id(
+        tenant_id, from_number if direction == 'inbound' else to_number
     )
+    recording_file = _recording_filename(raw_cdr)
+    agent_user_id = _resolve_agent_user_id(tenant_id, raw_cdr, agent_user_id)
+    telecmi_call_id = _first_value(raw_cdr, 'call_id')
+    conversation_uuid = _first_value(raw_cdr, 'conversation_uuid')
+    call_leg = str(raw_cdr.get('leg') or '').lower() or None
 
-    if not created:
-        # Update mutable fields on re-sync (e.g. notes or recording added post-call)
-        updated_fields = []
-        if raw_cdr.get('notes') and log.telecmi_notes != raw_cdr['notes']:
-            log.telecmi_notes = raw_cdr['notes']
-            updated_fields.append('telecmi_notes')
-        if lead_id and log.lead_id != lead_id:
-            log.lead_id = lead_id
-            updated_fields.append('lead_id')
-        if recording_file and not log.recording_file:
-            log.recording_file = recording_file
-            updated_fields.append('recording_file')
-        if updated_fields:
-            log.save(update_fields=updated_fields + ['updated_at'])
+    normalized = {
+        'direction': direction,
+        'call_type': call_type,
+        'from_number': from_number,
+        'to_number': to_number,
+        'duration': duration,
+        'billed_sec': _as_int(_first_value(raw_cdr, 'billedsec', 'billed_sec', default=0)),
+        'rate': _as_decimal(_first_value(raw_cdr, 'rate', 'call_rate', default=0)),
+        'caller_name': raw_cdr.get('name') or '',
+        'telecmi_notes': raw_cdr.get('notes'),
+        'recording_file': recording_file or None,
+        'call_time': call_time,
+        'lead_id': lead_id,
+        'agent_user_id': agent_user_id,
+        'synced_via': synced_via,
+        'call_leg': call_leg,
+        'telecmi_call_id': telecmi_call_id,
+        'conversation_uuid': conversation_uuid,
+        'request_id': _first_value(raw_cdr, 'request_id'),
+        'ivr_name': _first_value(raw_cdr, 'ivr_name'),
+        'team_name': _first_value(raw_cdr, 'team', 'team_name'),
+        'is_voicemail': bool(raw_cdr.get('voicemail')),
+        'voicemail_filename': _first_value(raw_cdr, 'voicename'),
+        'wait_seconds': _as_int(_first_value(raw_cdr, 'waitedsec', 'wait_seconds'), None),
+        'hangup_reason': _first_value(raw_cdr, 'hangup_reason'),
+        'raw_payload': raw_cdr,
+    }
+
+    with transaction.atomic():
+        log = CallLog.objects.select_for_update().filter(
+            tenant_id=tenant_id, cmiuid=str(cmiuid)
+        ).first()
+        if not log and telecmi_call_id:
+            log = CallLog.objects.select_for_update().filter(
+                tenant_id=tenant_id, telecmi_call_id=str(telecmi_call_id)
+            ).order_by('-call_leg', '-created_at').first()
+
+        created = log is None
+        if created:
+            log = CallLog.objects.create(tenant_id=tenant_id, cmiuid=str(cmiuid), **normalized)
+        else:
+            # Leg B is the customer leg and contains the final destination and recording.
+            if call_leg == 'b' and log.cmiuid != str(cmiuid):
+                log.cmiuid = str(cmiuid)
+            for field, value in normalized.items():
+                if value is not None and value != '':
+                    setattr(log, field, value)
+            log.save()
 
     # Create a CRM Activity if we have a lead and haven't done it yet
-    if lead_id and not log.activity_created:
+    if (
+        lead_id
+        and not log.activity_created
+        and not (direction == CallDirectionEnum.OUTBOUND and call_leg == 'a')
+    ):
         _create_call_activity(tenant_id, log, lead_id)
         log.activity_created = True
         log.save(update_fields=['activity_created', 'updated_at'])
+
+    if queue_archive and recording_file:
+        _queue_recording_archive(log)
 
     return log
 
@@ -207,7 +342,7 @@ def _format_duration(seconds: int) -> str:
     return f'{minutes}m {secs}s'
 
 
-def sync_cdr_for_agent(tenant_id, user_id, hours_back: int = 24) -> dict:
+def sync_cdr_for_agent(tenant_id, user_id, hours_back: int = 24, queue_archives: bool = True) -> dict:
     """
     Pull CDR from TeleCMI for the given agent and upsert into CallLog.
     Returns summary dict: {'created': N, 'updated': N, 'errors': N}.
@@ -227,7 +362,7 @@ def sync_cdr_for_agent(tenant_id, user_id, hours_back: int = 24) -> dict:
         logger.error('sync_cdr_for_agent: cannot get token for user %s: %s', user_id, exc)
         return {'created': 0, 'updated': 0, 'errors': 1, 'error': str(exc)}
 
-    stats = {'created': 0, 'updated': 0, 'errors': 0}
+    stats = {'created': 0, 'updated': 0, 'errors': 0, 'status': 'success', 'error_details': []}
 
     # Sync each combination of direction × call_type
     combinations = [
@@ -243,17 +378,48 @@ def sync_cdr_for_agent(tenant_id, user_id, hours_back: int = 24) -> dict:
             try:
                 result = fetch_fn(token, call_type_int, from_ts, to_ts, page=page, limit=10)
             except TeleCMIError as exc:
-                logger.error(
-                    'CDR fetch error (%s, type=%s, page=%s): %s',
-                    direction, call_type_int, page, exc
-                )
-                stats['errors'] += 1
-                break
-
-            records = result.get('cdr', [])
+                # TeleCMI reports invalid/expired user tokens as 404. Refresh once.
+                if exc.status_code == 404:
+                    from telephony.services.token_service import invalidate_token
+                    try:
+                        invalidate_token(tenant_id, user_id)
+                        token = get_agent_token(tenant_id, user_id)
+                        result = fetch_fn(token, call_type_int, from_ts, to_ts, page=page, limit=10)
+                    except (TokenServiceError, TeleCMIError) as retry_exc:
+                        exc = retry_exc
+                        result = None
+                else:
+                    result = None
+                if result is not None:
+                    records = result.get('cdr', [])
+                else:
+                    logger.error(
+                        'CDR fetch error (%s, type=%s, page=%s): %s',
+                        direction, call_type_int, page, exc
+                    )
+                    stats['errors'] += 1
+                    stats['error_details'].append(f'{direction}/{call_type_int}: {exc}')
+                    break
+            else:
+                records = result.get('cdr', [])
             for raw in records:
-                existing_count = _count_existing(tenant_id, raw.get('cmiuid'))
-                process_cdr_record(tenant_id, raw, direction, synced_via='manual_sync')
+                existing_count = _count_existing(
+                    tenant_id,
+                    _first_value(raw, 'cmiuid', 'cmiuuid'),
+                    _first_value(raw, 'call_id'),
+                )
+                log = process_cdr_record(
+                    tenant_id,
+                    raw,
+                    direction,
+                    synced_via='manual_sync',
+                    agent_user_id=user_id,
+                    queue_archive=queue_archives,
+                )
+                if not log:
+                    stats['errors'] += 1
+                    stats['error_details'].append(f'{direction}/{call_type_int}: invalid CDR payload')
+                    continue
                 if existing_count == 0:
                     stats['created'] += 1
                 else:
@@ -263,12 +429,18 @@ def sync_cdr_for_agent(tenant_id, user_id, hours_back: int = 24) -> dict:
                 break  # no more pages
             page += 1
 
-    logger.info('CDR sync for user %s: %s', user_id, stats)
+    if stats['errors']:
+        stats['status'] = 'partial' if stats['created'] or stats['updated'] else 'failed'
+    logger.info('CDR sync for user %s: %s', user_id, {**stats, 'error_details': len(stats['error_details'])})
     return stats
 
 
-def _count_existing(tenant_id, cmiuid) -> int:
+def _count_existing(tenant_id, cmiuid, telecmi_call_id=None) -> int:
     from telephony.models import CallLog
-    if not cmiuid:
+    from django.db.models import Q
+    if not cmiuid and not telecmi_call_id:
         return 0
-    return CallLog.objects.filter(tenant_id=tenant_id, cmiuid=cmiuid).count()
+    identity = Q(cmiuid=str(cmiuid)) if cmiuid else Q()
+    if telecmi_call_id:
+        identity |= Q(telecmi_call_id=str(telecmi_call_id))
+    return CallLog.objects.filter(tenant_id=tenant_id).filter(identity).count()
