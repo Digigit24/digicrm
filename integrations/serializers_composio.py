@@ -9,7 +9,8 @@ drf-spectacular and the MCP tool descriptions.
 SECURITY: none of these serializers may ever expose a credential. Composio
 holds the tokens, so there is nothing to leak from ComposioConnection - but
 ``metadata`` is a free-form JSON column, so it is NOT serialized by the list
-or detail serializers, and COMPOSIO_API_KEY appears nowhere in this module.
+or detail serializers, and the server-side Composio API key is never read,
+referenced or rendered anywhere in this module.
 """
 
 from rest_framework import serializers
