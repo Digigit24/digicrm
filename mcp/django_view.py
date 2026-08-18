@@ -31,8 +31,20 @@ def _cors(response):
 
 
 def _check_auth(request) -> bool:
+    """Authenticate an MCP request against MCP_SECRET.
+
+    FAILS CLOSED. If MCP_SECRET is unset/blank the server is misconfigured and
+    every request is rejected. Returning True here (the previous behaviour)
+    left an unconfigured deploy completely open: the MCP HTTP dispatcher talks
+    straight to the ORM with no DRF permission classes, so this shared secret
+    is the only access control on the whole surface.
+    """
     if not MCP_SECRET:
-        return True
+        logger.error(
+            'MCP_SECRET is not configured — refusing all MCP requests. '
+            'Set MCP_SECRET in the environment to enable the MCP endpoint.'
+        )
+        return False
     auth = request.headers.get('Authorization', '')
     if auth.startswith('Bearer ') and auth[7:].strip() == MCP_SECRET:
         return True
@@ -85,10 +97,16 @@ def oauth_token(request):
     except Exception:
         body = {}
     client_secret = body.get('client_secret') or request.POST.get('client_secret', '')
-    if MCP_SECRET and client_secret != MCP_SECRET:
+    # Fail closed: an unconfigured server must not mint a usable access token.
+    if not MCP_SECRET:
+        logger.error('MCP_SECRET is not configured — refusing to issue an OAuth token.')
+        return _cors(JsonResponse({'error': 'server_error',
+                                   'error_description': 'MCP_SECRET is not configured'},
+                                  status=503))
+    if client_secret != MCP_SECRET:
         return _cors(JsonResponse({'error': 'invalid_client'}, status=401))
     return _cors(JsonResponse({
-        'access_token': MCP_SECRET or 'no-secret-configured',
+        'access_token': MCP_SECRET,
         'token_type':   'bearer',
         'expires_in':   31536000,
     }))
