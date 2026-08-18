@@ -241,12 +241,9 @@ expect_raises(
     lambda: dispatch('create_task', {'lead_id': 99, 'title': 'x'}),
     'lead')
 
-expect_raises(
-    "create_meeting refuses another tenant's lead_id",
-    lambda: dispatch('create_meeting', {
-        'lead_id': 99, 'title': 'x',
-        'start_time': '2026-09-01T10:00:00Z', 'end_time': '2026-09-01T11:00:00Z'}),
-    'lead')
+# NOTE: create_meeting's lead scoping is asserted in section 3b instead. Its
+# dispatch branch imports MeetingAttendee before it reaches the lead check, so
+# it can only run where the calendar-backend schema is present.
 
 # update_lead_status: the lead lookup is already tenant-scoped, so give it a
 # lead it CAN find and prove the status_id is what gets rejected.
@@ -258,6 +255,152 @@ expect_raises(
 
 for k, v in _orig.items():
     setattr(crm_models if hasattr(crm_models, k) else wa_models, k, v)
+
+
+# ---------------------------------------------------------------------------
+# 3b. Calendar meeting tools (calendar-backend schema)
+# ---------------------------------------------------------------------------
+print('\n%s-- Meeting tools against the calendar-backend schema%s' % (BOLD, RESET))
+
+# These tools reference Meeting columns and helpers that land on the
+# Digigit24/calendar-backend branch (MeetingAttendee, is_deleted, timezone,
+# recurrence_rule, meetings.recurrence). Until that branch is merged this
+# worktree still has the old model, so skip rather than report a false failure.
+try:
+    from meetings.models import MeetingAttendee  # noqa: F401
+    from meetings import recurrence  # noqa: F401
+    _CALENDAR_SCHEMA = True
+except ImportError as _exc:
+    _CALENDAR_SCHEMA = False
+    print('  %sSKIP%s  calendar-backend schema not present here (%s).' % (
+        YELLOW, RESET, _exc))
+    print('        These cases run once Digigit24/calendar-backend is merged.')
+
+if _CALENDAR_SCHEMA:
+    import meetings.models as mtg_models
+
+    _orig_meeting = mtg_models.Meeting
+    _orig_lead = crm_models.Lead
+
+    START = '2026-09-01T10:00:00Z'
+    END = '2026-09-01T11:00:00Z'
+
+    def base(**over):
+        out = {'title': 'probe', 'start_time': START, 'end_time': END}
+        out.update(over)
+        return out
+
+    # -- tenant scoping on every id these tools accept --------------------
+    crm_models.Lead = FakeModel([FakeRow(99, {'tenant_id': TENANT_B})])
+    expect_raises("create_meeting refuses another tenant's lead_id",
+                  lambda: dispatch('create_meeting', base(lead_id=99)), 'lead')
+
+    expect_raises("create_meeting refuses another tenant's attendee lead_id",
+                  lambda: dispatch('create_meeting',
+                                   base(attendees=[{'lead_id': 99}])),
+                  'attendee lead')
+
+    # A foreign meeting_id, and a soft-deleted one, must both read as gone.
+    mtg_models.Meeting = FakeModel([FakeRow(99, {'tenant_id': TENANT_B,
+                                                 'is_deleted': False})])
+    expect_raises("update_meeting refuses another tenant's meeting_id",
+                  lambda: dispatch('update_meeting',
+                                   {'meeting_id': 99, 'title': 'x'}),
+                  'meeting')
+
+    deleted = FakeModel([FakeRow(5, {'tenant_id': TENANT_A, 'is_deleted': True})])
+    mtg_models.Meeting = deleted
+    expect_raises('update_meeting refuses a soft-deleted meeting',
+                  lambda: dispatch('update_meeting',
+                                   {'meeting_id': 5, 'title': 'x'}),
+                  'meeting')
+    check('update_meeting scopes on is_deleted=False',
+          any(c.get('is_deleted') is False for c in deleted.objects.filter_calls),
+          str(deleted.objects.filter_calls))
+
+    # -- attendee identity and argument validation ------------------------
+    crm_models.Lead = FakeModel([FakeRow(1, {'tenant_id': TENANT_A})])
+    expect_raises('create_meeting rejects a malformed attendee user_id',
+                  lambda: dispatch('create_meeting',
+                                   base(attendees=[{'user_id': 'not-a-uuid'}])),
+                  'user uuid')
+    expect_raises('create_meeting rejects an attendee with no identity',
+                  lambda: dispatch('create_meeting',
+                                   base(attendees=[{'display_name': 'Nobody'}])),
+                  'at least one of')
+    expect_raises('create_meeting refuses ORGANIZER as an attendee role',
+                  lambda: dispatch('create_meeting',
+                                   base(attendees=[{'email': 'a@b.c',
+                                                    'role': 'ORGANIZER'}])),
+                  'required or optional')
+    expect_raises('create_meeting rejects end_time before start_time',
+                  lambda: dispatch('create_meeting',
+                                   base(start_time=END, end_time=START)),
+                  'end_time')
+    expect_raises('create_meeting rejects an unparseable start_time',
+                  lambda: dispatch('create_meeting',
+                                   base(start_time='next tuesday')),
+                  'iso 8601')
+    expect_raises('create_meeting rejects an unknown IANA timezone',
+                  lambda: dispatch('create_meeting',
+                                   base(timezone='Mars/Olympus_Mons')),
+                  'timezone')
+    expect_raises('create_meeting rejects a malformed rrule',
+                  lambda: dispatch('create_meeting', base(rrule='every monday')),
+                  'freq=')
+
+    mtg_models.Meeting = _orig_meeting
+    crm_models.Lead = _orig_lead
+
+    # -- recurrence helpers are the calendar-backend ones, not a second
+    #    private RRULE parser --------------------------------------------
+    from datetime import datetime, timezone as _dtz
+    dtstart = datetime(2026, 9, 1, 10, 0, tzinfo=_dtz.utc)
+    rule, end = dv._meeting_recurrence('RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=3',
+                                       dtstart, 'Asia/Kolkata')
+    check('rrule "RRULE:" prefix is stripped', rule.startswith('FREQ='), repr(rule))
+    check('COUNT= resolves a concrete recurrence_end_at', end is not None, repr(end))
+    rule2, end2 = dv._meeting_recurrence('FREQ=DAILY', dtstart, 'UTC')
+    check('an open-ended rule leaves recurrence_end_at null', end2 is None, repr(end2))
+    check('no rrule means no recurrence', dv._meeting_recurrence(None, dtstart, 'UTC')
+          == (None, None))
+
+
+# ---------------------------------------------------------------------------
+# 3c. Declared-vs-implemented contract for the meeting tools
+# ---------------------------------------------------------------------------
+print('\n%s-- Every declared meeting property is actually written%s' % (BOLD, RESET))
+
+import re as _re  # noqa: E402
+from mcp.server import TOOLS as _TOOLS  # noqa: E402
+
+_src = open(dv.__file__.replace('.pyc', '.py'), encoding='utf-8').read()
+_lines = _src.split('\n')
+_starts = [(i, m.group(1)) for i, l in enumerate(_lines)
+           for m in [_re.match(r"    if name == '([a-z_]+)':", l)] if m]
+_starts.append((len(_lines), None))
+_bodies = {n: '\n'.join(_lines[ln:_starts[i + 1][0]])
+           for i, (ln, n) in enumerate(_starts[:-1])}
+_helpers = _src[:_src.index('def _dispatch_tool')]
+
+for _tool_name in ('create_meeting', 'update_meeting'):
+    _tool_def = next(t for t in _TOOLS if t['name'] == _tool_name)
+    _body = _bodies[_tool_name]
+    _orphans = [
+        prop for prop in _tool_def['inputSchema']['properties']
+        if ("'%s'" % prop) not in _body and ("'%s'" % prop) not in _helpers
+    ]
+    check('%s writes every property it declares' % _tool_name,
+          not _orphans, 'declared but never read: %s' % _orphans)
+
+check('create_meeting no longer declares attendees as a list of strings',
+      next(t for t in _TOOLS if t['name'] == 'create_meeting')
+      ['inputSchema']['properties']['attendees']['items']['type'] == 'object')
+
+for _tool_name in ('list_meetings', 'get_meetings_calendar', 'get_sales_dashboard'):
+    check('%s hides soft-deleted meetings' % _tool_name,
+          'is_deleted=False' in _bodies[_tool_name],
+          'no is_deleted filter found')
 
 
 # ---------------------------------------------------------------------------

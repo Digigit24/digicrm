@@ -555,30 +555,89 @@ use list_meetings when you need to page beyond that.
 })
 
 _tool('create_meeting', """
-Schedule a meeting linked to a lead.
+Schedule a meeting, optionally linked to a lead and with attendees.
 
-Required: lead_id, title, start_time, end_time
-start_time / end_time: ISO 8601 datetime strings
+Returns the created meeting's id, uid, title, start_at, end_at, status and the
+attendee rows created.
+The MCP service account is always added as the ORGANIZER attendee.
+Pass lead_id for a customer-facing meeting (get it from list_leads or
+lookup_lead_by_phone); omit it only for an INTERNAL meeting.
+For a repeating meeting pass rrule; the series end is derived from its UNTIL or
+COUNT automatically.
+Read meetings back with list_meetings or get_meetings_calendar, and change one
+with update_meeting.
 """, {
-    'lead_id':      {'type': 'integer'},
-    'title':        {'type': 'string'},
-    'start_time':   {'type': 'string', 'description': 'ISO 8601 datetime'},
-    'end_time':     {'type': 'string', 'description': 'ISO 8601 datetime'},
-    'location':     {'type': 'string'},
-    'description':  {'type': 'string'},
-    'attendees':    {'type': 'array', 'items': {'type': 'string'}, 'description': 'List of email addresses'},
-}, ['lead_id', 'title', 'start_time', 'end_time'])
+    'title':          {'type': 'string',  'description': 'Meeting title'},
+    'start_time':     {'type': 'string',  'description': 'Start as an ISO 8601 datetime (e.g. 2026-09-01T10:30:00Z)'},
+    'end_time':       {'type': 'string',  'description': 'End as an ISO 8601 datetime. Must not be before start_time.'},
+    'lead_id':        {'type': 'integer', 'description': 'Lead this meeting is with. Omit for an internal meeting.'},
+    'meeting_type':   {'type': 'string',
+                       'enum': ['MEETING', 'CALL', 'DEMO', 'SITE_VISIT',
+                                'FOLLOW_UP', 'INTERNAL', 'OTHER'],
+                       'description': 'What kind of meeting this is (default MEETING). Drives the calendar colour.'},
+    'all_day':        {'type': 'boolean', 'description': 'True for an all-day event (default false)'},
+    'timezone':       {'type': 'string',  'description': 'IANA timezone the meeting is authored in, e.g. "Asia/Kolkata" (default UTC). start_time/end_time stay absolute instants; this is what the UI renders in and what rrule is expanded against so DST stays correct.'},
+    'location':       {'type': 'string',  'description': 'Physical location or room'},
+    'description':    {'type': 'string',  'description': 'Agenda / body shown on the calendar entry'},
+    'notes':          {'type': 'string',  'description': 'Internal notes, not part of the calendar entry'},
+    'conference_url': {'type': 'string',  'description': 'Video call link (Meet/Zoom/Teams)'},
+    'status':         {'type': 'string',
+                       'enum': ['SCHEDULED', 'CONFIRMED', 'TENTATIVE',
+                                'CANCELLED', 'COMPLETED', 'NO_SHOW'],
+                       'description': 'Lifecycle state (default SCHEDULED)'},
+    'visibility':     {'type': 'string', 'enum': ['DEFAULT', 'PUBLIC', 'PRIVATE'],
+                       'description': 'PRIVATE hides the details from anyone who is not the owner or an attendee (default DEFAULT)'},
+    'rrule':          {'type': 'string',  'description': 'RFC 5545 recurrence rule without the "RRULE:" prefix, e.g. "FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=20261231T183000Z". Omit for a one-off meeting.'},
+    'attendees':      {'type': 'array',
+                       'description': 'People to invite. Each entry needs at least one of user_id, lead_id or email.',
+                       'items': {
+                           'type': 'object',
+                           'properties': {
+                               'user_id':      {'type': 'string',  'description': 'Internal user UUID. Resolve names via list_users.'},
+                               'lead_id':      {'type': 'integer', 'description': 'CRM lead to invite. Get it from list_leads.'},
+                               'email':        {'type': 'string',  'description': 'Raw email address for an external guest'},
+                               'display_name': {'type': 'string',  'description': 'Name to show for this attendee'},
+                               'role':         {'type': 'string', 'enum': ['REQUIRED', 'OPTIONAL'],
+                                                'description': 'Default REQUIRED. The organizer is set automatically and cannot be assigned here.'},
+                               'notify':       {'type': 'boolean', 'description': 'Send this attendee reminders (default true)'},
+                           },
+                       }},
+}, ['title', 'start_time', 'end_time'])
 
 _tool('update_meeting', """
-Update a scheduled meeting. All fields except meeting_id are optional.
+Update a scheduled meeting.
+
+All fields except meeting_id are optional -- only send what you want to change.
+Returns the meeting id and the list of fields that were changed.
+Setting status to CANCELLED records who cancelled it and when (and stores
+cancellation_reason if given); setting it to COMPLETED stamps completed_at.
+Cancelling is the correct way to call a meeting off -- there is no delete tool.
+Get meeting_id from list_meetings or get_meetings_calendar. Attendees cannot be
+changed here; recreate the meeting if the invite list is wrong.
 """, {
-    'meeting_id':   {'type': 'integer'},
-    'title':        {'type': 'string'},
-    'start_time':   {'type': 'string'},
-    'end_time':     {'type': 'string'},
-    'location':     {'type': 'string'},
-    'description':  {'type': 'string'},
-    'status':       {'type': 'string', 'enum': ['SCHEDULED', 'COMPLETED', 'CANCELLED']},
+    'meeting_id':          {'type': 'integer', 'description': 'ID of the meeting. Get it from list_meetings.'},
+    'title':               {'type': 'string',  'description': 'New title'},
+    'start_time':          {'type': 'string',  'description': 'New start as an ISO 8601 datetime'},
+    'end_time':            {'type': 'string',  'description': 'New end as an ISO 8601 datetime'},
+    'lead_id':             {'type': 'integer', 'description': 'Re-link the meeting to this lead'},
+    'meeting_type':        {'type': 'string',
+                            'enum': ['MEETING', 'CALL', 'DEMO', 'SITE_VISIT',
+                                     'FOLLOW_UP', 'INTERNAL', 'OTHER'],
+                            'description': 'New meeting type'},
+    'all_day':             {'type': 'boolean', 'description': 'Switch to/from an all-day event'},
+    'timezone':            {'type': 'string',  'description': 'New IANA authoring timezone, e.g. "Asia/Kolkata"'},
+    'location':            {'type': 'string',  'description': 'New location'},
+    'description':         {'type': 'string',  'description': 'New agenda / body'},
+    'notes':               {'type': 'string',  'description': 'New internal notes'},
+    'conference_url':      {'type': 'string',  'description': 'New video call link'},
+    'status':              {'type': 'string',
+                            'enum': ['SCHEDULED', 'CONFIRMED', 'TENTATIVE',
+                                     'CANCELLED', 'COMPLETED', 'NO_SHOW'],
+                            'description': 'New lifecycle state'},
+    'cancellation_reason': {'type': 'string',  'description': 'Why it was cancelled. Only meaningful with status = CANCELLED.'},
+    'visibility':          {'type': 'string', 'enum': ['DEFAULT', 'PUBLIC', 'PRIVATE'],
+                            'description': 'New visibility'},
+    'rrule':               {'type': 'string',  'description': 'New RFC 5545 recurrence rule without the "RRULE:" prefix. Send an empty string to make the meeting one-off again.'},
 }, ['meeting_id'])
 
 _tool('update_lead_status', """

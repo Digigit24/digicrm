@@ -205,6 +205,104 @@ def _require(model, obj_id, label, **scope):
     return obj
 
 
+# Fields on Meeting that the calendar-backend branch added and that both meeting
+# write tools accept verbatim (arg name == column name).
+_MEETING_PASSTHROUGH = (
+    'meeting_type', 'all_day', 'timezone', 'location', 'description', 'notes',
+    'conference_url', 'status', 'visibility',
+)
+
+
+def _meeting_datetime(args, key, required=False):
+    """Parse an ISO 8601 meeting timestamp into an aware datetime."""
+    from django.utils import timezone as _tz
+    from django.utils.dateparse import parse_datetime
+    raw = args.get(key)
+    if raw in (None, ''):
+        if required:
+            raise RuntimeError('%s is required' % key)
+        return None
+    parsed = parse_datetime(str(raw))
+    if parsed is None:
+        raise RuntimeError(
+            '%s must be an ISO 8601 datetime, e.g. 2026-09-01T10:30:00Z' % key)
+    if _tz.is_naive(parsed):
+        parsed = _tz.make_aware(parsed, _tz.get_current_timezone())
+    return parsed
+
+
+def _meeting_recurrence(rrule, dtstart, tz_name):
+    """Validate an RRULE and resolve its denormalised series end.
+
+    Reuses meetings.recurrence -- the calendar-backend branch's canonical
+    helpers -- so an MCP-created series behaves exactly like a UI-created one
+    instead of a second, subtly different RRULE parser.
+    """
+    from meetings import recurrence
+    normalized = recurrence.normalize_rule(rrule)
+    if not normalized:
+        return None, None
+    if 'FREQ=' not in normalized.upper():
+        raise RuntimeError(
+            'rrule must be an RFC 5545 recurrence rule containing FREQ=, e.g. '
+            '"FREQ=WEEKLY;BYDAY=MO,WE". Got %r.' % rrule)
+    if not recurrence.rule_is_valid(normalized, dtstart, tz_name):
+        raise RuntimeError('rrule %r is not a rule this calendar can expand.' % rrule)
+    return normalized, recurrence.compute_recurrence_end(normalized, dtstart, tz_name)
+
+
+def _meeting_attendee_specs(args, meeting_tenant_id):
+    """Validate the `attendees` argument into ready-to-create kwargs.
+
+    Every id is tenant-checked here, before anything is written: attendee
+    lead_ids go through _require, and user_ids must at least be well-formed
+    UUIDs (the user directory is a separate service, so it cannot be joined).
+    """
+    import uuid as _uuid
+    from crm.models import Lead as _Lead
+    raw = args.get('attendees') or []
+    if not isinstance(raw, list):
+        raise RuntimeError('attendees must be a list of objects')
+    specs = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                'attendees[%d] must be an object with at least one of '
+                'user_id, lead_id or email' % index)
+        user_id = (str(item.get('user_id')).strip()
+                   if item.get('user_id') else None)
+        if user_id:
+            try:
+                _uuid.UUID(user_id)
+            except ValueError:
+                raise RuntimeError(
+                    'attendees[%d].user_id must be a user UUID — resolve names '
+                    'via list_users' % index)
+        lead_id = item.get('lead_id')
+        if lead_id is not None:
+            lead_id = _require(_Lead, lead_id, 'Attendee lead',
+                               tenant_id=meeting_tenant_id).id
+        email = (item.get('email') or '').strip()
+        if not (user_id or lead_id or email):
+            raise RuntimeError(
+                'attendees[%d] needs at least one of user_id, lead_id or email'
+                % index)
+        role = (item.get('role') or 'REQUIRED').upper()
+        if role not in ('REQUIRED', 'OPTIONAL'):
+            raise RuntimeError(
+                'attendees[%d].role must be REQUIRED or OPTIONAL — the '
+                'organizer is assigned by the server' % index)
+        specs.append({
+            'user_id':      user_id,
+            'lead_id':      lead_id,
+            'email':        email,
+            'display_name': (item.get('display_name') or '').strip(),
+            'role':         role,
+            'notify':       bool(item.get('notify', True)),
+        })
+    return specs
+
+
 def _paginate(args: dict, default_size: int = 50, max_size: int = 200):
     """Return (page, page_size, offset) with page_size hard-capped.
 
@@ -370,7 +468,8 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                         'lead_id', 'lead__name')[:5]
             ),
             'upcoming_meetings': list(
-                Meeting.objects.filter(tenant_id=TENANT_ID, start_at__gte=now)
+                Meeting.objects.filter(tenant_id=TENANT_ID, start_at__gte=now,
+                                       is_deleted=False)
                 .order_by('start_at')
                 .values('id', 'title', 'start_at', 'end_at', 'lead_id', 'lead__name')[:5]
             ),
@@ -930,7 +1029,7 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── list_meetings ───────────────────────────────────────────────────────────
     if name == 'list_meetings':
-        qs = Meeting.objects.filter(tenant_id=TENANT_ID)
+        qs = Meeting.objects.filter(tenant_id=TENANT_ID, is_deleted=False)
         if args.get('lead_id'):
             qs = qs.filter(lead_id=args['lead_id'])
         if args.get('start_after'):
@@ -948,8 +1047,9 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         page, page_size, offset = _paginate(args)
         total = qs.count()
         rows = list(qs.order_by('start_at').values(
-            'id', 'title', 'start_at', 'end_at', 'location', 'notes',
-            'lead_id', 'lead__name', 'created_at',
+            'id', 'uid', 'title', 'start_at', 'end_at', 'all_day', 'timezone',
+            'meeting_type', 'status', 'visibility', 'location', 'conference_url',
+            'notes', 'lead_id', 'lead__name', 'recurrence_rule', 'created_at',
         )[offset:offset + page_size])
         return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
 
@@ -982,10 +1082,11 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             end = start + _timedelta(days=MAX_DAYS)
         rows = list(
             Meeting.objects
-            .filter(tenant_id=TENANT_ID,
+            .filter(tenant_id=TENANT_ID, is_deleted=False,
                     start_at__date__gte=start, start_at__date__lte=end)
             .order_by('start_at')
-            .values('id', 'title', 'start_at', 'end_at', 'location',
+            .values('id', 'title', 'start_at', 'end_at', 'all_day', 'timezone',
+                    'meeting_type', 'status', 'location', 'conference_url',
                     'lead_id', 'lead__name')[:MAX_ROWS]
         )
         calendar_data = {}
@@ -1004,29 +1105,177 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── create_meeting ──────────────────────────────────────────────────────────
     if name == 'create_meeting':
+        from django.db import transaction
+        from meetings.models import (
+            MeetingAttendee, AttendeeRoleEnum, AttendeeResponseEnum,
+        )
+        from meetings import recurrence as _recurrence
         if not OWNER_USER_ID:
             raise RuntimeError('MCP_OWNER_USER_ID env var not set')
-        lead = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
-        meeting = Meeting.objects.create(
-            tenant_id=TENANT_ID,
-            owner_user_id=OWNER_USER_ID,
-            lead_id=lead.id,
-            title=args['title'],
-            start_at=args['start_time'],
-            end_at=args['end_time'],
-            notes=args.get('notes') or '',
-        )
-        return {'id': meeting.id, 'title': meeting.title}
+
+        start_at = _meeting_datetime(args, 'start_time', required=True)
+        end_at   = _meeting_datetime(args, 'end_time',   required=True)
+        if end_at < start_at:
+            raise RuntimeError('end_time must not be before start_time')
+
+        # lead_id is optional now: an INTERNAL meeting has no lead. When given
+        # it still has to belong to this workspace.
+        lead_id = None
+        if args.get('lead_id') is not None:
+            lead_id = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID).id
+
+        tz_name = (args.get('timezone') or 'UTC').strip() or 'UTC'
+        if not _recurrence.is_valid_timezone(tz_name):
+            raise RuntimeError(
+                'timezone %r is not a known IANA timezone, e.g. "Asia/Kolkata" '
+                'or "UTC".' % tz_name)
+
+        rrule, recurrence_end = _meeting_recurrence(
+            args.get('rrule'), start_at, tz_name)
+
+        # Validate every attendee id BEFORE writing anything.
+        specs = _meeting_attendee_specs(args, TENANT_ID)
+
+        fields = {
+            'tenant_id':     TENANT_ID,
+            'owner_user_id': OWNER_USER_ID,
+            'lead_id':       lead_id,
+            'title':         args['title'],
+            'start_at':      start_at,
+            'end_at':        end_at,
+            'timezone':      tz_name,
+        }
+        for key in _MEETING_PASSTHROUGH:
+            if key in ('timezone', 'notes'):
+                continue
+            if args.get(key) is not None:
+                fields[key] = args[key]
+        fields['notes'] = args.get('notes') or ''
+        if rrule:
+            fields['recurrence_rule']   = rrule
+            fields['recurrence_end_at'] = recurrence_end
+
+        with transaction.atomic():
+            meeting = Meeting.objects.create(**fields)
+            # The organizer row is what makes this meeting visible to `team`
+            # scope and RSVP. A meeting created without it is invisible to
+            # everyone but its owner.
+            attendees = [MeetingAttendee.objects.create(
+                tenant_id=TENANT_ID,
+                meeting=meeting,
+                user_id=OWNER_USER_ID,
+                display_name='MCP agent',
+                role=AttendeeRoleEnum.ORGANIZER,
+                response_status=AttendeeResponseEnum.ACCEPTED,
+                is_organizer=True,
+            )]
+            for spec in specs:
+                # The organizer is already on the meeting; a duplicate user_id
+                # would violate uniq_attendee_user_per_meeting.
+                if spec['user_id'] and spec['user_id'] == OWNER_USER_ID:
+                    continue
+                attendees.append(MeetingAttendee.objects.create(
+                    tenant_id=TENANT_ID,
+                    meeting=meeting,
+                    user_id=spec['user_id'],
+                    lead_id=spec['lead_id'],
+                    email=spec['email'],
+                    display_name=spec['display_name'],
+                    role=spec['role'],
+                    notify=spec['notify'],
+                ))
+
+        return {
+            'id':                meeting.id,
+            'uid':               str(meeting.uid),
+            'title':             meeting.title,
+            'start_at':          meeting.start_at,
+            'end_at':            meeting.end_at,
+            'all_day':           meeting.all_day,
+            'timezone':          meeting.timezone,
+            'meeting_type':      meeting.meeting_type,
+            'status':            meeting.status,
+            'visibility':        meeting.visibility,
+            'lead_id':           meeting.lead_id,
+            'recurrence_rule':   meeting.recurrence_rule,
+            'recurrence_end_at': meeting.recurrence_end_at,
+            'attendees': [
+                {'id': a.id, 'user_id': str(a.user_id) if a.user_id else None,
+                 'lead_id': a.lead_id, 'email': a.email, 'role': a.role}
+                for a in attendees
+            ],
+        }
 
     # ── update_meeting ──────────────────────────────────────────────────────────
     if name == 'update_meeting':
-        meeting = Meeting.objects.get(id=args['meeting_id'], tenant_id=TENANT_ID)
-        field_map = {'start_time': 'start_at', 'end_time': 'end_at'}
-        for f in ['title', 'notes', 'start_time', 'end_time', 'location']:
-            if f in args:
-                setattr(meeting, field_map.get(f, f), args[f])
+        from meetings.models import MeetingStatusEnum
+        from meetings import recurrence as _recurrence
+        # is_deleted=False in the scope: a soft-deleted meeting must read as
+        # gone, not as editable.
+        meeting = _require(Meeting, args['meeting_id'], 'Meeting',
+                           tenant_id=TENANT_ID, is_deleted=False)
+        changed = []
+
+        if 'title' in args:
+            meeting.title = args['title']
+            changed.append('title')
+        if args.get('start_time') is not None:
+            meeting.start_at = _meeting_datetime(args, 'start_time')
+            changed.append('start_at')
+        if args.get('end_time') is not None:
+            meeting.end_at = _meeting_datetime(args, 'end_time')
+            changed.append('end_at')
+        if meeting.end_at < meeting.start_at:
+            raise RuntimeError('end_time must not be before start_time')
+
+        if args.get('lead_id') is not None:
+            meeting.lead_id = _require(Lead, args['lead_id'], 'Lead',
+                                       tenant_id=TENANT_ID).id
+            changed.append('lead_id')
+
+        if args.get('timezone') is not None:
+            tz_name = str(args['timezone']).strip() or 'UTC'
+            if not _recurrence.is_valid_timezone(tz_name):
+                raise RuntimeError(
+                    'timezone %r is not a known IANA timezone, e.g. '
+                    '"Asia/Kolkata" or "UTC".' % tz_name)
+            meeting.timezone = tz_name
+            changed.append('timezone')
+
+        for key in _MEETING_PASSTHROUGH:
+            if key in ('timezone', 'status'):
+                continue
+            if key in args and args[key] is not None:
+                setattr(meeting, key, args[key])
+                changed.append(key)
+
+        if 'rrule' in args:
+            rrule, recurrence_end = _meeting_recurrence(
+                args.get('rrule'), meeting.start_at, meeting.timezone)
+            meeting.recurrence_rule   = rrule
+            meeting.recurrence_end_at = recurrence_end
+            changed += ['recurrence_rule', 'recurrence_end_at']
+
+        if args.get('status') is not None:
+            meeting.status = args['status']
+            changed.append('status')
+            if meeting.status == MeetingStatusEnum.CANCELLED:
+                meeting.cancelled_at          = timezone.now()
+                meeting.cancelled_by_user_id  = OWNER_USER_ID or None
+                meeting.cancellation_reason   = args.get('cancellation_reason') or ''
+                changed += ['cancelled_at', 'cancelled_by_user_id',
+                            'cancellation_reason']
+            elif meeting.status == MeetingStatusEnum.COMPLETED:
+                meeting.completed_at = timezone.now()
+                changed.append('completed_at')
+
+        if not changed:
+            raise RuntimeError(
+                'Nothing to update — send at least one field besides meeting_id')
+
         meeting.save()
-        return {'id': meeting.id, 'updated': True}
+        return {'id': meeting.id, 'updated': True, 'changed_fields': changed,
+                'status': meeting.status}
 
 
     # ── WhatsApp — shared adapter setup ────────────────────────────────────────

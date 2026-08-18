@@ -181,12 +181,41 @@ class Command(BaseCommand):
             'start_time': (timezone.now() + timezone.timedelta(hours=1)).isoformat(),
             'end_time':   (timezone.now() + timezone.timedelta(hours=2)).isoformat(),
             'notes': 'Created by test_mcp — safe to delete',
+            # Calendar fields added by the calendar-backend branch. Exercising
+            # them here is what proves create_meeting still writes every field
+            # it declares rather than silently dropping them.
+            'meeting_type':   'DEMO',
+            'timezone':       'Asia/Kolkata',
+            'location':       'Test Room',
+            'description':    'Agenda: verify MCP writes calendar fields',
+            'conference_url': 'https://meet.example.com/_mcp_test',
+            'status':         'CONFIRMED',
+            'visibility':     'PRIVATE',
+            'all_day':        False,
+        }, skip_if_dry=True, section_name='meetings')
+
+        run('create_meeting', {
+            'title': '_MCP_TEST_RECURRING',
+            'start_time': (timezone.now() + timezone.timedelta(days=1)).isoformat(),
+            'end_time':   (timezone.now() + timezone.timedelta(days=1, hours=1)).isoformat(),
+            'meeting_type': 'INTERNAL',
+            'timezone':     'Asia/Kolkata',
+            # No lead_id: an INTERNAL meeting does not need one.
+            'rrule': 'FREQ=WEEKLY;BYDAY=MO,WE;COUNT=4',
         }, skip_if_dry=True, section_name='meetings')
 
         if sample_meeting_id:
             run('update_meeting', {
                 'meeting_id': sample_meeting_id,
                 'notes': f'Updated by test_mcp at {timezone.now()}',
+                'description': 'Description updated by test_mcp',
+                'location': 'Test Room 2',
+            }, skip_if_dry=True, section_name='meetings')
+
+            run('update_meeting', {
+                'meeting_id': sample_meeting_id,
+                'status': 'CANCELLED',
+                'cancellation_reason': 'Cancelled by test_mcp',
             }, skip_if_dry=True, section_name='meetings')
 
         # ─────────────────────────────────────────────────────────────────────
