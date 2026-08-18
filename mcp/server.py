@@ -2,11 +2,11 @@
 """
 DigiCRM Sales Agent MCP Server — tool catalog (TOOLS)
 
-Registers 40 tools for a Claude sales agent to interact with DigiCRM:
-  Phase 1 (18) — CRM core: leads, groups, tasks, activities, meetings, status
-  Phase 2 (10) — WhatsApp messaging: send, chat, sequences, inbox ops
-  Phase 3 (11) — Automation: sequences, enrollments, campaigns
-  Phase 4 (1)  — Discovery reads
+Registers 56 tools for a Claude sales agent to interact with DigiCRM:
+  CRM core        (25) — leads, groups, statuses, tasks, activities, meetings
+  WhatsApp        (11) — send, chat, templates, inbox ops, AI context
+  Automation      (15) — sequences, steps, enrollments, campaigns
+  Discovery reads (5)  — dashboard, kanban, follow-ups, phone lookup, audit log
 
 The authoritative count is always ``len(TOOLS)``; ``GET /mcp/health`` reports it.
 
@@ -103,20 +103,87 @@ def _tool(name: str, description: str, properties: dict, required: list = None):
 # ---------------------------------------------------------------------------
 
 _tool('list_leads', """
-Search and list leads in the CRM.
+Search, filter and list leads in the CRM. This is the advanced lead search.
 
-Returns paginated list with id, name, phone, email, status, lead_score, source,
-assigned_to.
-Use search to filter by name, phone, or email.
-Use assigned_to (a user UUID from list_users) to show only that user's leads,
-or unassigned=true to show leads with no owner.
+Returns a paginated list with id, name, phone, email, status, priority,
+lead_score, source, city, assigned_to, next_follow_up_at and created_at.
+Combine any of the filters below; they are ANDed together.
+Resolve status_id / status_ids via list_lead_statuses, lead_group_id via
+list_lead_groups, and assigned_to via list_users. To find one lead from a phone
+number use lookup_lead_by_phone instead.
 """, {
-    'search':      {'type': 'string',  'description': 'Filter by name, phone, or email (partial match)'},
-    'assigned_to': {'type': 'string',  'description': 'User UUID - only return leads assigned to this user. Resolve names via list_users.'},
-    'unassigned':  {'type': 'boolean', 'description': 'If true, only return leads with no assigned user. Ignored when assigned_to is set.'},
-    'page':        {'type': 'integer', 'description': 'Page number (default 1)'},
-    'page_size':   {'type': 'integer', 'description': 'Results per page (default 20, max 100)'},
+    'search':                {'type': 'string',  'description': 'Filter by name, phone, or email (partial match)'},
+    'assigned_to':           {'type': 'string',  'description': 'User UUID - only return leads assigned to this user. Resolve names via list_users.'},
+    'unassigned':            {'type': 'boolean', 'description': 'If true, only return leads with no assigned user. Ignored when assigned_to is set.'},
+    'status_id':             {'type': 'integer', 'description': 'Only leads in this pipeline stage. Get ids from list_lead_statuses.'},
+    'status_ids':            {'type': 'array',   'items': {'type': 'integer'},
+                              'description': 'Only leads in any of these pipeline stages. Overrides status_id when both are sent.'},
+    'priority':              {'type': 'string',  'enum': ['LOW', 'MEDIUM', 'HIGH'],
+                              'description': 'Only leads at this priority'},
+    'lead_score_min':        {'type': 'integer', 'description': 'Minimum lead_score (0-100), inclusive'},
+    'lead_score_max':        {'type': 'integer', 'description': 'Maximum lead_score (0-100), inclusive'},
+    'created_after':         {'type': 'string',  'description': 'Only leads created at/after this ISO 8601 datetime'},
+    'created_before':        {'type': 'string',  'description': 'Only leads created at/before this ISO 8601 datetime'},
+    'next_follow_up_before': {'type': 'string',  'description': 'Only leads whose next_follow_up_at is at/before this ISO 8601 datetime (use for "follow-ups due")'},
+    'city':                  {'type': 'string',  'description': 'Filter by city (partial match)'},
+    'lead_group_id':         {'type': 'integer', 'description': 'Only leads belonging to this group. Get ids from list_lead_groups.'},
+    'ordering':              {'type': 'string',
+                              'enum': ['created_at', '-created_at', 'name', '-name',
+                                       'lead_score', '-lead_score',
+                                       'next_follow_up_at', '-next_follow_up_at',
+                                       'updated_at', '-updated_at'],
+                              'description': 'Sort order (prefix with - for descending). Default -created_at.'},
+    'page':                  {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':             {'type': 'integer', 'description': 'Results per page (default 20, max 100)'},
 })
+
+_tool('lookup_lead_by_phone', """
+Find the single CRM lead that owns a phone number.
+
+Matches on the last 10 significant digits, so +91XXXXXXXXXX, 0XXXXXXXXXX and a
+bare 10-digit number all resolve to the same lead.
+Returns {found, id, name, phone, status} — found is false when nothing matches.
+Use this to turn an inbound caller or WhatsApp number into a lead_id for
+get_lead, append_lead_note, create_task and the WhatsApp tools.
+""", {
+    'phone': {'type': 'string', 'description': 'Phone number in any format (E.164, 0-prefixed, or bare digits)'},
+}, ['phone'])
+
+_tool('get_sales_dashboard', """
+Get a compact sales overview for the whole workspace.
+
+Returns totals (lead count, high-priority count, follow-ups due today,
+estimated pipeline value), lead counts broken down by status and by priority,
+the 5 newest leads, the 5 next open tasks, the 5 next upcoming meetings and the
+8 most recent lead activities.
+Takes no arguments. Use it to orient at the start of a session before drilling
+in with list_leads / list_tasks / list_meetings.
+""", {})
+
+_tool('get_lead_kanban', """
+Get leads grouped by pipeline stage, in board order.
+
+Returns one entry per active status (id, name, color_hex, order_index, is_won,
+is_lost, lead_count) each with a capped list of its leads. lead_count is the
+true total for the stage even when the leads list is truncated by
+limit_per_status.
+Pass status_id to fetch a single column. Status ids come from
+list_lead_statuses.
+""", {
+    'status_id':        {'type': 'integer', 'description': 'Only return this one status column. Get ids from list_lead_statuses.'},
+    'limit_per_status': {'type': 'integer', 'description': 'Max leads returned per status (default 20, max 100)'},
+})
+
+_tool('get_lead_follow_up', """
+Get the follow-up schedule for one lead.
+
+Returns next_follow_up_at and last_contacted_at plus the active reminder
+(id, remind_at, offset_minutes, status) if one is set, or null.
+Get lead_id from list_leads or lookup_lead_by_phone.
+Use set_lead_follow_up to change the schedule.
+""", {
+    'lead_id': {'type': 'integer', 'description': 'ID of the lead'},
+}, ['lead_id'])
 
 _tool('get_lead', """
 Get full details of a single lead by ID.
@@ -247,6 +314,20 @@ create_campaign.
     'page_size': {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
 })
 
+_tool('list_group_leads', """
+List the leads that belong to one lead group.
+
+Returns a paginated list of leads (id, name, phone, email, status, lead_score,
+assigned_to) plus the group's name.
+Get lead_group_id from list_lead_groups. Use add_leads_to_group /
+remove_leads_from_group to change membership.
+""", {
+    'lead_group_id': {'type': 'integer', 'description': 'ID of the lead group. Get it from list_lead_groups.'},
+    'search':        {'type': 'string',  'description': 'Filter the group members by name, phone, or email'},
+    'page':          {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':     {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+}, ['lead_group_id'])
+
 _tool('create_lead_group', """
 Create a new CRM lead group (list/segment).
 
@@ -275,6 +356,38 @@ Returns the created status with its id.
     'is_lost':     {'type': 'boolean', 'description': 'True if this stage represents a lost deal'},
     'is_active':   {'type': 'boolean', 'description': 'Whether the status is active (default true)'},
 }, ['name'])
+
+_tool('list_tasks', """
+List and filter tasks.
+
+Returns a paginated list with id, title, status, priority, due_date, lead_id,
+lead_name, assignee_user_id and completed_at, ordered by due date.
+Get lead_id from list_leads and assignee_user_id from list_users.
+Use get_task for the full body of one task and update_task to change it.
+""", {
+    'lead_id':          {'type': 'integer', 'description': 'Only tasks attached to this lead'},
+    'status':           {'type': 'string',  'enum': ['TODO', 'IN_PROGRESS', 'DONE', 'CANCELLED'],
+                         'description': 'Only tasks in this state'},
+    'priority':         {'type': 'string',  'enum': ['LOW', 'MEDIUM', 'HIGH'],
+                         'description': 'Only tasks at this priority'},
+    'assignee_user_id': {'type': 'string',  'description': 'User UUID the task is assigned to. Resolve names via list_users.'},
+    'due_after':        {'type': 'string',  'description': 'Only tasks due at/after this ISO 8601 datetime'},
+    'due_before':       {'type': 'string',  'description': 'Only tasks due at/before this ISO 8601 datetime'},
+    'overdue':          {'type': 'boolean', 'description': 'If true, only tasks past their due date that are not DONE or CANCELLED'},
+    'search':           {'type': 'string',  'description': 'Filter by title or description (partial match)'},
+    'page':             {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':        {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('get_task', """
+Get full details of a single task by ID.
+
+Returns title, description, status, priority, due_date, checklist,
+assignee_user_id, the linked lead (id, name, phone) and timestamps.
+Get task_id from list_tasks.
+""", {
+    'task_id': {'type': 'integer', 'description': 'ID of the task. Get it from list_tasks.'},
+}, ['task_id'])
 
 _tool('create_task', """
 Create a task in CRM, optionally linked to a lead.
@@ -305,6 +418,27 @@ status: TODO | IN_PROGRESS | DONE | CANCELLED
     'assignee_user_id': {'type': 'string'},
 }, ['task_id'])
 
+_tool('list_lead_activities', """
+List the activity timeline (calls, emails, meetings, notes, SMS, real-estate
+events) recorded against leads.
+
+Returns a paginated list with id, lead_id, lead_name, type, content,
+happened_at and meta, newest first.
+Get lead_id from list_leads or lookup_lead_by_phone.
+Use create_lead_activity to add an entry, or append_lead_note to add to the
+lead's notes body instead.
+""", {
+    'lead_id':         {'type': 'integer', 'description': 'Only activities for this lead'},
+    'type':            {'type': 'string',
+                        'enum': ['CALL', 'EMAIL', 'MEETING', 'NOTE', 'SMS', 'REAL_ESTATE', 'OTHER'],
+                        'description': 'Only activities of this type'},
+    'happened_after':  {'type': 'string',  'description': 'Only activities at/after this ISO 8601 datetime'},
+    'happened_before': {'type': 'string',  'description': 'Only activities at/before this ISO 8601 datetime'},
+    'search':          {'type': 'string',  'description': 'Filter by activity content (partial match)'},
+    'page':            {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':       {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
 _tool('create_lead_activity', """
 Log an activity on a lead (call, note, email, SMS, meeting, etc.)
 
@@ -315,6 +449,36 @@ type options: CALL | NOTE | EMAIL | SMS | MEETING | WHATSAPP | OTHER
     'content':     {'type': 'string', 'description': 'What happened / what was said'},
     'happened_at': {'type': 'string', 'description': 'ISO 8601 datetime, defaults to now'},
 }, ['lead_id', 'type', 'content'])
+
+_tool('list_meetings', """
+List and filter meetings.
+
+Returns a paginated list with id, title, start_at, end_at, location, lead_id,
+lead_name and notes, ordered by start time.
+Get lead_id from list_leads. Use get_meetings_calendar for a date-grouped view
+and update_meeting to reschedule.
+""", {
+    'lead_id':      {'type': 'integer', 'description': 'Only meetings for this lead'},
+    'start_after':  {'type': 'string',  'description': 'Only meetings starting at/after this ISO 8601 datetime'},
+    'start_before': {'type': 'string',  'description': 'Only meetings starting at/before this ISO 8601 datetime'},
+    'search':       {'type': 'string',  'description': 'Filter by title, location, description or notes'},
+    'page':         {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':    {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('get_meetings_calendar', """
+Get meetings grouped by calendar date.
+
+Returns date_from, date_to and calendar_data — a map of YYYY-MM-DD to the
+meetings starting that day (id, title, start_at, end_at, location, lead_id,
+lead_name).
+Defaults to the next 31 days. The window is capped at 92 days and 500 meetings;
+use list_meetings when you need to page beyond that.
+""", {
+    'month':     {'type': 'string', 'description': 'Calendar month as YYYY-MM. Takes precedence over date_from/date_to.'},
+    'date_from': {'type': 'string', 'description': 'Start of the range as YYYY-MM-DD (default today)'},
+    'date_to':   {'type': 'string', 'description': 'End of the range as YYYY-MM-DD, inclusive (default 31 days after date_from)'},
+})
 
 _tool('create_meeting', """
 Schedule a meeting linked to a lead.
@@ -445,6 +609,35 @@ Prefer this over send_whatsapp_template when acting autonomously.
     'note':                {'type': 'string'},
 }, ['lead_id', 'template_uid'])
 
+_tool('get_ai_context', """
+Get every id an agent needs in one call: WhatsApp templates, sequences, lead
+statuses and lead groups for this workspace.
+
+Returns whatsapp_templates (uid, name, category, language, status), sequences
+(id, name, step_count), lead_statuses (id, name, color_hex, order_index) and
+lead_groups (id, name, lead_count).
+Takes no arguments. Prefer this over calling list_lead_statuses +
+list_lead_groups + list_sequences + get_whatsapp_templates separately.
+whatsapp_templates comes back empty if the WhatsApp gateway is unreachable; the
+rest of the payload still returns.
+""", {})
+
+_tool('list_agent_action_logs', """
+Read the audit log of actions this AI agent has already performed for the
+workspace.
+
+Returns id, action_type, status, triggered_by, payload_in, payload_out,
+error_message and created_at, newest first.
+Use it to avoid repeating an action or to explain what was done earlier.
+log_agent_activity writes to this same log.
+""", {
+    'action_type': {'type': 'string',
+                    'enum': ['SEND_WHATSAPP', 'ENROLL_SEQUENCE', 'CREATE_CAMPAIGN',
+                             'UPDATE_LEAD_STATUS', 'LOG_ACTIVITY'],
+                    'description': 'Only log entries of this action type'},
+    'limit':       {'type': 'integer', 'description': 'Max results (default 50, max 200)'},
+})
+
 _tool('log_agent_activity', """
 Log a custom agent activity to the DigiCRM AgentActionLog.
 
@@ -460,6 +653,31 @@ Use to record decisions, reasoning steps, or external actions taken.
 # ---------------------------------------------------------------------------
 # PHASE 3 — SEQUENCES & CAMPAIGNS (11 tools)
 # ---------------------------------------------------------------------------
+
+_tool('list_sequences', """
+List WhatsApp follow-up sequences (drip campaigns) for this workspace.
+
+Returns a paginated list with id, name, description, is_active, stop_on_reply,
+step_count and active_enrollment_count.
+Use a sequence's id as sequence_id for get_sequence_steps, add_sequence_step,
+enroll_lead_in_sequence and bulk_enroll_leads_in_sequence.
+""", {
+    'is_active': {'type': 'boolean', 'description': 'Only active (true) or only inactive (false) sequences'},
+    'search':    {'type': 'string',  'description': 'Filter by sequence name or description'},
+    'page':      {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size': {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('get_sequence_steps', """
+List the ordered steps of one WhatsApp sequence.
+
+Returns the sequence name plus each step's id, step_number, delay_days,
+template_uid, template_name and template_variable_mapping.
+Get sequence_id from list_sequences. Use a returned step id as step_id for
+update_sequence_step / delete_sequence_step.
+""", {
+    'sequence_id': {'type': 'integer', 'description': 'ID of the sequence. Get it from list_sequences.'},
+}, ['sequence_id'])
 
 _tool('create_sequence', """
 Create a new WhatsApp follow-up sequence.
@@ -538,6 +756,37 @@ If sequence_id is omitted, removes the lead from ALL sequences.
     'lead_id':     {'type': 'integer'},
     'sequence_id': {'type': 'integer', 'description': 'Optional: unenroll from specific sequence only'},
 }, ['lead_id'])
+
+_tool('list_campaigns', """
+List WhatsApp broadcast campaigns for this workspace.
+
+Returns a paginated list with id, name, status, template_uid, template_name,
+lead_group_id, lead_group_name, total_contacts, scheduled_at, launched_at and
+laravel_campaign_uid.
+Use a campaign's id as campaign_id for launch_campaign, get_campaign_analytics
+and get_campaign_replies.
+""", {
+    'status':        {'type': 'string',
+                      'enum': ['DRAFT', 'SCHEDULED', 'RUNNING', 'COMPLETED', 'FAILED'],
+                      'description': 'Only campaigns in this state'},
+    'lead_group_id': {'type': 'integer', 'description': 'Only campaigns targeting this lead group. Get ids from list_lead_groups.'},
+    'search':        {'type': 'string',  'description': 'Filter by campaign name (partial match)'},
+    'page':          {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':     {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('get_campaign_replies', """
+List the contacts who replied to a launched WhatsApp campaign.
+
+Returns the reply list from the WhatsApp gateway — use it to segment warm
+respondents for follow-up.
+Only works once the campaign has been launched; call launch_campaign first.
+Get campaign_id from list_campaigns.
+""", {
+    'campaign_id': {'type': 'integer', 'description': 'ID of the campaign. Get it from list_campaigns.'},
+    'page':        {'type': 'integer', 'description': 'Page number (default 1)'},
+    'per_page':    {'type': 'integer', 'description': 'Replies per page (default 50, max 200)'},
+}, ['campaign_id'])
 
 _tool('create_campaign', """
 Create a WhatsApp campaign targeting a lead group.

@@ -140,6 +140,25 @@ def oauth_authorize(request):
     return HttpResponse(html)
 
 
+def _paginate(args: dict, default_size: int = 50, max_size: int = 200):
+    """Return (page, page_size, offset) with page_size hard-capped.
+
+    Every list tool must paginate — an unbounded result set will blow the
+    model's context window.
+    """
+    try:
+        page = int(args.get('page') or 1)
+    except (TypeError, ValueError):
+        raise RuntimeError('page must be an integer')
+    try:
+        page_size = int(args.get('page_size') or default_size)
+    except (TypeError, ValueError):
+        raise RuntimeError('page_size must be an integer')
+    page      = max(page, 1)
+    page_size = min(max(page_size, 1), max_size)
+    return page, page_size, (page - 1) * page_size
+
+
 def _dispatch_tool(name: str, args: dict) -> dict:
     from crm.models import Lead, LeadStatus, LeadActivity, LeadGroup, LeadGroupMembership
     from tasks.models import Task
@@ -155,7 +174,7 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     # ── list_leads ──────────────────────────────────────────────────────────────
     if name == 'list_leads':
         qs = Lead.objects.filter(tenant_id=TENANT_ID)
-        search = args.get('search', '').strip()
+        search = (args.get('search') or '').strip()
         if search:
             qs = qs.filter(
                 Q(name__icontains=search) |
@@ -166,15 +185,48 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             qs = qs.filter(assigned_to=args['assigned_to'])
         elif args.get('unassigned'):
             qs = qs.filter(assigned_to__isnull=True)
-        page      = int(args.get('page', 1))
-        page_size = int(args.get('page_size', 20))
-        offset    = (page - 1) * page_size
-        total     = qs.count()
-        leads = list(qs.select_related('status').values(
-            'id', 'name', 'phone', 'email',
-            'status__name', 'lead_score', 'source', 'assigned_to', 'created_at',
+        # Advanced filters (search_leads_advanced lives here rather than as a
+        # separate tool — see _plans/02-mcp-roadmap.md Batch 1).
+        status_ids = args.get('status_ids') or None
+        if status_ids:
+            qs = qs.filter(status_id__in=status_ids)
+        elif args.get('status_id'):
+            qs = qs.filter(status_id=args['status_id'])
+        if args.get('priority'):
+            qs = qs.filter(priority=args['priority'])
+        if args.get('lead_score_min') is not None:
+            qs = qs.filter(lead_score__gte=args['lead_score_min'])
+        if args.get('lead_score_max') is not None:
+            qs = qs.filter(lead_score__lte=args['lead_score_max'])
+        if args.get('created_after'):
+            qs = qs.filter(created_at__gte=args['created_after'])
+        if args.get('created_before'):
+            qs = qs.filter(created_at__lte=args['created_before'])
+        if args.get('next_follow_up_before'):
+            qs = qs.filter(
+                next_follow_up_at__isnull=False,
+                next_follow_up_at__lte=args['next_follow_up_before'],
+            )
+        if args.get('city'):
+            qs = qs.filter(city__icontains=args['city'])
+        if args.get('lead_group_id'):
+            qs = qs.filter(groups__id=args['lead_group_id'])
+        ordering = (args.get('ordering') or '-created_at').strip()
+        if ordering.lstrip('-') not in {
+            'created_at', 'updated_at', 'name', 'lead_score', 'next_follow_up_at',
+        }:
+            raise RuntimeError(
+                'Unsupported ordering %r. Allowed: created_at, updated_at, name, '
+                'lead_score, next_follow_up_at (optionally prefixed with -).' % ordering
+            )
+        page, page_size, offset = _paginate(args, default_size=20, max_size=100)
+        total = qs.count()
+        leads = list(qs.order_by(ordering).values(
+            'id', 'name', 'phone', 'email', 'status_id', 'status__name',
+            'priority', 'lead_score', 'source', 'city', 'assigned_to',
+            'next_follow_up_at', 'created_at',
         )[offset:offset + page_size])
-        return {'count': total, 'page': page, 'results': leads}
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': leads}
 
     # ── get_lead ────────────────────────────────────────────────────────────────
     if name == 'get_lead':
@@ -195,6 +247,123 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             'assigned_to':       str(lead.assigned_to) if lead.assigned_to else None,
             'created_at':        str(lead.created_at),
             'updated_at':        str(lead.updated_at),
+        }
+
+    # ── lookup_lead_by_phone ────────────────────────────────────────────────────
+    if name == 'lookup_lead_by_phone':
+        raw    = str(args.get('phone') or '')
+        digits = ''.join(ch for ch in raw if ch.isdigit())
+        if len(digits) < 6:
+            raise RuntimeError('phone must contain at least 6 digits')
+        qs = Lead.objects.filter(tenant_id=TENANT_ID).select_related('status')
+        # Match on the last 10 significant digits first (mirrors the CDR
+        # pipeline), then fall back to the full digit string.
+        lead = (qs.filter(phone__endswith=digits[-10:]).first()
+                or qs.filter(phone__endswith=digits).first())
+        if not lead:
+            return {'found': False, 'phone': raw}
+        return {
+            'found':  True,
+            'id':     lead.id,
+            'name':   lead.name,
+            'phone':  lead.phone,
+            'status': ({'id': lead.status_id, 'name': lead.status.name,
+                        'color_hex': lead.status.color_hex} if lead.status else None),
+        }
+
+    # ── get_sales_dashboard ─────────────────────────────────────────────────────
+    if name == 'get_sales_dashboard':
+        from django.db.models import Count, Sum
+        leads = Lead.objects.filter(tenant_id=TENANT_ID)
+        now   = timezone.now()
+        today = now.date()
+        return {
+            'totals': {
+                'leads':           leads.count(),
+                'high_priority':   leads.filter(priority='HIGH').count(),
+                'followups_due':   leads.filter(next_follow_up_at__date__lte=today).count(),
+                'estimated_value': leads.aggregate(total=Sum('value_amount')).get('total') or 0,
+            },
+            'status_breakdown': list(
+                leads.values('status_id', 'status__name')
+                .annotate(count=Count('id'))
+                .order_by('status__order_index', 'status__name')
+            ),
+            'priority_breakdown': list(
+                leads.values('priority').annotate(count=Count('id')).order_by('priority')
+            ),
+            'recent_leads': list(
+                leads.order_by('-created_at').values(
+                    'id', 'name', 'phone', 'status__name', 'lead_score', 'created_at',
+                )[:5]
+            ),
+            'open_tasks': list(
+                Task.objects.filter(tenant_id=TENANT_ID)
+                .exclude(status__in=['DONE', 'CANCELLED'])
+                .order_by('due_date', '-created_at')
+                .values('id', 'title', 'status', 'priority', 'due_date',
+                        'lead_id', 'lead__name')[:5]
+            ),
+            'upcoming_meetings': list(
+                Meeting.objects.filter(tenant_id=TENANT_ID, start_at__gte=now)
+                .order_by('start_at')
+                .values('id', 'title', 'start_at', 'end_at', 'lead_id', 'lead__name')[:5]
+            ),
+            'recent_activities': list(
+                LeadActivity.objects.filter(tenant_id=TENANT_ID)
+                .order_by('-happened_at')
+                .values('id', 'lead_id', 'lead__name', 'type', 'content', 'happened_at')[:8]
+            ),
+        }
+
+    # ── get_lead_kanban ─────────────────────────────────────────────────────────
+    if name == 'get_lead_kanban':
+        try:
+            limit = int(args.get('limit_per_status') or 20)
+        except (TypeError, ValueError):
+            raise RuntimeError('limit_per_status must be an integer')
+        limit = min(max(limit, 1), 100)
+        statuses = LeadStatus.objects.filter(
+            tenant_id=TENANT_ID, is_active=True
+        ).order_by('order_index')
+        if args.get('status_id'):
+            statuses = statuses.filter(id=args['status_id'])
+        columns = []
+        for st in statuses:
+            lead_qs = Lead.objects.filter(tenant_id=TENANT_ID, status_id=st.id)
+            columns.append({
+                'id':          st.id,
+                'name':        st.name,
+                'color_hex':   st.color_hex,
+                'order_index': st.order_index,
+                'is_won':      st.is_won,
+                'is_lost':     st.is_lost,
+                'lead_count':  lead_qs.count(),
+                'leads': list(lead_qs.order_by('-created_at').values(
+                    'id', 'name', 'phone', 'email', 'priority', 'lead_score',
+                    'assigned_to', 'next_follow_up_at', 'created_at',
+                )[:limit]),
+            })
+        return {'limit_per_status': limit, 'statuses': columns}
+
+    # ── get_lead_follow_up ──────────────────────────────────────────────────────
+    if name == 'get_lead_follow_up':
+        from notifications.models import Reminder, ReminderStatus
+        lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        reminder = (
+            Reminder.objects
+            .filter(tenant_id=TENANT_ID, lead_id=lead.id,
+                    status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING])
+            .order_by('-updated_at')
+            .values('id', 'follow_up_at', 'remind_at', 'offset_minutes', 'status')
+            .first()
+        )
+        return {
+            'lead_id':           lead.id,
+            'lead_name':         lead.name,
+            'next_follow_up_at': lead.next_follow_up_at,
+            'last_contacted_at': lead.last_contacted_at,
+            'reminder':          reminder,
         }
 
     # ── list_lead_statuses ──────────────────────────────────────────────────────
@@ -329,6 +498,32 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         )[offset:offset + page_size])
         return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
 
+    # ── list_group_leads ────────────────────────────────────────────────────────
+    if name == 'list_group_leads':
+        group = LeadGroup.objects.get(id=args['lead_group_id'], tenant_id=TENANT_ID)
+        qs = Lead.objects.filter(tenant_id=TENANT_ID, groups=group)
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) |
+                Q(phone__icontains=search) |
+                Q(email__icontains=search)
+            )
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('-created_at').values(
+            'id', 'name', 'phone', 'email', 'status_id', 'status__name',
+            'lead_score', 'assigned_to', 'created_at',
+        )[offset:offset + page_size])
+        return {
+            'lead_group_id': group.id,
+            'group_name':    group.name,
+            'count':         total,
+            'page':          page,
+            'page_size':     page_size,
+            'results':       rows,
+        }
+
     # -- create_lead_group --
     if name == 'create_lead_group':
         group = LeadGroup.objects.create(
@@ -362,6 +557,28 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         )
         return {'id': status_obj.id, 'name': status_obj.name, 'order_index': status_obj.order_index}
 
+    # ── list_lead_activities ────────────────────────────────────────────────────
+    if name == 'list_lead_activities':
+        qs = LeadActivity.objects.filter(tenant_id=TENANT_ID)
+        if args.get('lead_id'):
+            qs = qs.filter(lead_id=args['lead_id'])
+        if args.get('type'):
+            qs = qs.filter(type=args['type'])
+        if args.get('happened_after'):
+            qs = qs.filter(happened_at__gte=args['happened_after'])
+        if args.get('happened_before'):
+            qs = qs.filter(happened_at__lte=args['happened_before'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(content__icontains=search)
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('-happened_at').values(
+            'id', 'lead_id', 'lead__name', 'type', 'content',
+            'happened_at', 'meta', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
     # ── create_lead_activity ────────────────────────────────────────────────────
     if name == 'create_lead_activity':
         activity = LeadActivity.objects.create(
@@ -373,6 +590,56 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             by_user_id=OWNER_USER_ID or None,
         )
         return {'id': activity.id, 'lead_id': args['lead_id']}
+
+    # ── list_tasks ──────────────────────────────────────────────────────────────
+    if name == 'list_tasks':
+        qs = Task.objects.filter(tenant_id=TENANT_ID)
+        if args.get('lead_id'):
+            qs = qs.filter(lead_id=args['lead_id'])
+        if args.get('status'):
+            qs = qs.filter(status=args['status'])
+        if args.get('priority'):
+            qs = qs.filter(priority=args['priority'])
+        if args.get('assignee_user_id'):
+            qs = qs.filter(assignee_user_id=args['assignee_user_id'])
+        if args.get('due_after'):
+            qs = qs.filter(due_date__gte=args['due_after'])
+        if args.get('due_before'):
+            qs = qs.filter(due_date__lte=args['due_before'])
+        if args.get('overdue'):
+            qs = qs.filter(due_date__lt=timezone.now()).exclude(
+                status__in=['DONE', 'CANCELLED'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(title__icontains=search) | Q(description__icontains=search))
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('due_date', '-created_at').values(
+            'id', 'title', 'status', 'priority', 'due_date',
+            'lead_id', 'lead__name', 'assignee_user_id', 'completed_at', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── get_task ────────────────────────────────────────────────────────────────
+    if name == 'get_task':
+        task = Task.objects.select_related('lead').get(
+            id=args['task_id'], tenant_id=TENANT_ID)
+        return {
+            'id':               task.id,
+            'title':            task.title,
+            'description':      task.description,
+            'status':           task.status,
+            'priority':         task.priority,
+            'due_date':         task.due_date,
+            'checklist':        task.checklist,
+            'assignee_user_id': str(task.assignee_user_id) if task.assignee_user_id else None,
+            'attachments_count': task.attachments_count,
+            'lead': ({'id': task.lead_id, 'name': task.lead.name,
+                      'phone': task.lead.phone} if task.lead_id else None),
+            'created_at':   task.created_at,
+            'updated_at':   task.updated_at,
+            'completed_at': task.completed_at,
+        }
 
     # ── create_task ─────────────────────────────────────────────────────────────
     if name == 'create_task':
@@ -398,6 +665,80 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                 setattr(task, f, args[f])
         task.save()
         return {'id': task.id, 'updated': True}
+
+    # ── list_meetings ───────────────────────────────────────────────────────────
+    if name == 'list_meetings':
+        qs = Meeting.objects.filter(tenant_id=TENANT_ID)
+        if args.get('lead_id'):
+            qs = qs.filter(lead_id=args['lead_id'])
+        if args.get('start_after'):
+            qs = qs.filter(start_at__gte=args['start_after'])
+        if args.get('start_before'):
+            qs = qs.filter(start_at__lte=args['start_before'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(title__icontains=search) |
+                Q(location__icontains=search) |
+                Q(description__icontains=search) |
+                Q(notes__icontains=search)
+            )
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('start_at').values(
+            'id', 'title', 'start_at', 'end_at', 'location', 'notes',
+            'lead_id', 'lead__name', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── get_meetings_calendar ───────────────────────────────────────────────────
+    if name == 'get_meetings_calendar':
+        from datetime import date as _date, timedelta as _timedelta
+        MAX_DAYS = 92
+        MAX_ROWS = 500
+        month = (args.get('month') or '').strip()
+        if month:
+            try:
+                year_s, month_s = month.split('-')
+                start = _date(int(year_s), int(month_s), 1)
+            except (ValueError, TypeError):
+                raise RuntimeError('month must be YYYY-MM, e.g. "2026-08"')
+            nxt = _date(start.year + (start.month == 12),
+                        (start.month % 12) + 1, 1)
+            end = nxt - _timedelta(days=1)
+        else:
+            try:
+                start = (_date.fromisoformat(args['date_from'])
+                         if args.get('date_from') else timezone.localdate())
+                end   = (_date.fromisoformat(args['date_to'])
+                         if args.get('date_to') else start + _timedelta(days=31))
+            except (ValueError, TypeError):
+                raise RuntimeError('date_from / date_to must be YYYY-MM-DD')
+        if end < start:
+            raise RuntimeError('date_to must not be before date_from')
+        if (end - start).days > MAX_DAYS:
+            end = start + _timedelta(days=MAX_DAYS)
+        rows = list(
+            Meeting.objects
+            .filter(tenant_id=TENANT_ID,
+                    start_at__date__gte=start, start_at__date__lte=end)
+            .order_by('start_at')
+            .values('id', 'title', 'start_at', 'end_at', 'location',
+                    'lead_id', 'lead__name')[:MAX_ROWS]
+        )
+        calendar_data = {}
+        for row in rows:
+            started = row['start_at']
+            if timezone.is_aware(started):
+                started = timezone.localtime(started)
+            calendar_data.setdefault(started.date().isoformat(), []).append(row)
+        return {
+            'date_from':     start.isoformat(),
+            'date_to':       end.isoformat(),
+            'count':         len(rows),
+            'truncated':     len(rows) >= MAX_ROWS,
+            'calendar_data': calendar_data,
+        }
 
     # ── create_meeting ──────────────────────────────────────────────────────────
     if name == 'create_meeting':
@@ -558,6 +899,66 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         lead = _get_lead(args['lead_id'])
         return _adapter().block_contact(phone=lead.phone, block=args.get('block', True))
 
+    # ── get_ai_context ──────────────────────────────────────────────────────────
+    if name == 'get_ai_context':
+        from django.db.models import Count
+        # Templates live in the Laravel gateway. A gateway outage must not fail
+        # the whole context call — return an empty list and keep the CRM half.
+        try:
+            raw_templates = _adapter().get_templates()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('get_ai_context: template fetch failed: %s', exc)
+            raw_templates = []
+        templates = [
+            {
+                'uid':      t.get('_uid') or t.get('uid'),
+                'name':     t.get('template_name') or t.get('name'),
+                'category': t.get('category'),
+                'language': t.get('language'),
+                'status':   t.get('status'),
+            }
+            for t in (raw_templates if isinstance(raw_templates, list) else [])
+        ]
+        sequences = list(
+            WhatsAppSequence.objects.filter(tenant_id=TENANT_ID)
+            .annotate(step_count=Count('steps', distinct=True))
+            .order_by('name')
+            .values('id', 'name', 'description', 'is_active', 'step_count')
+        )
+        statuses = list(
+            LeadStatus.objects.filter(tenant_id=TENANT_ID)
+            .order_by('order_index')
+            .values('id', 'name', 'color_hex', 'order_index', 'is_won', 'is_lost')
+        )
+        groups = list(
+            LeadGroup.objects.filter(tenant_id=TENANT_ID)
+            .annotate(lead_count=Count('memberships'))
+            .order_by('name')
+            .values('id', 'name', 'lead_count')
+        )
+        return {
+            'whatsapp_templates': templates,
+            'sequences':          sequences,
+            'lead_statuses':      statuses,
+            'lead_groups':        groups,
+        }
+
+    # ── list_agent_action_logs ──────────────────────────────────────────────────
+    if name == 'list_agent_action_logs':
+        qs = AgentActionLog.objects.filter(tenant_id=TENANT_ID)
+        if args.get('action_type'):
+            qs = qs.filter(action_type=args['action_type'])
+        try:
+            limit = int(args.get('limit') or 50)
+        except (TypeError, ValueError):
+            raise RuntimeError('limit must be an integer')
+        limit = min(max(limit, 1), 200)
+        rows = list(qs.order_by('-created_at').values(
+            'id', 'action_type', 'status', 'triggered_by',
+            'payload_in', 'payload_out', 'error_message', 'created_at',
+        )[:limit])
+        return {'count': len(rows), 'limit': limit, 'results': rows}
+
     # ── log_agent_activity ──────────────────────────────────────────────────────
     if name == 'log_agent_activity':
         log = AgentActionLog.objects.create(
@@ -572,6 +973,46 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         )
         return {'id': log.id, 'logged': True}
 
+
+    # ── list_sequences ──────────────────────────────────────────────────────────
+    if name == 'list_sequences':
+        from django.db.models import Count
+        qs = WhatsAppSequence.objects.filter(tenant_id=TENANT_ID).annotate(
+            step_count=Count('steps', distinct=True),
+            active_enrollment_count=Count(
+                'enrollments',
+                filter=Q(enrollments__status=SequenceEnrollmentStatusEnum.ACTIVE),
+                distinct=True,
+            ),
+        )
+        if args.get('is_active') is not None:
+            qs = qs.filter(is_active=bool(args['is_active']))
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('name').values(
+            'id', 'name', 'description', 'is_active', 'stop_on_reply',
+            'step_count', 'active_enrollment_count', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── get_sequence_steps ──────────────────────────────────────────────────────
+    if name == 'get_sequence_steps':
+        seq = WhatsAppSequence.objects.get(
+            id=args['sequence_id'], tenant_id=TENANT_ID)
+        steps = list(seq.steps.order_by('step_number').values(
+            'id', 'step_number', 'delay_days', 'template_uid',
+            'template_name', 'template_variable_mapping',
+        ))
+        return {
+            'sequence_id':   seq.id,
+            'sequence_name': seq.name,
+            'is_active':     seq.is_active,
+            'count':         len(steps),
+            'results':       steps,
+        }
 
     # ── create_sequence ─────────────────────────────────────────────────────────
     if name == 'create_sequence':
@@ -649,6 +1090,39 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         e.stopped_reason = 'manual unenroll via MCP'
         e.save(update_fields=['status', 'stopped_reason', 'updated_at'])
         return {'id': e.id, 'status': e.status}
+
+    # ── list_campaigns ──────────────────────────────────────────────────────────
+    if name == 'list_campaigns':
+        qs = WhatsAppCampaign.objects.filter(tenant_id=TENANT_ID)
+        if args.get('status'):
+            qs = qs.filter(status=args['status'])
+        if args.get('lead_group_id'):
+            qs = qs.filter(lead_group_id=args['lead_group_id'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(name__icontains=search)
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('-created_at').values(
+            'id', 'name', 'status', 'template_uid', 'template_name',
+            'lead_group_id', 'lead_group__name', 'total_contacts',
+            'scheduled_at', 'launched_at', 'laravel_campaign_uid', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── get_campaign_replies ────────────────────────────────────────────────────
+    if name == 'get_campaign_replies':
+        campaign = WhatsAppCampaign.objects.get(
+            id=args['campaign_id'], tenant_id=TENANT_ID)
+        if not campaign.laravel_campaign_uid:
+            raise RuntimeError(
+                'Campaign %s has not been launched yet — call launch_campaign first.'
+                % campaign.id
+            )
+        page, per_page, _offset = _paginate(
+            {'page': args.get('page'), 'page_size': args.get('per_page')})
+        return _adapter().get_campaign_replies(
+            campaign.laravel_campaign_uid, page, per_page)
 
     # ── create_campaign ─────────────────────────────────────────────────────────
     if name == 'create_campaign':
