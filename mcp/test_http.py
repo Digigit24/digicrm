@@ -470,10 +470,14 @@ def run_all(args):
 
     if sample.get('step_id'):
         run('update_sequence_step', {
-            'step_id':   sample['step_id'],
-            'delay_days': 1,
+            'sequence_id': sample['seq_id'],
+            'step_id':     sample['step_id'],
+            'delay_days':  1,
         }, write=True)
-        run('delete_sequence_step', {'step_id': sample['step_id']}, write=True)
+        run('delete_sequence_step', {
+            'sequence_id': sample['seq_id'],
+            'step_id':     sample['step_id'],
+        }, write=True)
 
     # ── Phase 3: Enrollment ───────────────────────────────────────────────────────
     print('\n%s── Phase 3: Enrollments (4 tools)%s' % (BOLD, RESET))
@@ -491,7 +495,16 @@ def run_all(args):
     if sample.get('enrollment_id'):
         run('pause_enrollment',  {'enrollment_id': sample['enrollment_id']}, write=True)
         run('resume_enrollment', {'enrollment_id': sample['enrollment_id']}, write=True)
-        run('unenroll_lead',     {'enrollment_id': sample['enrollment_id']}, write=True)
+        # unenroll_lead takes lead_id (+ optional sequence_id), NOT enrollment_id.
+        # It used to read an undeclared 'enrollment_id' key, so this call was
+        # testing the implementation rather than the published contract.
+        if sample.get('lead_id') and sample.get('seq_id'):
+            run('unenroll_lead',
+                {'lead_id': sample['lead_id'], 'sequence_id': sample['seq_id']},
+                write=True)
+        else:
+            print('  %sSKIP%s  unenroll_lead (no lead_id or seq_id)' % (YELLOW, RESET))
+            results['skipped'] += 1
 
     # ── Phase 3: Campaigns ────────────────────────────────────────────────────────
     print('\n%s── Phase 3: Campaigns (3 tools)%s' % (BOLD, RESET))
@@ -675,9 +688,11 @@ def run_all(args):
     ALIEN = 987654321      # not in any workspace on a normal dataset
 
     expect_fail('update_sequence_step',
-                {'step_id': ALIEN, 'template_uid': 'attacker-template'},
+                {'sequence_id': sample.get('seq_id') or ALIEN, 'step_id': ALIEN,
+                 'template_uid': 'attacker-template'},
                 label='A5: step lookup must join through sequence.tenant_id (M4)')
-    expect_fail('delete_sequence_step', {'step_id': ALIEN},
+    expect_fail('delete_sequence_step',
+                {'sequence_id': sample.get('seq_id') or ALIEN, 'step_id': ALIEN},
                 label='A5: same join, on the delete path')
     expect_fail('add_sequence_step',
                 {'sequence_id': ALIEN, 'step_number': 1, 'template_uid': 'x'},

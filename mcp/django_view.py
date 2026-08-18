@@ -551,6 +551,10 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             lead_score=args.get('lead_score', 0),
             notes=args.get('notes') or '',
             assigned_to=args.get('assigned_to') or None,
+            # Custom fields live in Lead.metadata. This was declared in the
+            # schema but never written, so every custom_fields payload was
+            # silently discarded. Key names come from get_lead_field_schema.
+            metadata=args.get('custom_fields') or None,
         )
         return {'id': lead.id, 'name': lead.name, 'phone': lead.phone}
 
@@ -583,6 +587,12 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                 setattr(lead, f, args[f])
         if 'assigned_to' in args:
             lead.assigned_to = args['assigned_to'] or None
+        if args.get('custom_fields'):
+            # MERGE, not replace: a partial custom_fields payload must not wipe
+            # keys the agent did not mention (same reasoning as append_lead_note).
+            merged = dict(lead.metadata or {})
+            merged.update(args['custom_fields'])
+            lead.metadata = merged
         lead.save()
         return {'id': lead.id, 'updated': True}
 
@@ -594,7 +604,19 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         _require(LeadStatus, args['status_id'], 'Lead status', tenant_id=TENANT_ID)
         lead.status_id = args['status_id']
         lead.save(update_fields=['status'])
-        return {'id': lead.id, 'status_id': args['status_id']}
+        if args.get('note'):
+            # `note` was declared but discarded. Record it on the timeline so
+            # the reason for a stage change survives.
+            LeadActivity.objects.create(
+                tenant_id=TENANT_ID,
+                lead_id=lead.id,
+                type='NOTE',
+                content='Status changed: %s' % args['note'],
+                happened_at=timezone.now(),
+                by_user_id=OWNER_USER_ID or None,
+            )
+        return {'id': lead.id, 'status_id': args['status_id'],
+                'note_logged': bool(args.get('note'))}
 
     # ── append_lead_note ────────────────────────────────────────────────────────
     if name == 'append_lead_note':
@@ -733,6 +755,7 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                     lead_score=row.get('lead_score', 0),
                     notes=row.get('notes', ''),
                     assigned_to=row.get('assigned_to') or None,
+                    metadata=row.get('custom_fields') or None,
                 )
                 success += 1
             except Exception as exc:
@@ -1024,6 +1047,8 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         for f in ['title', 'description', 'status', 'priority', 'due_date']:
             if f in args:
                 setattr(task, f, args[f])
+        if 'assignee_user_id' in args:
+            task.assignee_user_id = args['assignee_user_id'] or None
         task.save()
         return {'id': task.id, 'updated': True}
 
@@ -1301,6 +1326,27 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     def _get_lead(lead_id):
         return Lead.objects.get(id=lead_id, tenant_id=TENANT_ID)
 
+    def _log_send_note(lead, note):
+        """Write the optional `note` argument to the lead's timeline.
+
+        Both send tools declared `note` ("Activity note to log on the lead")
+        and neither wrote it anywhere. A logging failure must not make a
+        already-sent message look like a failed send.
+        """
+        if not note:
+            return
+        try:
+            LeadActivity.objects.create(
+                tenant_id=TENANT_ID,
+                lead_id=lead.id,
+                type='NOTE',
+                content=note,
+                happened_at=timezone.now(),
+                by_user_id=OWNER_USER_ID or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error('Failed to log send note on lead %s: %s', lead.id, exc)
+
     # ── get_lead_chat ───────────────────────────────────────────────────────────
     if name == 'get_lead_chat':
         lead = _get_lead(args['lead_id'])
@@ -1359,13 +1405,15 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     # ── send_whatsapp_template ──────────────────────────────────────────────────
     if name == 'send_whatsapp_template':
         lead = _get_lead(args['lead_id'])
-        return _adapter().send_message(
+        result = _adapter().send_message(
             phone=lead.phone,
             name=lead.name,
             template_uid=args['template_uid'],
             template_components=args.get('template_components', []),
             digicrm_lead_id=lead.id,
         )
+        _log_send_note(lead, args.get('note'))
+        return result
 
     # ── send_whatsapp_text ──────────────────────────────────────────────────────
     if name == 'send_whatsapp_text':
@@ -1380,13 +1428,15 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     # ── agent_send_whatsapp ─────────────────────────────────────────────────────
     if name == 'agent_send_whatsapp':
         lead = _get_lead(args['lead_id'])
-        return _adapter().send_message(
+        result = _adapter().send_message(
             phone=lead.phone,
             name=lead.name,
             template_uid=args['template_uid'],
             template_components=args.get('template_components', []),
             digicrm_lead_id=lead.id,
         )
+        _log_send_note(lead, args.get('note'))
+        return result
 
     # ── assign_lead_chat_user ───────────────────────────────────────────────────
     if name == 'assign_lead_chat_user':
@@ -1507,6 +1557,9 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             payload_in={
                 'summary': args['summary'],
                 'lead_id': args.get('lead_id'),
+                # `payload` was declared ("Any structured data to attach") and
+                # dropped on the floor.
+                'payload': args.get('payload'),
             },
             triggered_by='claude-agent',
             status=AgentActionStatusEnum.SUCCESS,
@@ -1604,7 +1657,14 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     if name == 'update_sequence_step':
         # WhatsAppSequenceStep has no tenant_id column (audit M4), so scope
         # through the parent sequence rather than adding a migration.
+        # sequence_id is declared AND required, so honour it: the step must
+        # belong to that sequence, which must belong to this tenant.
+        if args.get('sequence_id') is None:
+            raise RuntimeError(
+                'sequence_id is required -- get it from list_sequences, and the '
+                'step ids from get_sequence_steps')
         step = _require(WhatsAppSequenceStep, args['step_id'], 'Sequence step',
+                        sequence_id=args['sequence_id'],
                         sequence__tenant_id=TENANT_ID)
         for f in ['delay_days', 'template_uid', 'template_name', 'template_variable_mapping']:
             if f in args:
@@ -1615,7 +1675,12 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     # ── delete_sequence_step ────────────────────────────────────────────────────
     if name == 'delete_sequence_step':
         # Scoped through the parent sequence -- see update_sequence_step.
+        if args.get('sequence_id') is None:
+            raise RuntimeError(
+                'sequence_id is required -- get it from list_sequences, and the '
+                'step ids from get_sequence_steps')
         step = _require(WhatsAppSequenceStep, args['step_id'], 'Sequence step',
+                        sequence_id=args['sequence_id'],
                         sequence__tenant_id=TENANT_ID)
         deleted, _detail = WhatsAppSequenceStep.objects.filter(pk=step.pk).delete()
         return {'deleted': deleted > 0}
@@ -1718,11 +1783,33 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── unenroll_lead ───────────────────────────────────────────────────────────
     if name == 'unenroll_lead':
-        e = LeadSequenceEnrollment.objects.get(id=args['enrollment_id'], tenant_id=TENANT_ID)
-        e.status = SequenceEnrollmentStatusEnum.OPTED_OUT
-        e.stopped_reason = 'manual unenroll via MCP'
-        e.save(update_fields=['status', 'stopped_reason', 'updated_at'])
-        return {'id': e.id, 'status': e.status}
+        # This branch used to read args['enrollment_id'] -- a key the schema
+        # does not declare -- so every schema-conforming call raised KeyError.
+        # It now implements the contract the schema actually advertises:
+        # lead_id (required) + optional sequence_id, omitting it opts the lead
+        # out of every sequence.
+        lead = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
+        qs = LeadSequenceEnrollment.objects.filter(
+            lead_id=lead.id, tenant_id=TENANT_ID,
+        ).exclude(status=SequenceEnrollmentStatusEnum.OPTED_OUT)
+        sequence_name = None
+        if args.get('sequence_id') is not None:
+            seq = _require(WhatsAppSequence, args['sequence_id'], 'Sequence',
+                           tenant_id=TENANT_ID)
+            qs = qs.filter(sequence_id=seq.id)
+            sequence_name = seq.name
+        enrollment_ids = list(qs.values_list('id', flat=True))
+        updated = qs.update(
+            status=SequenceEnrollmentStatusEnum.OPTED_OUT,
+            stopped_reason='manual unenroll via MCP',
+            updated_at=timezone.now(),
+        )
+        return {
+            'lead_id':          lead.id,
+            'sequence':         sequence_name,
+            'unenrolled_count': updated,
+            'enrollment_ids':   enrollment_ids,
+        }
 
     # ── list_campaigns ──────────────────────────────────────────────────────────
     if name == 'list_campaigns':
@@ -2312,6 +2399,14 @@ def _handle_mcp_request(body: dict) -> dict:
             result = _dispatch_tool(tool_name, tool_args)
             return {'jsonrpc': '2.0', 'id': req_id,
                     'result': {'content': [{'type': 'text', 'text': json.dumps(result, default=str)}]}}
+        except KeyError as exc:
+            # A missing required argument surfaces as KeyError, whose str() is
+            # just the quoted key name -- useless to the model. Name it.
+            logger.exception('Tool %s failed', tool_name)
+            key = exc.args[0] if exc.args else exc
+            return {'jsonrpc': '2.0', 'id': req_id,
+                    'error': {'code': -32602,
+                              'message': 'Missing required argument: %s' % key}}
         except Exception as exc:
             logger.exception('Tool %s failed', tool_name)
             return {'jsonrpc': '2.0', 'id': req_id,

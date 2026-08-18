@@ -186,12 +186,14 @@ wa_models.WhatsAppSequence = own_sequence
 expect_raises(
     "update_sequence_step refuses another tenant's step_id",
     lambda: dispatch('update_sequence_step',
-                     {'step_id': 99, 'template_uid': 'attacker-template'}),
+                     {'sequence_id': 7, 'step_id': 99,
+                      'template_uid': 'attacker-template'}),
     'sequence step')
 
 expect_raises(
     "delete_sequence_step refuses another tenant's step_id",
-    lambda: dispatch('delete_sequence_step', {'step_id': 99}),
+    lambda: dispatch('delete_sequence_step',
+                     {'sequence_id': 7, 'step_id': 99}),
     'sequence step')
 
 expect_raises(
@@ -382,6 +384,25 @@ _starts.append((len(_lines), None))
 _bodies = {n: '\n'.join(_lines[ln:_starts[i + 1][0]])
            for i, (ln, n) in enumerate(_starts[:-1])}
 _helpers = _src[:_src.index('def _dispatch_tool')]
+
+# Applied to ALL tools, not just the meeting ones: a property that is declared
+# in inputSchema but never read by the dispatch branch is silently discarded,
+# and the model has no way to find out. That is the bug class that produced
+# create_meeting(location=...) going nowhere.
+_all_orphans = []
+for _tool_def in _TOOLS:
+    _body = _bodies.get(_tool_def['name'], '')
+    for _prop in _tool_def['inputSchema']['properties']:
+        if ("'%s'" % _prop) in _body or ("'%s'" % _prop) in _helpers:
+            continue
+        _all_orphans.append('%s.%s' % (_tool_def['name'], _prop))
+check('no tool declares a property its dispatch branch ignores',
+      not _all_orphans, 'orphaned: %s' % _all_orphans)
+
+_missing_req = ['%s.%s' % (t['name'], k) for t in _TOOLS
+                for k in (t['inputSchema'].get('required') or [])
+                if k not in t['inputSchema']['properties']]
+check('every required key is a declared property', not _missing_req, str(_missing_req))
 
 for _tool_name in ('create_meeting', 'update_meeting'):
     _tool_def = next(t for t in _TOOLS if t['name'] == _tool_name)

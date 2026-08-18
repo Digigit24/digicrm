@@ -298,9 +298,14 @@ Returns { success_count, failure_count, errors[] }
         'items': {
             'type': 'object',
             'properties': {
-                'name':  {'type': 'string'},
-                'phone': {'type': 'string'},
-                'email': {'type': 'string'},
+                'name':          {'type': 'string'},
+                'phone':         {'type': 'string'},
+                'email':         {'type': 'string'},
+                'source':        {'type': 'string'},
+                'lead_score':    {'type': 'integer'},
+                'notes':         {'type': 'string'},
+                'assigned_to':   {'type': 'string', 'description': 'User UUID from list_users'},
+                'custom_fields': {'type': 'object', 'description': 'Dict of custom field key -> value. Keys come from get_lead_field_schema.'},
             },
             'required': ['name', 'phone'],
         }
@@ -643,8 +648,10 @@ changed here; recreate the meeting if the invite list is wrong.
 _tool('update_lead_status', """
 Move a lead to a different pipeline stage (lead status).
 
-status_id: integer ID of the target pipeline stage.
-Use the CRM UI or ask the user for the status ID if unknown.
+Returns the lead id, the new status_id, and whether a note was logged.
+Get status_id from list_lead_statuses. Pass note to record WHY the stage
+changed -- it is written to the lead's activity timeline.
+For many leads at once use bulk_update_lead_status.
 """, {
     'lead_id':   {'type': 'integer'},
     'status_id': {'type': 'integer', 'description': 'ID of the target pipeline stage'},
@@ -806,7 +813,10 @@ Log a custom agent activity to the DigiCRM AgentActionLog.
 Use to record decisions, reasoning steps, or external actions taken.
 """, {
     'lead_id':     {'type': 'integer', 'description': 'Optional lead context'},
-    'action_type': {'type': 'string', 'description': 'Short label for what was done'},
+    'action_type': {'type': 'string',
+                    'enum': ['SEND_WHATSAPP', 'ENROLL_SEQUENCE', 'CREATE_CAMPAIGN',
+                             'UPDATE_LEAD_STATUS', 'LOG_ACTIVITY'],
+                    'description': 'What kind of action is being recorded'},
     'summary':     {'type': 'string', 'description': 'Human-readable summary of what happened'},
     'payload':     {'type': 'object', 'description': 'Any structured data to attach'},
 }, ['action_type', 'summary'])
@@ -936,12 +946,16 @@ Resume a paused sequence enrollment.
 }, ['enrollment_id'])
 
 _tool('unenroll_lead', """
-Remove a lead from a sequence (sets status to OPTED_OUT).
+Opt a lead out of a WhatsApp sequence, stopping any further messages.
 
-If sequence_id is omitted, removes the lead from ALL sequences.
+Returns how many enrollments were opted out and their ids. Already opted-out
+enrollments are left alone, so calling this twice is safe.
+Omit sequence_id to opt the lead out of EVERY sequence it is enrolled in.
+Get lead_id from list_leads and sequence_id from list_sequences.
+To stop a lead temporarily instead, use pause_enrollment.
 """, {
-    'lead_id':     {'type': 'integer'},
-    'sequence_id': {'type': 'integer', 'description': 'Optional: unenroll from specific sequence only'},
+    'lead_id':     {'type': 'integer', 'description': 'ID of the lead to opt out'},
+    'sequence_id': {'type': 'integer', 'description': 'Only opt out of this sequence. Omit to opt out of all of them.'},
 }, ['lead_id'])
 
 _tool('list_campaigns', """
