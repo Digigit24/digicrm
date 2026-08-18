@@ -1603,6 +1603,342 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         )[offset:offset + page_size])
         return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
 
+    # ── set_call_outcome ────────────────────────────────────────────────────────
+    if name == 'set_call_outcome':
+        from telephony.models import CallLog
+        from telephony.services.analytics_service import OUTCOME_CHOICES
+        from telephony.services.call_log_service import set_call_outcome as _set_outcome
+        outcome = str(args.get('outcome') or '').strip()
+        valid   = [choice[0] for choice in OUTCOME_CHOICES]
+        if outcome not in valid:
+            raise RuntimeError('outcome must be one of: %s' % ', '.join(valid))
+        try:
+            call_log = _set_outcome(
+                args['call_id'],
+                TENANT_ID,
+                outcome,
+                str(args.get('note') or '')[:512],
+                OWNER_USER_ID or None,
+            )
+        except CallLog.DoesNotExist:
+            raise RuntimeError(
+                'Call %s not found in this workspace — get valid ids from '
+                'list_call_logs.' % args['call_id'])
+        return {
+            'id':                  call_log.id,
+            'call_outcome':        call_log.call_outcome,
+            'call_outcome_note':   call_log.call_outcome_note,
+            'call_outcome_set_at': call_log.call_outcome_set_at,
+            'lead_id':             call_log.lead_id,
+        }
+
+    # ── get_telephony_analytics ─────────────────────────────────────────────────
+    if name == 'get_telephony_analytics':
+        from datetime import timedelta as _timedelta
+        from telephony.services.analytics_service import (
+            get_team_summary, get_agent_summary,
+            get_missed_unattended, get_outcome_breakdown,
+        )
+        try:
+            days = int(args.get('days') or 30)
+        except (TypeError, ValueError):
+            raise RuntimeError('days must be an integer')
+        days      = min(max(days, 1), 365)
+        date_to   = timezone.localdate()
+        date_from = date_to - _timedelta(days=days - 1)
+        return {
+            'days':              days,
+            'date_from':         date_from,
+            'date_to':           date_to,
+            'team_summary':      get_team_summary(TENANT_ID, date_from, date_to),
+            'agent_summary':     get_agent_summary(TENANT_ID, date_from, date_to),
+            'outcome_breakdown': get_outcome_breakdown(TENANT_ID, date_from, date_to),
+            'missed_unattended': get_missed_unattended(TENANT_ID),
+        }
+
+    # ── PAYMENTS ────────────────────────────────────────────────────────────────
+    # Money-touching writes. The MCP HTTP path has no RBAC, so there is
+    # deliberately no delete tool — void a record via update_payment instead.
+
+    # ── list_payments ───────────────────────────────────────────────────────────
+    if name == 'list_payments':
+        from payments.models import Payment
+        qs = Payment.objects.filter(tenant_id=TENANT_ID)
+        if args.get('lead_id'):
+            qs = qs.filter(lead_id=args['lead_id'])
+        if args.get('type'):
+            qs = qs.filter(type=args['type'])
+        if args.get('status'):
+            qs = qs.filter(status=args['status'])
+        if args.get('date_from'):
+            qs = qs.filter(date__gte=args['date_from'])
+        if args.get('date_to'):
+            qs = qs.filter(date__lte=args['date_to'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(reference_no__icontains=search) | Q(notes__icontains=search))
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('-date').values(
+            'id', 'lead_id', 'lead__name', 'type', 'status', 'amount', 'currency',
+            'method', 'reference_no', 'date', 'notes', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── create_payment ──────────────────────────────────────────────────────────
+    if name == 'create_payment':
+        from decimal import Decimal, InvalidOperation
+        from django.utils.dateparse import parse_datetime
+        from payments.models import Payment
+        if not OWNER_USER_ID:
+            raise RuntimeError('MCP_OWNER_USER_ID env var not set')
+        # Confirm the lead is in this tenant before writing a financial record.
+        lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        try:
+            amount = Decimal(str(args['amount']))
+        except (InvalidOperation, TypeError, ValueError):
+            raise RuntimeError('amount must be a number, e.g. 25000.00')
+        paid_at = args.get('date')
+        if paid_at:
+            paid_at = parse_datetime(str(paid_at))
+            if paid_at is None:
+                raise RuntimeError('date must be an ISO 8601 datetime, e.g. 2026-09-01T10:30:00Z')
+            if timezone.is_naive(paid_at):
+                paid_at = timezone.make_aware(paid_at, timezone.get_current_timezone())
+        else:
+            paid_at = timezone.now()
+        payment = Payment.objects.create(
+            tenant_id=TENANT_ID,
+            owner_user_id=OWNER_USER_ID,
+            lead_id=lead.id,
+            type=args['type'],
+            amount=amount,
+            currency=args.get('currency') or 'INR',
+            method=args.get('method') or None,
+            reference_no=args.get('reference_no') or None,
+            notes=args.get('notes') or None,
+            date=paid_at,
+            status=args.get('status') or 'CLEARED',
+        )
+        return {
+            'id':       payment.id,
+            'lead_id':  payment.lead_id,
+            'type':     payment.type,
+            'status':   payment.status,
+            'amount':   payment.amount,
+            'currency': payment.currency,
+            'date':     payment.date,
+        }
+
+    # ── update_payment ──────────────────────────────────────────────────────────
+    if name == 'update_payment':
+        from decimal import Decimal, InvalidOperation
+        from django.utils.dateparse import parse_datetime
+        from payments.models import Payment
+        payment = Payment.objects.get(id=args['payment_id'], tenant_id=TENANT_ID)
+        changed = []
+        for field in ('type', 'status', 'currency', 'method', 'reference_no', 'notes'):
+            if field in args:
+                setattr(payment, field, args[field])
+                changed.append(field)
+        if 'amount' in args:
+            try:
+                payment.amount = Decimal(str(args['amount']))
+            except (InvalidOperation, TypeError, ValueError):
+                raise RuntimeError('amount must be a number, e.g. 25000.00')
+            changed.append('amount')
+        if 'date' in args and args['date']:
+            paid_at = parse_datetime(str(args['date']))
+            if paid_at is None:
+                raise RuntimeError('date must be an ISO 8601 datetime, e.g. 2026-09-01T10:30:00Z')
+            if timezone.is_naive(paid_at):
+                paid_at = timezone.make_aware(paid_at, timezone.get_current_timezone())
+            payment.date = paid_at
+            changed.append('date')
+        if not changed:
+            raise RuntimeError('Nothing to update — send at least one field besides payment_id')
+        payment.save()
+        return {'id': payment.id, 'updated': True, 'changed_fields': changed}
+
+    # ── REAL ESTATE ─────────────────────────────────────────────────────────────
+    # create_project_interest / create_unit_lead replicate the REST viewsets'
+    # perform_create hooks: they call real_estate.services.activity_bridge so the
+    # lead's CRM timeline gets its REAL_ESTATE entry. Do not drop those calls.
+
+    # ── list_projects ───────────────────────────────────────────────────────────
+    if name == 'list_projects':
+        from django.db.models import Count
+        from real_estate.models import Project
+        qs = Project.objects.filter(tenant_id=TENANT_ID).annotate(
+            unit_count=Count('units', distinct=True))
+        if args.get('status'):
+            qs = qs.filter(status=args['status'])
+        if args.get('project_type'):
+            qs = qs.filter(project_type=args['project_type'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(name__icontains=search) |
+                Q(city__icontains=search) |
+                Q(rera_number__icontains=search)
+            )
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('-created_at').values(
+            'id', 'name', 'project_type', 'status', 'city', 'state',
+            'rera_number', 'possession_date', 'unit_count', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── get_project_summary ─────────────────────────────────────────────────────
+    if name == 'get_project_summary':
+        from django.db.models import Count
+        from real_estate.models import Project, Unit
+        project = Project.objects.get(id=args['project_id'], tenant_id=TENANT_ID)
+        units = Unit.objects.filter(project_id=project.id, tenant_id=TENANT_ID)
+
+        def _counts(field):
+            return {
+                (str(row[field]) if row[field] is not None else 'null'): row['count']
+                for row in units.values(field).annotate(count=Count('id'))
+            }
+
+        return {
+            'project': {
+                'id':              project.id,
+                'name':            project.name,
+                'project_type':    project.project_type,
+                'status':          project.status,
+                'city':            project.city,
+                'possession_date': project.possession_date,
+            },
+            'total_units':            units.count(),
+            'unit_counts_by_status':  _counts('status'),
+            'unit_counts_by_type':    _counts('unit_type'),
+            'unit_counts_by_floor':   _counts('floor_number'),
+        }
+
+    # ── list_units ──────────────────────────────────────────────────────────────
+    if name == 'list_units':
+        from real_estate.models import Unit
+        qs = Unit.objects.filter(tenant_id=TENANT_ID)
+        if args.get('project_id'):
+            qs = qs.filter(project_id=args['project_id'])
+        if args.get('block_id'):
+            qs = qs.filter(block_id=args['block_id'])
+        if args.get('status'):
+            qs = qs.filter(status=args['status'])
+        if args.get('unit_type'):
+            qs = qs.filter(unit_type=args['unit_type'])
+        if args.get('floor_number') is not None:
+            qs = qs.filter(floor_number=args['floor_number'])
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(
+                Q(unit_number__icontains=search) | Q(configuration__icontains=search))
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('project_id', 'unit_number').values(
+            'id', 'unit_number', 'project_id', 'project__name', 'block_id',
+            'block__name', 'unit_type', 'configuration', 'floor_number', 'facing',
+            'carpet_area_sqft', 'built_up_area_sqft', 'total_price', 'status',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
+    # ── create_project_interest ─────────────────────────────────────────────────
+    if name == 'create_project_interest':
+        from decimal import Decimal, InvalidOperation
+        from real_estate.models import Project, ProjectInterest
+        from real_estate.services.activity_bridge import log_project_interest_activity
+        lead    = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        project = Project.objects.get(id=args['project_id'], tenant_id=TENANT_ID)
+
+        def _money(key):
+            if args.get(key) is None:
+                return None
+            try:
+                return Decimal(str(args[key]))
+            except (InvalidOperation, TypeError, ValueError):
+                raise RuntimeError('%s must be a number' % key)
+
+        interest, created = ProjectInterest.objects.get_or_create(
+            project_id=project.id,
+            lead_id=lead.id,
+            defaults={
+                'tenant_id':           TENANT_ID,
+                'budget_min':          _money('budget_min'),
+                'budget_max':          _money('budget_max'),
+                'preferred_unit_type': args.get('preferred_unit_type') or None,
+                'notes':               args.get('notes') or None,
+            },
+        )
+        if created:
+            # Mirrors ProjectInterestViewSet.perform_create — without this the
+            # lead's timeline silently loses the REAL_ESTATE entry.
+            log_project_interest_activity(interest, actor_user_id=OWNER_USER_ID or None)
+        return {
+            'id':         interest.id,
+            'created':    created,
+            'lead_id':    interest.lead_id,
+            'project_id': interest.project_id,
+            'project':    project.name,
+        }
+
+    # ── create_unit_lead ────────────────────────────────────────────────────────
+    if name == 'create_unit_lead':
+        from real_estate.models import Unit, UnitLead
+        from real_estate.services.activity_bridge import log_unit_lead_activity
+        lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        unit = Unit.objects.select_related('project').get(
+            id=args['unit_id'], tenant_id=TENANT_ID)
+        unit_lead, created = UnitLead.objects.get_or_create(
+            unit_id=unit.id,
+            lead_id=lead.id,
+            defaults={
+                'tenant_id':     TENANT_ID,
+                'relation_type': args['relation_type'],
+                'notes':         args.get('notes') or None,
+            },
+        )
+        if created:
+            # Mirrors UnitLeadViewSet.perform_create — without this the lead's
+            # timeline silently loses the REAL_ESTATE entry.
+            log_unit_lead_activity(unit_lead, actor_user_id=OWNER_USER_ID or None)
+        elif unit_lead.relation_type != args['relation_type']:
+            previous = unit_lead.relation_type
+            unit_lead.relation_type = args['relation_type']
+            if args.get('notes'):
+                unit_lead.notes = args['notes']
+            unit_lead.save(update_fields=['relation_type', 'notes', 'updated_at'])
+            # Mirrors UnitLeadViewSet.perform_update's relation-change logging.
+            log_unit_lead_activity(
+                unit_lead,
+                actor_user_id=OWNER_USER_ID or None,
+                previous_relation_type=previous,
+            )
+        return {
+            'id':            unit_lead.id,
+            'created':       created,
+            'lead_id':       unit_lead.lead_id,
+            'unit_id':       unit_lead.unit_id,
+            'unit_number':   unit.unit_number,
+            'project':       unit.project.name,
+            'relation_type': unit_lead.relation_type,
+        }
+
+    # ── update_unit_status ──────────────────────────────────────────────────────
+    if name == 'update_unit_status':
+        from real_estate.models import Unit
+        unit = Unit.objects.get(id=args['unit_id'], tenant_id=TENANT_ID)
+        unit.status = args['status']
+        unit.save(update_fields=['status', 'updated_at'])
+        return {
+            'id':          unit.id,
+            'unit_number': unit.unit_number,
+            'status':      unit.status,
+            'project_id':  unit.project_id,
+        }
+
     raise RuntimeError('Unknown MCP tool: %s' % name)
 
 

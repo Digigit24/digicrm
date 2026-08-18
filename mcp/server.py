@@ -2,12 +2,14 @@
 """
 DigiCRM Sales Agent MCP Server — tool catalog (TOOLS)
 
-Registers 67 tools for a Claude sales agent to interact with DigiCRM:
+Registers 78 tools for a Claude sales agent to interact with DigiCRM:
   CRM core        (31) — leads, groups, statuses, tasks, activities, meetings
   WhatsApp        (12) — send, chat, templates, inbox ops, AI context
   Automation      (18) — sequences, steps, enrollments, campaigns
   Discovery reads (5)  — dashboard, kanban, follow-ups, phone lookup, audit log
-  Telephony       (1)  — call history
+  Telephony       (3)  — call history, disposition, analytics
+  Payments        (3)  — list / create / update payment records
+  Real estate     (6)  — projects, units, project interests, unit leads
 
 The authoritative count is always ``len(TOOLS)``; ``GET /mcp/health`` reports it.
 
@@ -992,6 +994,218 @@ list_users. Use set_call_outcome to record a disposition on a call.
     'page':          {'type': 'integer', 'description': 'Page number (default 1)'},
     'page_size':     {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
 })
+
+
+_tool('set_call_outcome', """
+Record the agent disposition (outcome) and an optional note on a completed
+call.
+
+Returns the call id, the stored outcome, note and the time it was set.
+Get call_id from list_call_logs. Setting an outcome again overwrites the
+previous one.
+""", {
+    'call_id': {'type': 'integer', 'description': 'ID of the call log. Get it from list_call_logs.'},
+    'outcome': {'type': 'string',
+                'enum': ['interested', 'not_interested', 'follow_up',
+                         'callback', 'converted', 'dnd'],
+                'description': 'Disposition for this call'},
+    'note':    {'type': 'string', 'description': 'Optional free-text note about the outcome (max 512 chars)'},
+}, ['call_id', 'outcome'])
+
+_tool('get_telephony_analytics', """
+Get team and per-agent call analytics for a recent date window.
+
+Returns date_from/date_to, team_summary (totals, answered/missed, talk time),
+agent_summary (the same broken down per agent_user_id), outcome_breakdown
+(counts per disposition) and missed_unattended (missed calls with no follow-up
+yet).
+Resolve agent_user_id values to names via list_users. Use list_call_logs for
+the individual calls behind these numbers.
+""", {
+    'days': {'type': 'integer', 'description': 'Size of the window in days, ending today (default 30, max 365)'},
+})
+
+
+# ---------------------------------------------------------------------------
+# PAYMENTS
+# ---------------------------------------------------------------------------
+
+_tool('list_payments', """
+List payment records (invoices, advances, refunds) logged against leads.
+
+Returns a paginated list with id, lead_id, lead_name, type, status, amount,
+currency, method, reference_no, date and notes, newest first.
+Get lead_id from list_leads. Use create_payment to add a record and
+update_payment to correct one.
+""", {
+    'lead_id':   {'type': 'integer', 'description': 'Only payments for this lead'},
+    'type':      {'type': 'string', 'enum': ['INVOICE', 'REFUND', 'ADVANCE', 'OTHER'],
+                  'description': 'Only payments of this type'},
+    'status':    {'type': 'string', 'enum': ['PENDING', 'CLEARED', 'FAILED', 'CANCELLED'],
+                  'description': 'Only payments in this state'},
+    'date_from': {'type': 'string',  'description': 'Only payments dated at/after this ISO 8601 datetime'},
+    'date_to':   {'type': 'string',  'description': 'Only payments dated at/before this ISO 8601 datetime'},
+    'search':    {'type': 'string',  'description': 'Filter by reference_no or notes (partial match)'},
+    'page':      {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size': {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('create_payment', """
+Record a payment against a lead.
+
+Returns the created payment's id, lead_id, type, status and amount.
+This writes a financial record. Confirm the amount and lead with the user
+first; there is no delete tool to undo it — correct mistakes with
+update_payment (e.g. status = CANCELLED).
+Get lead_id from list_leads or lookup_lead_by_phone.
+""", {
+    'lead_id':      {'type': 'integer', 'description': 'ID of the lead this payment belongs to'},
+    'amount':       {'type': 'number',  'description': 'Payment amount, e.g. 25000.00'},
+    'type':         {'type': 'string', 'enum': ['INVOICE', 'REFUND', 'ADVANCE', 'OTHER'],
+                     'description': 'What kind of record this is'},
+    'status':       {'type': 'string', 'enum': ['PENDING', 'CLEARED', 'FAILED', 'CANCELLED'],
+                     'description': 'Payment state (default CLEARED)'},
+    'date':         {'type': 'string',  'description': 'When the payment happened, as an ISO 8601 datetime (default now)'},
+    'currency':     {'type': 'string',  'description': 'ISO currency code (default INR)'},
+    'method':       {'type': 'string',  'description': 'How it was paid, e.g. "UPI", "NEFT", "cash"'},
+    'reference_no': {'type': 'string',  'description': 'Transaction / cheque / invoice reference number'},
+    'notes':        {'type': 'string',  'description': 'Free-text notes'},
+}, ['lead_id', 'amount', 'type'])
+
+_tool('update_payment', """
+Update an existing payment record.
+
+All fields except payment_id are optional — only send what you want to change.
+Returns the payment id and the fields that were changed.
+Get payment_id from list_payments. Use status = CANCELLED to void a payment
+rather than trying to delete it.
+""", {
+    'payment_id':   {'type': 'integer', 'description': 'ID of the payment. Get it from list_payments.'},
+    'amount':       {'type': 'number',  'description': 'New amount'},
+    'type':         {'type': 'string', 'enum': ['INVOICE', 'REFUND', 'ADVANCE', 'OTHER'],
+                     'description': 'New record type'},
+    'status':       {'type': 'string', 'enum': ['PENDING', 'CLEARED', 'FAILED', 'CANCELLED'],
+                     'description': 'New payment state'},
+    'date':         {'type': 'string',  'description': 'New payment date as an ISO 8601 datetime'},
+    'currency':     {'type': 'string',  'description': 'New ISO currency code'},
+    'method':       {'type': 'string',  'description': 'New payment method'},
+    'reference_no': {'type': 'string',  'description': 'New reference number'},
+    'notes':        {'type': 'string',  'description': 'New notes (replaces the existing notes)'},
+}, ['payment_id'])
+
+
+# ---------------------------------------------------------------------------
+# REAL ESTATE
+# ---------------------------------------------------------------------------
+
+_tool('list_projects', """
+List real estate projects (developments) in this workspace.
+
+Returns a paginated list with id, name, project_type, status, city, state,
+rera_number, possession_date and unit_count.
+Use a project's id as project_id for get_project_summary, list_units and
+create_project_interest.
+""", {
+    'status':       {'type': 'string',
+                     'enum': ['planning', 'under_construction', 'ready_to_move',
+                              'completed', 'on_hold'],
+                     'description': 'Only projects in this build state'},
+    'project_type': {'type': 'string', 'enum': ['residential', 'commercial', 'mixed', 'plotted'],
+                     'description': 'Only projects of this type'},
+    'search':       {'type': 'string',  'description': 'Filter by project name, city or RERA number'},
+    'page':         {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':    {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('get_project_summary', """
+Get inventory availability for one real estate project.
+
+Returns the project's basics plus unit_counts_by_status (available / held /
+booked / sold / blocked), unit_counts_by_type and unit_counts_by_floor.
+Get project_id from list_projects. Use list_units to see the individual units
+behind these counts.
+""", {
+    'project_id': {'type': 'integer', 'description': 'ID of the project. Get it from list_projects.'},
+}, ['project_id'])
+
+_tool('list_units', """
+List individual sellable units (flats, villas, plots, shops, offices).
+
+Returns a paginated list with id, unit_number, project_id, project_name,
+block_name, unit_type, configuration, floor_number, facing, carpet/built-up
+area, total_price and status.
+Get project_id from list_projects. Use a unit's id as unit_id for
+create_unit_lead and update_unit_status.
+""", {
+    'project_id':   {'type': 'integer', 'description': 'Only units in this project. Get ids from list_projects.'},
+    'block_id':     {'type': 'integer', 'description': 'Only units in this block/tower/wing'},
+    'status':       {'type': 'string',
+                     'enum': ['available', 'held', 'booked', 'sold', 'blocked'],
+                     'description': 'Only units in this sales state'},
+    'unit_type':    {'type': 'string',
+                     'enum': ['flat', 'villa', 'row_house', 'plot',
+                              'commercial_shop', 'commercial_office', 'other'],
+                     'description': 'Only units of this type'},
+    'floor_number': {'type': 'integer', 'description': 'Only units on this floor (may be negative for basements)'},
+    'search':       {'type': 'string',  'description': 'Filter by unit_number or configuration, e.g. "A-1203" or "2BHK"'},
+    'page':         {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':    {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
+
+_tool('create_project_interest', """
+Record that a lead is interested in a real estate project, with an optional
+budget range and preferred unit type.
+
+Returns the interest id and whether it was newly created (a lead can only have
+one interest row per project — a repeat call returns the existing one).
+Creating one also writes a REAL_ESTATE entry to the lead's activity timeline.
+Get lead_id from list_leads and project_id from list_projects. Once the lead
+picks a specific unit, use create_unit_lead.
+""", {
+    'lead_id':             {'type': 'integer', 'description': 'ID of the interested lead'},
+    'project_id':          {'type': 'integer', 'description': 'ID of the project. Get it from list_projects.'},
+    'preferred_unit_type': {'type': 'string',
+                            'enum': ['flat', 'villa', 'row_house', 'plot',
+                                     'commercial_shop', 'commercial_office', 'other'],
+                            'description': 'What kind of unit the lead wants'},
+    'budget_min':          {'type': 'number', 'description': 'Lower end of the lead\'s budget'},
+    'budget_max':          {'type': 'number', 'description': 'Upper end of the lead\'s budget'},
+    'notes':               {'type': 'string', 'description': 'Free-text notes about the requirement'},
+}, ['lead_id', 'project_id'])
+
+_tool('create_unit_lead', """
+Link a lead to a specific unit and record where they are in the buying journey
+(interested, site visit scheduled/done, negotiating, booked, sold, cancelled).
+
+Returns the link id and whether it was newly created (one link per lead+unit —
+a repeat call returns the existing one).
+Creating one also writes a REAL_ESTATE entry to the lead's activity timeline.
+This is the "book a site visit" primitive: pass
+relation_type = "site_visit_scheduled".
+Get lead_id from list_leads and unit_id from list_units.
+""", {
+    'lead_id':       {'type': 'integer', 'description': 'ID of the lead'},
+    'unit_id':       {'type': 'integer', 'description': 'ID of the unit. Get it from list_units.'},
+    'relation_type': {'type': 'string',
+                      'enum': ['interested', 'site_visit_scheduled', 'site_visit_done',
+                               'negotiating', 'booked', 'sold', 'cancelled'],
+                      'description': 'Where the lead is in the journey for this unit'},
+    'notes':         {'type': 'string', 'description': 'Free-text notes'},
+}, ['lead_id', 'unit_id', 'relation_type'])
+
+_tool('update_unit_status', """
+Change the sales status of a single unit (availability board update).
+
+Returns the unit id, its unit_number and the new status.
+Marking a unit held/booked/sold takes it out of the available inventory shown by
+list_units and get_project_summary — confirm with the user before changing it.
+Get unit_id from list_units.
+""", {
+    'unit_id': {'type': 'integer', 'description': 'ID of the unit. Get it from list_units.'},
+    'status':  {'type': 'string',
+                'enum': ['available', 'held', 'booked', 'sold', 'blocked'],
+                'description': 'New sales status for the unit'},
+}, ['unit_id', 'status'])
 
 
 # ===========================================================================
