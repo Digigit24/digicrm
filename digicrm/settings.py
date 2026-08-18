@@ -517,6 +517,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'notifications.tasks.dispatch_due_reminders',
         'schedule': 30.0,
     },
+    'materialize-meeting-reminders': {
+        'task': 'meetings.tasks.materialize_meeting_reminders',
+        'schedule': 900.0,  # Every 15 minutes
+    },
 }
 
 # Due reminders older than this are marked missed instead of surfacing as stale alerts.
