@@ -155,6 +155,10 @@ JWT_ALGORITHM = config('JWT_ALGORITHM', default='HS256')
 # SuperAdmin URL
 SUPERADMIN_URL = config('SUPERADMIN_URL', default='https://admin.celiyo.com')
 
+# How long (seconds) the tenant user directory fetched from SuperAdmin is cached
+# server-side. Cache keys are always tenant-scoped (crm/user_directory.py).
+USER_DIRECTORY_CACHE_TTL = config('USER_DIRECTORY_CACHE_TTL', default=300, cast=int)
+
 # Session settings for admin
 SESSION_COOKIE_AGE = 3600 * 8  # 8 hours
 SESSION_SAVE_EVERY_REQUEST = True
