@@ -10,6 +10,8 @@ Background tasks for:
 
 import logging
 from datetime import timedelta
+from django.conf import settings
+from django.db import models
 from django.utils import timezone
 from celery import shared_task, Task
 from celery.exceptions import MaxRetriesExceededError
@@ -375,3 +377,164 @@ def check_connection_health():
     except Exception as e:
         logger.error(f"Connection health check failed: {e}", exc_info=True)
         return {'status': 'error', 'message': str(e)}
+
+
+# ===========================================================================
+# COMPOSIO
+# ===========================================================================
+# All four tasks use the existing CallbackTask base so failures land in the
+# same log shape as the legacy integration tasks. None of them import the
+# composio SDK directly - everything goes through
+# integrations.services.composio_client / composio_sync.
+
+
+@shared_task(base=CallbackTask, bind=True, max_retries=5)
+def poll_composio_connection(self, connection_id):
+    """
+    Poll one pending Composio connection until it reaches a terminal state.
+
+    Scheduled by the initiate endpoint with countdown=5 as a safety net: the
+    hosted-auth callback normally resolves the status synchronously, but the
+    user may close the tab before Composio redirects the browser back to us.
+
+    Retries with backoff while the connection is still INITIALIZING/PENDING;
+    stops as soon as it is ACTIVE or terminal, or once the link TTL expires.
+    """
+    from integrations.models import ComposioConnection, ComposioConnectionStatusEnum
+    from integrations.services.composio_client import (
+        ComposioError, ComposioNotConfigured,
+    )
+    from integrations.services.composio_sync import sync_connection_status
+
+    try:
+        connection = ComposioConnection.objects.get(id=connection_id)
+    except ComposioConnection.DoesNotExist:
+        logger.warning(f"poll_composio_connection: connection {connection_id} is gone")
+        return {'status': 'missing'}
+
+    pending = (ComposioConnectionStatusEnum.PENDING, ComposioConnectionStatusEnum.INITIALIZING)
+    if connection.status not in pending:
+        return {'status': connection.status, 'polled': False}
+
+    ttl = int(getattr(settings, 'COMPOSIO_LINK_TTL_SECONDS', 900))
+    if timezone.now() - connection.created_at > timedelta(seconds=ttl):
+        connection.mark_failed('Authorisation was not completed before the link expired')
+        connection.record_event(
+            'FAILED', message='Hosted-auth link expired before the user finished authorising'
+        )
+        return {'status': connection.status, 'expired': True}
+
+    try:
+        sync_connection_status(connection, force=True)
+    except ComposioNotConfigured:
+        return {'status': 'not_configured'}
+    except ComposioError as exc:
+        logger.warning(f"poll_composio_connection {connection_id}: {exc}")
+
+    connection.refresh_from_db()
+    if connection.status in pending:
+        # Backoff: 5s, 10s, 20s, 40s, 80s.
+        raise self.retry(countdown=5 * (2 ** self.request.retries))
+
+    return {'status': connection.status, 'polled': True}
+
+
+@shared_task(base=CallbackTask)
+def sync_composio_toolkits():
+    """
+    Refresh the ComposioToolkit catalogue cache. Celery beat: daily.
+
+    Never touches the operator-owned is_enabled / is_featured / sort_order
+    columns, so a disabled toolkit stays disabled across syncs.
+    """
+    from integrations.services.composio_client import ComposioError, ComposioNotConfigured
+    from integrations.services.composio_sync import sync_toolkit_catalogue
+
+    try:
+        touched = sync_toolkit_catalogue()
+    except ComposioNotConfigured:
+        logger.info('sync_composio_toolkits: Composio is disabled, skipping')
+        return {'status': 'disabled'}
+    except ComposioError as exc:
+        logger.error(f'sync_composio_toolkits failed: {exc}')
+        return {'status': 'error', 'message': str(exc)}
+
+    return {'status': 'ok', 'synced': touched}
+
+
+@shared_task(base=CallbackTask)
+def sweep_stale_composio_connections():
+    """
+    Housekeeping for the Composio connect flow. Celery beat: every 15 minutes.
+
+      * PENDING/INITIALIZING older than COMPOSIO_LINK_TTL_SECONDS -> FAILED
+      * ACTIVE rows not status-checked in 24h -> re-sync against Composio
+      * expired or consumed ComposioLinkState rows -> deleted
+    """
+    from integrations.models import (
+        ComposioConnection, ComposioConnectionStatusEnum,
+        ComposioEventTypeEnum, ComposioLinkState,
+    )
+    from integrations.services.composio_client import ComposioError, ComposioNotConfigured
+    from integrations.services.composio_sync import sync_connection_status
+
+    now = timezone.now()
+    ttl = int(getattr(settings, 'COMPOSIO_LINK_TTL_SECONDS', 900))
+
+    stale = ComposioConnection.objects.filter(
+        status__in=[ComposioConnectionStatusEnum.PENDING,
+                    ComposioConnectionStatusEnum.INITIALIZING],
+        created_at__lt=now - timedelta(seconds=ttl),
+    )
+    expired_count = 0
+    for connection in stale.iterator():
+        connection.mark_failed('Authorisation was not completed before the link expired')
+        connection.record_event(
+            ComposioEventTypeEnum.FAILED,
+            message='Swept: hosted-auth link expired before the user finished authorising',
+        )
+        expired_count += 1
+
+    resynced = 0
+    errors = 0
+    aging = ComposioConnection.objects.filter(
+        status=ComposioConnectionStatusEnum.ACTIVE
+    ).filter(
+        models.Q(last_status_check_at__isnull=True)
+        | models.Q(last_status_check_at__lt=now - timedelta(hours=24))
+    )
+    for connection in aging.iterator():
+        try:
+            sync_connection_status(connection, force=True)
+            resynced += 1
+        except ComposioNotConfigured:
+            break
+        except (ComposioError, Exception) as exc:  # noqa: BLE001
+            errors += 1
+            logger.warning(f'sweep_stale_composio_connections: {connection.public_id}: {exc}')
+
+    deleted_states, _ = ComposioLinkState.objects.filter(
+        models.Q(expires_at__lt=now) | models.Q(consumed_at__lt=now - timedelta(hours=1))
+    ).delete()
+
+    logger.info(
+        f'Composio sweep: {expired_count} expired, {resynced} resynced, '
+        f'{errors} errors, {deleted_states} link states removed'
+    )
+    return {
+        'expired': expired_count,
+        'resynced': resynced,
+        'errors': errors,
+        'link_states_deleted': deleted_states,
+    }
+
+
+@shared_task(base=CallbackTask)
+def cleanup_composio_events(days=180):
+    """Drop ComposioConnectionEvent rows older than `days`. Celery beat: daily."""
+    from integrations.models import ComposioConnectionEvent
+
+    cutoff = timezone.now() - timedelta(days=days)
+    deleted, _ = ComposioConnectionEvent.objects.filter(created_at__lt=cutoff).delete()
+    logger.info(f'Deleted {deleted} Composio connection events older than {days} days')
+    return {'deleted': deleted}
