@@ -17,6 +17,10 @@ this module forwards it upstream as ``x-tenant-id``. If no tenant id can be
 resolved the fetch fails closed with :class:`TenantScopeRequired` rather than
 performing an unscoped fetch.
 
+HTTP redirects are never followed (``allow_redirects=False``): a 3xx from the
+auth service would otherwise replay the privileged service JWT at an arbitrary
+host. Any 3xx is treated as an upstream failure.
+
 Upstream contract (SuperAdmin)::
 
     GET {SUPERADMIN_URL}/api/users/?page=1&page_size=200&search=<q>
@@ -162,6 +166,40 @@ def _same_host(candidate: str, base: str) -> bool:
         return False
 
 
+def _get(url: str, params, headers: dict):
+    """
+    One outbound call to the auth service.
+
+    Redirects are NOT followed: ``requests`` would replay the request -- and the
+    privileged ``Authorization: Bearer <service JWT>`` / ``x-tenant-id`` headers
+    with it -- at whatever host the 3xx points to. A redirect from our own auth
+    service is never a normal condition (proxy/ingress/DNS misconfiguration or a
+    captive portal), so any 3xx is treated as an upstream failure and surfaces to
+    the caller as a 502 rather than leaking the credential or silently returning
+    an empty list.
+    """
+    resp = requests.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
+    )
+    if 300 <= resp.status_code < 400:
+        location = resp.headers.get('Location', '') if hasattr(resp, 'headers') else ''
+        logger.error(
+            'User directory: auth service returned an unexpected %s redirect to %s; '
+            'refusing to follow it with the service credential.',
+            resp.status_code, urlparse(location).netloc or '<unknown host>',
+        )
+        raise requests.HTTPError(
+            'Auth service returned an unexpected {} redirect'.format(resp.status_code),
+            response=resp,
+        )
+    resp.raise_for_status()
+    return resp
+
+
 def fetch_tenant_users(
     search: str = None,
     page_size: int = DEFAULT_PAGE_SIZE,
@@ -238,8 +276,7 @@ def fetch_tenant_users(
     pages = 0
 
     while url and pages < MAX_PAGES and len(users) < MAX_USERS:
-        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
+        resp = _get(url, params, headers)
         payload = resp.json()
         pages += 1
 

@@ -68,7 +68,18 @@ def _raw_user(idx, tenant_label='a', **overrides):
 def _response(payload):
     resp = mock.MagicMock()
     resp.status_code = 200
+    resp.headers = {}
     resp.json.return_value = payload
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+def _redirect(location, status_code=302):
+    """A 3xx that requests would silently follow if allow_redirects were on."""
+    resp = mock.MagicMock()
+    resp.status_code = status_code
+    resp.headers = {'Location': location}
+    resp.json.side_effect = AssertionError('body of a redirect must not be parsed')
     resp.raise_for_status.return_value = None
     return resp
 
@@ -117,6 +128,7 @@ class FetchTenantUsersScopingTest(SimpleTestCase):
         )
         self.assertEqual(kwargs['params']['page_size'], 200)
         self.assertEqual(kwargs['params']['search'], 'as')
+        self.assertIs(kwargs['allow_redirects'], False)
 
     def test_page_size_is_clamped(self):
         with mock.patch.object(
@@ -176,7 +188,7 @@ class FetchTenantUsersCacheTest(SimpleTestCase):
             TENANT_B: _response(_page([_raw_user(9, 'b')])),
         }
 
-        def fake_get(url, params=None, headers=None, timeout=None):
+        def fake_get(url, params=None, headers=None, timeout=None, **kwargs):
             return responses[headers['x-tenant-id']]
 
         with mock.patch.object(user_directory.requests, 'get', side_effect=fake_get):
@@ -250,6 +262,9 @@ class FetchTenantUsersPaginationTest(SimpleTestCase):
         # follow-up requests use the absolute next URL and drop params
         self.assertEqual(get.call_args_list[1][0][0], page1['next'])
         self.assertIsNone(get.call_args_list[1][1]['params'])
+        # and no page may ever follow an HTTP redirect
+        for call in get.call_args_list:
+            self.assertIs(call[1]['allow_redirects'], False)
 
     def test_page_loop_is_capped(self):
         endless = _response(
@@ -264,6 +279,53 @@ class FetchTenantUsersPaginationTest(SimpleTestCase):
 
         self.assertEqual(get.call_count, user_directory.MAX_PAGES)
         # duplicate ids across the repeated page are collapsed
+        self.assertEqual(data['count'], 1)
+
+    def test_http_redirect_is_not_followed_and_does_not_replay_the_credential(self):
+        """A 3xx must never carry the service JWT to the redirect target."""
+        redirect = _redirect('https://evil.example.com/api/users/')
+        with mock.patch.object(user_directory.requests, 'get', return_value=redirect) as get:
+            with self.assertRaises(requests.HTTPError):
+                fetch_tenant_users(tenant_id=TENANT_A)
+
+        # exactly one outbound call, made with redirect following disabled
+        self.assertEqual(get.call_count, 1)
+        self.assertIs(get.call_args[1]['allow_redirects'], False)
+        # and nothing was ever sent to the redirect target
+        for call in get.call_args_list:
+            self.assertNotIn('evil.example.com', call[0][0])
+
+    def test_redirect_on_a_later_page_also_fails_closed(self):
+        page1 = _page(
+            [_raw_user(1)],
+            next_url='{}/api/users/?page=2&page_size=100'.format(UPSTREAM),
+            count=200,
+        )
+        with mock.patch.object(
+            user_directory.requests, 'get',
+            side_effect=[_response(page1), _redirect('https://evil.example.com/api/users/')],
+        ) as get:
+            with self.assertRaises(requests.HTTPError):
+                fetch_tenant_users(tenant_id=TENANT_A)
+        self.assertEqual(get.call_count, 2)
+        for call in get.call_args_list:
+            self.assertIs(call[1]['allow_redirects'], False)
+            self.assertNotIn('evil.example.com', call[0][0])
+
+    def test_redirect_is_not_cached(self):
+        """A failed fetch must not poison the cache with an empty list."""
+        with mock.patch.object(
+            user_directory.requests, 'get', return_value=_redirect('https://evil.example.com/')
+        ):
+            with self.assertRaises(requests.HTTPError):
+                fetch_tenant_users(tenant_id=TENANT_A)
+
+        with mock.patch.object(
+            user_directory.requests, 'get',
+            return_value=_response(_page([_raw_user(1)])),
+        ) as get:
+            data = fetch_tenant_users(tenant_id=TENANT_A)
+        self.assertEqual(get.call_count, 1)
         self.assertEqual(data['count'], 1)
 
     def test_off_host_next_link_is_not_followed(self):
@@ -423,6 +485,16 @@ class TenantUserListViewTest(SimpleTestCase):
             response = self.view(self._request())
         self.assertEqual(response.status_code, 502)
 
+    def test_upstream_redirect_returns_502(self):
+        with mock.patch.object(
+            user_directory.requests, 'get',
+            return_value=_redirect('https://evil.example.com/api/users/'),
+        ) as get:
+            response = self.view(self._request())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(get.call_count, 1)
+        self.assertIs(get.call_args[1]['allow_redirects'], False)
+
     @override_settings(MCP_SERVICE_JWT='')
     def test_missing_service_token_returns_503(self):
         with mock.patch.dict(
@@ -439,7 +511,7 @@ class TenantUserListViewTest(SimpleTestCase):
             TENANT_B: _response(_page([_raw_user(9, 'b')])),
         }
 
-        def fake_get(url, params=None, headers=None, timeout=None):
+        def fake_get(url, params=None, headers=None, timeout=None, **kwargs):
             return responses[headers['x-tenant-id']]
 
         with mock.patch.object(user_directory.requests, 'get', side_effect=fake_get):
