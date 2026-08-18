@@ -2,12 +2,40 @@
 Django settings for digicrm project.
 """
 
+import os
 from pathlib import Path
-from decouple import config, Csv
+from decouple import AutoConfig, Config, Csv, RepositoryEnv
 import dj_database_url
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# ---------------------------------------------------------------------------
+# Environment file resolution
+#
+# python-decouple's default AutoConfig only ever reads ``.env``. We want a
+# local developer's ``.env.local`` to win over the shared ``.env`` without
+# anyone having to edit or clobber the latter, so build the Config explicitly.
+#
+# Precedence: DJANGO_ENV_FILE (explicit override) > .env.local > .env
+# ``.env.local`` is gitignored and must contain localhost-only values.
+# ---------------------------------------------------------------------------
+def _resolve_env_file(base_dir):
+    explicit = os.environ.get('DJANGO_ENV_FILE')
+    if explicit and Path(explicit).is_file():
+        return Path(explicit)
+    for name in ('.env.local', '.env'):
+        candidate = base_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+_ENV_FILE = _resolve_env_file(BASE_DIR)
+if _ENV_FILE is not None:
+    config = Config(RepositoryEnv(str(_ENV_FILE)))
+else:
+    config = AutoConfig(search_path=str(BASE_DIR))
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-temporary-key-change-in-production')
@@ -155,6 +183,12 @@ JWT_ALGORITHM = config('JWT_ALGORITHM', default='HS256')
 
 # SuperAdmin URL
 SUPERADMIN_URL = config('SUPERADMIN_URL', default='https://admin.celiyo.com')
+
+# Service JWT used for server-to-server calls to SuperAdmin (the tenant user
+# directory, and the MCP dispatcher). crm/user_directory.py reads this via
+# settings; without it the directory fails closed with 503 rather than making
+# an unauthenticated upstream request.
+MCP_SERVICE_JWT = config('MCP_SERVICE_JWT', default='')
 
 # How long (seconds) the tenant user directory fetched from SuperAdmin is cached
 # server-side. Cache keys are always tenant-scoped (crm/user_directory.py).
