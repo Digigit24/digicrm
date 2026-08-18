@@ -314,3 +314,106 @@ class ScopedPermissionTest(TestCase):
 
         result = get_queryset_for_permission(qs, request, 'crm.leads.view')
         self.assertEqual(len(result), 0)
+
+
+class OwnershipRegistryTest(TestCase):
+    """Regressions for the ownership-registry fixes shipped with the calendar work."""
+
+    def test_tasks_task_is_registered(self):
+        """A task ASSIGNED to you but OWNED by your manager must reach your calendar."""
+        self.assertIn('tasks.Task', OWNERSHIP_FIELDS)
+        registered = OWNERSHIP_FIELDS['tasks.Task']
+        self.assertEqual(registered['owner'], 'owner_user_id')
+        self.assertEqual(
+            registered['team'],
+            ('owner_user_id', 'assignee_user_id', 'reporter_user_id'),
+        )
+
+    def test_registered_task_fields_exist_on_the_model(self):
+        from tasks.models import Task
+        field_names = {field.name for field in Task._meta.get_fields()}
+        for field in OWNERSHIP_FIELDS['tasks.Task']['team']:
+            self.assertIn(field, field_names)
+
+    def test_meeting_team_tuple_includes_attendees(self):
+        """Without this, `team` scope on meetings is a synonym for `own`."""
+        self.assertEqual(
+            OWNERSHIP_FIELDS['meetings.Meeting']['team'],
+            ('owner_user_id', 'attendees__user_id'),
+        )
+
+    def test_get_object_owner_id_is_defined_exactly_once(self):
+        """The duck-typed duplicate used to shadow the registry-backed version."""
+        import inspect
+        import common.permissions as permissions_module
+
+        source = inspect.getsource(permissions_module)
+        self.assertEqual(source.count('def get_object_owner_id('), 1)
+
+    def test_get_object_owner_id_uses_the_registry_not_duck_typing(self):
+        """An unregistered model must fail closed even when it has owner_user_id."""
+        unregistered = SimpleNamespace(
+            _meta=SimpleNamespace(label='telephony.CallLog'),
+            owner_user_id=USER_A,
+        )
+        self.assertIsNone(get_object_owner_id(unregistered))
+
+        registered = SimpleNamespace(
+            _meta=SimpleNamespace(label='crm.Lead'), owner_user_id=USER_A
+        )
+        self.assertEqual(get_object_owner_id(registered), USER_A)
+
+    def test_team_scope_matches_a_meeting_attendee(self):
+        """_is_team_member must resolve the reverse `attendees__user_id` relation."""
+        import uuid as _uuid
+        from datetime import datetime, timedelta, timezone as _tz
+
+        from meetings.models import Meeting, MeetingAttendee
+
+        start = datetime(2026, 9, 1, 9, 0, tzinfo=_tz.utc)
+        meeting = Meeting.objects.create(
+            tenant_id=TENANT_A, title='Shared', start_at=start,
+            end_at=start + timedelta(hours=1), owner_user_id=USER_B,
+        )
+        MeetingAttendee.objects.create(
+            tenant_id=TENANT_A, meeting=meeting, user_id=USER_A
+        )
+        request = SimpleNamespace(
+            user_id=USER_A,
+            permissions={'crm': {'meetings': {'view': 'team'}}},
+            is_super_admin=False,
+        )
+        self.assertTrue(check_object_permission(request, meeting, 'crm.meetings.view'))
+
+        stranger = SimpleNamespace(
+            user_id=_uuid.uuid4(),
+            permissions={'crm': {'meetings': {'view': 'team'}}},
+            is_super_admin=False,
+        )
+        self.assertFalse(check_object_permission(stranger, meeting, 'crm.meetings.view'))
+
+    def test_team_scoped_queryset_deduplicates_joined_rows(self):
+        """attendees__user_id is a JOIN and would otherwise duplicate rows."""
+        from datetime import datetime, timedelta, timezone as _tz
+
+        from meetings.models import Meeting, MeetingAttendee
+
+        start = datetime(2026, 9, 1, 9, 0, tzinfo=_tz.utc)
+        meeting = Meeting.objects.create(
+            tenant_id=TENANT_A, title='Shared', start_at=start,
+            end_at=start + timedelta(hours=1), owner_user_id=USER_A,
+        )
+        # owner AND attendee -> the OR filter matches twice
+        MeetingAttendee.objects.create(
+            tenant_id=TENANT_A, meeting=meeting, user_id=USER_A,
+            role='ORGANIZER', is_organizer=True,
+        )
+        request = SimpleNamespace(
+            user_id=USER_A, tenant_id=TENANT_A,
+            permissions={'crm': {'meetings': {'view': 'team'}}},
+            is_super_admin=False,
+        )
+        result = get_queryset_for_permission(
+            Meeting.objects.all(), request, 'crm.meetings.view'
+        )
+        self.assertEqual(result.count(), 1)

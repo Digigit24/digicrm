@@ -4,7 +4,7 @@ The Django app is named ``scheduling`` on purpose -- a top-level ``calendar``
 package shadows the stdlib module Django itself imports.
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import requests
 from django.db.models import Q

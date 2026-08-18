@@ -20,7 +20,6 @@ from meetings.models import (
     MeetingAttendee,
     MeetingReminder,
     MeetingStatusEnum,
-    VisibilityEnum,
 )
 from notifications.models import Reminder, ReminderStatus, ReminderSubjectType
 
