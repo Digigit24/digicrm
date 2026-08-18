@@ -97,7 +97,13 @@ OWNERSHIP_FIELDS = {
     },
     'meetings.Meeting': {
         'owner': 'owner_user_id',
-        'team': ('owner_user_id',),
+        # ``attendees__user_id`` spans a reverse FK, so team-scoped querysets must
+        # ``.distinct()`` (see get_queryset_for_permission).
+        'team': ('owner_user_id', 'attendees__user_id'),
+    },
+    'tasks.Task': {
+        'owner': 'owner_user_id',
+        'team': ('owner_user_id', 'assignee_user_id', 'reporter_user_id'),
     },
 }
 
@@ -150,16 +156,31 @@ def _team_fields_for(obj):
 
 
 def _is_team_member(obj, user_id):
-    """Return True if ``user_id`` matches any registered team field on ``obj``."""
+    """Return True if ``user_id`` matches any registered team field on ``obj``.
+
+    Handles both plain/forward-FK paths (``lead__owner_user_id``) and reverse
+    relations (``attendees__user_id``), which resolve to a related manager and
+    must be queried rather than attribute-walked.
+    """
     if not user_id:
         return False
     for field in _team_fields_for(obj):
         try:
             value = obj
-            for part in field.split('__'):
-                value = getattr(value, part, None)
-                if value is None:
+            parts = field.split('__')
+            for index, part in enumerate(parts):
+                manager = getattr(value, part, None)
+                if manager is None:
+                    value = None
                     break
+                # Reverse relation / many-to-many -> query the remaining path.
+                if hasattr(manager, 'filter') and hasattr(manager, 'model'):
+                    remainder = '__'.join(parts[index + 1:]) or 'pk'
+                    if manager.filter(**{remainder: user_id}).exists():
+                        return True
+                    value = None
+                    break
+                value = manager
             if value is not None and str(value) == str(user_id):
                 return True
         except Exception:
@@ -331,12 +352,18 @@ def get_queryset_for_permission(queryset, request, view_permission_key, owner_fi
         elif permission_value == "team":
             model_label = _model_label(queryset)
             team_q = _team_filter_kwargs(model_label, _actor_id(request))
-            return base_queryset.filter(team_q)
+            fields = OWNERSHIP_FIELDS.get(model_label, {}).get('team', ())
+            filtered = base_queryset.filter(team_q)
+            # A team field that spans a relation (e.g. ``attendees__user_id``)
+            # produces a JOIN that can duplicate rows.
+            if any('__' in field for field in fields):
+                filtered = filtered.distinct()
+            return filtered
         elif permission_value == "own":
             model_label = _model_label(queryset)
-            fields = OWNERSHIP_FIELDS.get(model_label, {}).get('team', ())
-            if fields:
-                owner_field = fields[0]
+            registered_owner = OWNERSHIP_FIELDS.get(model_label, {}).get('owner')
+            if registered_owner:
+                owner_field = registered_owner
             filter_kwargs = {owner_field: _actor_id(request)}
             return base_queryset.filter(**filter_kwargs)
 
@@ -414,21 +441,6 @@ def get_nested_permission(permissions, path):
         Permission value or None if not found
     """
     return get_permission_value(permissions, path)
-
-
-def get_object_owner_id(obj):
-    """Best-effort ownership resolver used for scoped permissions."""
-    for field_name in ('owner_user_id', 'by_user_id', 'created_by', 'uploaded_by'):
-        if hasattr(obj, field_name):
-            value = getattr(obj, field_name)
-            if value:
-                return value
-
-    lead = getattr(obj, 'lead', None)
-    if lead is not None and hasattr(lead, 'owner_user_id'):
-        return lead.owner_user_id
-
-    return None
 
 
 class HasDigiPermission(BasePermission):

@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'payments',
     'tasks',
     'notifications',
+    'scheduling',            # Calendar / scheduling (URL prefix /api/calendar/)
     'integrations',
     'telephony',
     'whatsapp_integration',   # DigiCRM WhatsApp adapter app
@@ -519,6 +520,10 @@ CELERY_BEAT_SCHEDULE = {
     'dispatch-due-reminders': {
         'task': 'notifications.tasks.dispatch_due_reminders',
         'schedule': 30.0,
+    },
+    'materialize-meeting-reminders': {
+        'task': 'meetings.tasks.materialize_meeting_reminders',
+        'schedule': 900.0,  # Every 15 minutes
     },
 }
 

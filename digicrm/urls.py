@@ -37,6 +37,9 @@ urlpatterns = [
     path('api/real-estate/', include('real_estate.urls')),
     path('api/ai/', include('ai.urls')),
     path('api/meetings/', include('meetings.urls')),
+    # Unified calendar API. The Django app is named ``scheduling`` (a top-level
+    # ``calendar`` package would shadow the stdlib module Django imports).
+    path('api/calendar/', include('scheduling.urls')),
     path('api/payments/', include('payments.urls')),
     path('api/tasks/', include('tasks.urls')),
     path('api/notifications/', include('notifications.urls')),
