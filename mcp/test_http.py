@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 DigiCRM MCP HTTP Test Suite — all 78 tools
+
+The MCP secret is read from the MCP_SECRET environment variable. Never hardcode
+it here or pass it as a literal on the command line — it lands in shell history,
+CI logs and this repo.
+
 Usage:
-    python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse --secret 'letmegoin@0008'
+    export MCP_SECRET='...'          # or set it in your shell profile / CI secret store
+    python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse
+    python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse --secret "$MCP_SECRET"
     python mcp/test_http.py --tool list_leads
     python mcp/test_http.py --dry-run      # skip write/destructive calls
 """
@@ -44,11 +51,20 @@ RESET  = '\033[0m'
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--url',     default=os.environ.get('MCP_URL', 'http://localhost:8000/mcp/sse'))
-    p.add_argument('--secret',  default=os.environ.get('MCP_SECRET', ''))
+    p.add_argument('--secret',  default=os.environ.get('MCP_SECRET'),
+                   help='MCP bearer secret. Defaults to the MCP_SECRET env var; '
+                        'prefer the env var over passing it on the command line.')
     p.add_argument('--tool',    help='Run only this tool')
     p.add_argument('--dry-run', action='store_true', help='Skip write tools')
     p.add_argument('--timeout', type=int, default=20)
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.secret:
+        # The server fails closed on a blank MCP_SECRET, so an unset secret would
+        # otherwise surface as an unexplained wall of 401s.
+        p.error('no MCP secret provided. Set the MCP_SECRET environment variable '
+                '(preferred) or pass --secret. The server rejects every request '
+                'without it.')
+    return args
 
 
 class MCPClient:
