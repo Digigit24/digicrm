@@ -390,6 +390,26 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         )
         return {'id': lead.id, 'name': lead.name, 'phone': lead.phone}
 
+    # ── get_lead_field_schema ───────────────────────────────────────────────────
+    if name == 'get_lead_field_schema':
+        from crm.models import LeadFieldConfiguration
+        from crm.utils import ensure_default_field_configurations
+        # Idempotent: seeds the tenant's standard field rows on first read,
+        # exactly like GET /api/crm/field-configurations/field_schema/.
+        ensure_default_field_configurations(TENANT_ID)
+        cols = (
+            'field_name', 'field_label', 'field_type', 'is_required',
+            'is_visible', 'options', 'placeholder', 'help_text',
+            'default_value', 'display_order',
+        )
+        fields = LeadFieldConfiguration.objects.filter(
+            tenant_id=TENANT_ID, is_active=True
+        ).order_by('display_order', 'field_label')
+        return {
+            'standard_fields': list(fields.filter(is_standard=True).values(*cols)),
+            'custom_fields':   list(fields.filter(is_standard=False).values(*cols)),
+        }
+
     # ── update_lead ─────────────────────────────────────────────────────────────
     if name == 'update_lead':
         lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
@@ -408,6 +428,126 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         lead.status_id = args['status_id']
         lead.save(update_fields=['status'])
         return {'id': lead.id, 'status_id': args['status_id']}
+
+    # ── append_lead_note ────────────────────────────────────────────────────────
+    if name == 'append_lead_note':
+        from django.db import transaction
+        text = str(args.get('text') or '').strip()
+        if not text:
+            raise RuntimeError('text is required and must not be blank')
+        stamp  = timezone.now().strftime('%Y-%m-%d %H:%M')
+        header = '\u2014 %s' % stamp + (' \u00b7 %s' % OWNER_USER_ID if OWNER_USER_ID else '')
+        block  = '%s\n%s' % (header, text)
+        with transaction.atomic():
+            # Read-modify-write under a row lock so concurrent appends are not
+            # lost — this is the non-destructive alternative to update_lead.
+            lead = Lead.objects.select_for_update().get(
+                id=args['lead_id'], tenant_id=TENANT_ID)
+            existing = lead.notes or ''
+            lead.notes = ('%s\n\n%s' % (existing, block)) if existing.strip() else block
+            lead.save(update_fields=['notes', 'updated_at'])
+        return {'id': lead.id, 'appended': True, 'notes': lead.notes}
+
+    # ── set_lead_follow_up ──────────────────────────────────────────────────────
+    if name == 'set_lead_follow_up':
+        from django.db import transaction
+        from django.utils.dateparse import parse_datetime
+        from notifications.models import Reminder, ReminderStatus
+        if not OWNER_USER_ID:
+            raise RuntimeError('MCP_OWNER_USER_ID env var not set')
+        follow_up_at = parse_datetime(str(args['follow_up_at']))
+        if follow_up_at is None:
+            raise RuntimeError(
+                'follow_up_at must be an ISO 8601 datetime, e.g. 2026-09-01T10:30:00Z')
+        if timezone.is_naive(follow_up_at):
+            follow_up_at = timezone.make_aware(
+                follow_up_at, timezone.get_current_timezone())
+        enabled = args.get('reminder_enabled', True)
+        try:
+            offset = int(args.get('reminder_offset_minutes') or 0)
+        except (TypeError, ValueError):
+            raise RuntimeError('reminder_offset_minutes must be an integer')
+        if offset < 0:
+            raise RuntimeError('reminder_offset_minutes must be 0 or greater')
+        now       = timezone.now()
+        remind_at = follow_up_at - timezone.timedelta(minutes=offset) if enabled else None
+        if enabled and remind_at <= now:
+            raise RuntimeError(
+                'Reminder time %s is not in the future — pick a later follow_up_at '
+                'or a smaller reminder_offset_minutes.' % remind_at.isoformat())
+
+        with transaction.atomic():
+            lead = Lead.objects.select_for_update().get(
+                id=args['lead_id'], tenant_id=TENANT_ID)
+            lead.next_follow_up_at = follow_up_at
+            lead.save(update_fields=['next_follow_up_at', 'updated_at'])
+
+            active = Reminder.objects.select_for_update().filter(
+                tenant_id=TENANT_ID,
+                lead_id=lead.id,
+                recipient_user_id=OWNER_USER_ID,
+                status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+            ).order_by('-updated_at')
+            reminder = active.first()
+
+            if enabled:
+                if reminder is None:
+                    reminder = Reminder.objects.create(
+                        tenant_id=TENANT_ID,
+                        lead_id=lead.id,
+                        recipient_user_id=OWNER_USER_ID,
+                        created_by_user_id=OWNER_USER_ID,
+                        follow_up_at=follow_up_at,
+                        remind_at=remind_at,
+                        offset_minutes=offset,
+                    )
+                else:
+                    reminder.follow_up_at   = follow_up_at
+                    reminder.remind_at      = remind_at
+                    reminder.offset_minutes = offset
+                    reminder.status         = ReminderStatus.PENDING
+                    reminder.locked_at      = None
+                    reminder.cancelled_at   = None
+                    reminder.last_error     = ''
+                    reminder.save(update_fields=[
+                        'follow_up_at', 'remind_at', 'offset_minutes', 'status',
+                        'locked_at', 'cancelled_at', 'last_error', 'updated_at',
+                    ])
+            else:
+                active.update(status=ReminderStatus.CANCELLED,
+                              cancelled_at=now, locked_at=None)
+                reminder = None
+
+        return {
+            'lead_id':           lead.id,
+            'next_follow_up_at': lead.next_follow_up_at,
+            'reminder': ({
+                'id':             reminder.id,
+                'remind_at':      reminder.remind_at,
+                'offset_minutes': reminder.offset_minutes,
+                'status':         reminder.status,
+            } if reminder else None),
+        }
+
+    # ── bulk_update_lead_status ─────────────────────────────────────────────────
+    if name == 'bulk_update_lead_status':
+        lead_ids = args.get('lead_ids') or []
+        if not lead_ids:
+            raise RuntimeError('lead_ids must not be empty')
+        status_id = args.get('status_id')
+        if status_id is not None and not LeadStatus.objects.filter(
+                id=status_id, tenant_id=TENANT_ID).exists():
+            raise RuntimeError(
+                'Status %s does not exist in this workspace — get valid ids from '
+                'list_lead_statuses.' % status_id)
+        updated = Lead.objects.filter(
+            tenant_id=TENANT_ID, id__in=lead_ids
+        ).update(status_id=status_id)
+        return {
+            'updated_count': updated,
+            'requested':     len(lead_ids),
+            'status_id':     status_id,
+        }
 
     # ── bulk_import_leads ───────────────────────────────────────────────────────
     if name == 'bulk_import_leads':
@@ -440,6 +580,52 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             group_id=args['lead_group_id'],
         )
         return {'lead_id': args['lead_id'], 'group_id': args['lead_group_id'], 'added': True}
+
+    # ── add_leads_to_group ──────────────────────────────────────────────────────
+    if name == 'add_leads_to_group':
+        group = LeadGroup.objects.get(id=args['lead_group_id'], tenant_id=TENANT_ID)
+        lead_ids = args.get('lead_ids') or []
+        if not lead_ids:
+            raise RuntimeError('lead_ids must not be empty')
+        leads = list(Lead.objects.filter(id__in=lead_ids, tenant_id=TENANT_ID))
+        added, already_in = 0, 0
+        for lead in leads:
+            _membership, created = LeadGroupMembership.objects.get_or_create(
+                group=group,
+                lead=lead,
+                defaults={'added_by': OWNER_USER_ID or None},
+            )
+            if created:
+                added += 1
+            else:
+                already_in += 1
+        return {
+            'lead_group_id':    group.id,
+            'group_name':       group.name,
+            'added':            added,
+            'already_in_group': already_in,
+            'not_found':        len(set(lead_ids)) - len(leads),
+        }
+
+    # ── remove_leads_from_group ─────────────────────────────────────────────────
+    if name == 'remove_leads_from_group':
+        group = LeadGroup.objects.get(id=args['lead_group_id'], tenant_id=TENANT_ID)
+        lead_ids = args.get('lead_ids') or []
+        if not lead_ids:
+            raise RuntimeError('lead_ids must not be empty')
+        # Scope to this tenant's leads before deleting any membership rows.
+        tenant_lead_ids = list(
+            Lead.objects.filter(id__in=lead_ids, tenant_id=TENANT_ID)
+            .values_list('id', flat=True)
+        )
+        deleted, _detail = LeadGroupMembership.objects.filter(
+            group=group, lead_id__in=tenant_lead_ids
+        ).delete()
+        return {
+            'lead_group_id': group.id,
+            'group_name':    group.name,
+            'removed':       deleted,
+        }
 
     # -- list_users --
     if name == 'list_users':
@@ -806,6 +992,34 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             templates = [t for t in templates if q in str(t.get('name', '')).lower()]
         return {'results': templates}
 
+    # ── list_whatsapp_templates_detailed ────────────────────────────────────────
+    if name == 'list_whatsapp_templates_detailed':
+        def _template_body(tpl):
+            for comp in (tpl.get('components') or []):
+                if str(comp.get('type') or '').upper() == 'BODY':
+                    return comp.get('text', '')
+            return ''
+
+        raw = _adapter().get_templates()
+        rows = [
+            {
+                'uid':      t.get('_uid') or t.get('uid'),
+                'name':     t.get('template_name') or t.get('name'),
+                'category': t.get('category'),
+                'language': t.get('language'),
+                'status':   t.get('status'),
+                'body':     _template_body(t),
+            }
+            for t in (raw if isinstance(raw, list) else [])
+        ]
+        search   = (args.get('search') or '').strip().lower()
+        category = (args.get('category') or '').strip().upper()
+        if search:
+            rows = [t for t in rows if search in (t['name'] or '').lower()]
+        if category:
+            rows = [t for t in rows if (t['category'] or '').upper() == category]
+        return {'count': len(rows), 'results': rows}
+
     # ── get_lead_enrollments ────────────────────────────────────────────────────
     if name == 'get_lead_enrollments':
         rows = list(
@@ -1014,6 +1228,27 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             'results':       steps,
         }
 
+    # ── list_active_sequences_with_steps ────────────────────────────────────────
+    if name == 'list_active_sequences_with_steps':
+        rows = []
+        for seq in (WhatsAppSequence.objects
+                    .filter(tenant_id=TENANT_ID, is_active=True)
+                    .prefetch_related('steps')
+                    .order_by('name')):
+            steps = list(seq.steps.order_by('step_number').values(
+                'id', 'step_number', 'delay_days', 'template_uid',
+                'template_name', 'template_variable_mapping',
+            ))
+            rows.append({
+                'id':            seq.id,
+                'name':          seq.name,
+                'description':   seq.description,
+                'stop_on_reply': seq.stop_on_reply,
+                'step_count':    len(steps),
+                'steps':         steps,
+            })
+        return {'count': len(rows), 'results': rows}
+
     # ── create_sequence ─────────────────────────────────────────────────────────
     if name == 'create_sequence':
         seq = WhatsAppSequence.objects.create(
@@ -1068,6 +1303,69 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             },
         )
         return {'id': enrollment.id, 'created': created, 'next_step_at': str(enrollment.next_step_at)}
+
+    # ── bulk_enroll_leads_in_sequence ───────────────────────────────────────────
+    if name == 'bulk_enroll_leads_in_sequence':
+        from whatsapp_integration.models import AgentActionTypeEnum
+        lead_ids = args.get('lead_ids') or []
+        if not lead_ids:
+            raise RuntimeError('lead_ids must not be empty')
+        seq = WhatsAppSequence.objects.filter(
+            id=args['sequence_id'], tenant_id=TENANT_ID, is_active=True).first()
+        if seq is None:
+            raise RuntimeError(
+                'Sequence %s not found or is inactive — get valid ids from '
+                'list_sequences.' % args['sequence_id'])
+        first_step   = seq.steps.order_by('step_number').first()
+        next_step_at = timezone.now() + timezone.timedelta(
+            days=first_step.delay_days if first_step else 0)
+
+        enrolled, skipped = [], []
+        for lead_id in lead_ids:
+            lead = Lead.objects.filter(id=lead_id, tenant_id=TENANT_ID).first()
+            if lead is None:
+                skipped.append({'lead_id': lead_id, 'reason': 'not found'})
+                continue
+            enrollment, created = LeadSequenceEnrollment.objects.get_or_create(
+                lead=lead,
+                sequence=seq,
+                defaults={
+                    'tenant_id':    TENANT_ID,
+                    'status':       SequenceEnrollmentStatusEnum.ACTIVE,
+                    'next_step_at': next_step_at,
+                    'enrolled_by':  OWNER_USER_ID or None,
+                },
+            )
+            if not created and enrollment.status == SequenceEnrollmentStatusEnum.ACTIVE:
+                skipped.append({'lead_id': lead_id, 'reason': 'already enrolled'})
+                continue
+            if not created:
+                enrollment.status         = SequenceEnrollmentStatusEnum.ACTIVE
+                enrollment.next_step_at   = next_step_at
+                enrollment.current_step   = None
+                enrollment.completed_at   = None
+                enrollment.stopped_reason = None
+                enrollment.save()
+            enrolled.append(lead_id)
+
+        result = {
+            'sequence_id': seq.id,
+            'sequence':    seq.name,
+            'enrolled':    enrolled,
+            'skipped':     skipped,
+        }
+        try:
+            AgentActionLog.objects.create(
+                tenant_id=TENANT_ID,
+                action_type=AgentActionTypeEnum.ENROLL_SEQUENCE,
+                payload_in={'lead_ids': lead_ids, 'sequence_id': seq.id},
+                payload_out=result,
+                triggered_by='claude-agent',
+                status=AgentActionStatusEnum.SUCCESS,
+            )
+        except Exception as exc:  # noqa: BLE001 — audit write must not fail the action
+            logger.error('Failed to write AgentActionLog for bulk enroll: %s', exc)
+        return result
 
     # ── pause_enrollment ────────────────────────────────────────────────────────
     if name == 'pause_enrollment':
@@ -1138,6 +1436,99 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         )
         return {'id': campaign.id, 'name': campaign.name, 'status': campaign.status}
 
+    # ── create_and_launch_campaign ──────────────────────────────────────────────
+    if name == 'create_and_launch_campaign':
+        from django.utils.dateparse import parse_datetime
+        from whatsapp_integration.models import AgentActionTypeEnum
+        from whatsapp_integration.utils import normalize_msisdn
+
+        campaign_name = str(args.get('name') or '').strip()
+        template_uid  = str(args.get('template_uid') or '').strip()
+        lead_ids      = args.get('lead_ids') or []
+        components    = args.get('template_components') or []
+        if not campaign_name:
+            raise RuntimeError('name is required')
+        if not template_uid:
+            raise RuntimeError(
+                'template_uid is required — get one from list_whatsapp_templates_detailed')
+        if not lead_ids:
+            raise RuntimeError('lead_ids must not be empty')
+
+        leads = list(Lead.objects.filter(id__in=lead_ids, tenant_id=TENANT_ID))
+        if not leads:
+            raise RuntimeError('No leads in this workspace match the given lead_ids')
+        contacts = [
+            {'phone': normalize_msisdn(lead.phone),
+             'name': lead.name or lead.phone,
+             'digicrm_lead_id': lead.id}
+            for lead in leads if lead.phone
+        ]
+        if not contacts:
+            raise RuntimeError('None of the specified leads have a phone number')
+
+        scheduled_at = args.get('scheduled_at')
+        scheduled_dt = parse_datetime(str(scheduled_at)) if scheduled_at else None
+        if scheduled_dt is not None and timezone.is_naive(scheduled_dt):
+            scheduled_dt = timezone.make_aware(
+                scheduled_dt, timezone.get_current_timezone())
+
+        campaign = WhatsAppCampaign.objects.create(
+            tenant_id=TENANT_ID,
+            name=campaign_name,
+            template_uid=template_uid,
+            template_components=components,
+            status=CampaignStatusEnum.DRAFT,
+            scheduled_at=scheduled_dt or timezone.now(),
+            total_contacts=len(contacts),
+            created_by=OWNER_USER_ID or TENANT_ID,
+        )
+        try:
+            result = _adapter().create_campaign(
+                name=campaign_name,
+                contacts=contacts,
+                template_uid=template_uid,
+                template_components=components,
+                scheduled_at=scheduled_at,
+                digicrm_campaign_id=campaign.id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            campaign.status = CampaignStatusEnum.FAILED
+            campaign.save(update_fields=['status', 'updated_at'])
+            raise RuntimeError(
+                'Campaign %s was created but the WhatsApp gateway rejected the '
+                'launch: %s' % (campaign.id, exc))
+
+        campaign.laravel_campaign_uid = result.get('campaign_uid')
+        campaign.laravel_group_uid    = result.get('group_uid')
+        campaign.status               = CampaignStatusEnum.RUNNING
+        campaign.launched_at          = timezone.now()
+        campaign.save(update_fields=[
+            'laravel_campaign_uid', 'laravel_group_uid', 'status',
+            'launched_at', 'updated_at',
+        ])
+
+        payload = {
+            'campaign_id':          campaign.id,
+            'name':                 campaign.name,
+            'status':               campaign.status,
+            'contacts_count':       len(contacts),
+            'scheduled_at':         campaign.scheduled_at,
+            'laravel_campaign_uid': campaign.laravel_campaign_uid,
+        }
+        try:
+            AgentActionLog.objects.create(
+                tenant_id=TENANT_ID,
+                action_type=AgentActionTypeEnum.CREATE_CAMPAIGN,
+                payload_in={'name': campaign_name, 'template_uid': template_uid,
+                            'lead_ids': lead_ids},
+                payload_out=result,
+                triggered_by='claude-agent',
+                status=AgentActionStatusEnum.SUCCESS,
+            )
+        except Exception as exc:  # noqa: BLE001 — audit write must not fail the action
+            logger.error('Failed to write AgentActionLog for campaign launch: %s', exc)
+        return payload
+
     # ── launch_campaign ─────────────────────────────────────────────────────────
     if name == 'launch_campaign':
         campaign = WhatsAppCampaign.objects.get(id=args['campaign_id'], tenant_id=TENANT_ID)
@@ -1182,6 +1573,35 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         if not campaign.laravel_campaign_uid:
             raise RuntimeError('Campaign not launched yet (no laravel_campaign_uid)')
         return _adapter().get_campaign_analytics(campaign.laravel_campaign_uid)
+
+    # ── TELEPHONY ───────────────────────────────────────────────────────────────
+    # Call history is genuine CRM context ("did anyone ring this lead?").
+
+    # ── list_call_logs ──────────────────────────────────────────────────────────
+    if name == 'list_call_logs':
+        from telephony.models import CallLog
+        qs = CallLog.objects.filter(tenant_id=TENANT_ID)
+        if args.get('lead_id'):
+            qs = qs.filter(lead_id=args['lead_id'])
+        if args.get('direction'):
+            qs = qs.filter(direction=args['direction'])
+        if args.get('call_type'):
+            qs = qs.filter(call_type=args['call_type'])
+        if args.get('agent_user_id'):
+            qs = qs.filter(agent_user_id=args['agent_user_id'])
+        if args.get('date_from'):
+            qs = qs.filter(call_time__gte=args['date_from'])
+        if args.get('date_to'):
+            qs = qs.filter(call_time__lte=args['date_to'])
+        page, page_size, offset = _paginate(args)
+        total = qs.count()
+        rows = list(qs.order_by('-call_time').values(
+            'id', 'cmiuid', 'direction', 'call_type', 'from_number', 'to_number',
+            'duration', 'billed_sec', 'call_time', 'lead_id', 'agent_user_id',
+            'caller_name', 'call_outcome', 'call_outcome_note',
+            'call_outcome_set_at', 'is_voicemail', 'hangup_reason',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
 
     raise RuntimeError('Unknown MCP tool: %s' % name)
 

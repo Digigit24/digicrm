@@ -2,11 +2,12 @@
 """
 DigiCRM Sales Agent MCP Server — tool catalog (TOOLS)
 
-Registers 56 tools for a Claude sales agent to interact with DigiCRM:
-  CRM core        (25) — leads, groups, statuses, tasks, activities, meetings
-  WhatsApp        (11) — send, chat, templates, inbox ops, AI context
-  Automation      (15) — sequences, steps, enrollments, campaigns
+Registers 67 tools for a Claude sales agent to interact with DigiCRM:
+  CRM core        (31) — leads, groups, statuses, tasks, activities, meetings
+  WhatsApp        (12) — send, chat, templates, inbox ops, AI context
+  Automation      (18) — sequences, steps, enrollments, campaigns
   Discovery reads (5)  — dashboard, kanban, follow-ups, phone lookup, audit log
+  Telephony       (1)  — call history
 
 The authoritative count is always ``len(TOOLS)``; ``GET /mcp/health`` reports it.
 
@@ -220,10 +221,25 @@ Returns the created lead object with its id.
     'custom_fields': {'type': 'object', 'description': 'Dict of custom field key → value'},
 }, ['name', 'phone'])
 
+_tool('get_lead_field_schema', """
+Get the lead field schema configured for this workspace.
+
+Returns standard_fields and custom_fields, each with field_name, field_label,
+field_type, is_required, is_visible, options (for dropdowns) and display_order.
+Takes no arguments.
+Call this before create_lead(custom_fields=…) or
+bulk_import_leads(custom_fields=…) so you use real field_name keys instead of
+guessing them.
+""", {})
+
 _tool('update_lead', """
 Update an existing lead's fields.
 
 All fields except lead_id are optional — only send what you want to change.
+Every field you send OVERWRITES the stored value. To add to the notes without
+erasing existing content, use append_lead_note instead of update_lead(notes=…).
+To change the pipeline stage use update_lead_status; to change the follow-up
+date use set_lead_follow_up.
 """, {
     'lead_id':       {'type': 'integer', 'description': 'ID of the lead to update'},
     'name':          {'type': 'string'},
@@ -235,6 +251,36 @@ All fields except lead_id are optional — only send what you want to change.
     'assigned_to':   {'type': 'string', 'description': 'UUID of the user to reassign to'},
     'custom_fields': {'type': 'object'},
 }, ['lead_id'])
+
+_tool('append_lead_note', """
+Append a timestamped block to a lead's notes without erasing what is already
+there.
+
+Returns the lead id and the full updated notes body.
+This is the safe, non-destructive alternative to update_lead(notes=…), which
+replaces the whole field. The append is done under a row lock, so concurrent
+appends are not lost.
+Get lead_id from list_leads or lookup_lead_by_phone.
+""", {
+    'lead_id': {'type': 'integer', 'description': 'ID of the lead'},
+    'text':    {'type': 'string',  'description': 'Note text to append. A "— <timestamp>" header is added automatically.'},
+}, ['lead_id', 'text'])
+
+_tool('set_lead_follow_up', """
+Set or clear the next follow-up date on a lead, with an optional reminder.
+
+Returns the lead id, the stored next_follow_up_at and the resulting reminder
+(or null if reminders are disabled).
+The reminder fires reminder_offset_minutes BEFORE follow_up_at and must be in
+the future. Setting reminder_enabled=false cancels any existing reminder but
+keeps the follow-up date.
+Get lead_id from list_leads; read the current schedule with get_lead_follow_up.
+""", {
+    'lead_id':                  {'type': 'integer', 'description': 'ID of the lead'},
+    'follow_up_at':             {'type': 'string',  'description': 'When to follow up, as an ISO 8601 datetime (e.g. 2026-09-01T10:30:00Z)'},
+    'reminder_enabled':         {'type': 'boolean', 'description': 'Create/update a reminder for this follow-up (default true)'},
+    'reminder_offset_minutes':  {'type': 'integer', 'description': 'Minutes before follow_up_at to fire the reminder (default 0)'},
+}, ['lead_id', 'follow_up_at'])
 
 _tool('bulk_import_leads', """
 Import multiple leads from a JSON array.
@@ -267,6 +313,32 @@ lead_group_id: integer ID of the group (get from list_lead_groups if needed)
     'lead_id':       {'type': 'integer'},
     'lead_group_id': {'type': 'integer'},
 }, ['lead_id', 'lead_group_id'])
+
+_tool('add_leads_to_group', """
+Add many leads to a lead group in one call.
+
+Returns { added, already_in_group, not_found }. Leads already in the group are
+skipped, not duplicated.
+Get lead_group_id from list_lead_groups and lead ids from list_leads.
+For a single lead you can also use add_lead_to_group.
+""", {
+    'lead_group_id': {'type': 'integer', 'description': 'ID of the target group. Get it from list_lead_groups.'},
+    'lead_ids':      {'type': 'array', 'items': {'type': 'integer'},
+                      'description': 'IDs of the leads to add'},
+}, ['lead_group_id', 'lead_ids'])
+
+_tool('remove_leads_from_group', """
+Remove many leads from a lead group in one call.
+
+Returns { removed }. Removing a lead from a group does NOT delete the lead —
+only its membership.
+Get lead_group_id from list_lead_groups and the member ids from
+list_group_leads.
+""", {
+    'lead_group_id': {'type': 'integer', 'description': 'ID of the group. Get it from list_lead_groups.'},
+    'lead_ids':      {'type': 'array', 'items': {'type': 'integer'},
+                      'description': 'IDs of the leads to remove from the group'},
+}, ['lead_group_id', 'lead_ids'])
 
 _tool('list_users', """
 List the users (team members) in this workspace.
@@ -523,6 +595,20 @@ Use the CRM UI or ask the user for the status ID if unknown.
 # PHASE 2 — WHATSAPP MESSAGING (10 tools)
 # ---------------------------------------------------------------------------
 
+_tool('bulk_update_lead_status', """
+Move many leads to the same pipeline stage in one call.
+
+Returns { updated_count }. Only leads in this workspace are touched.
+Get status_id from list_lead_statuses and lead ids from list_leads. Pass
+status_id = null to clear the stage.
+For a single lead use update_lead_status.
+""", {
+    'lead_ids':  {'type': 'array', 'items': {'type': 'integer'},
+                  'description': 'IDs of the leads to move'},
+    'status_id': {'type': ['integer', 'null'],
+                  'description': 'Target pipeline stage id from list_lead_statuses, or null to clear the stage'},
+}, ['lead_ids', 'status_id'])
+
 _tool('send_whatsapp_template', """
 Send a WhatsApp template message to a lead.
 
@@ -563,6 +649,21 @@ Use template_uid when calling send_whatsapp_template.
 """, {
     'search': {'type': 'string', 'description': 'Optional search term to filter templates'},
 }, [])
+
+_tool('list_whatsapp_templates_detailed', """
+List approved WhatsApp templates with their body text.
+
+Returns uid, name, category, language, status and body for each template.
+The body shows the {{1}}, {{2}} … placeholders, so use this (not
+get_whatsapp_templates) when you need to know how many template_components
+values a send requires.
+Use a template's uid as template_uid for send_whatsapp_template,
+add_sequence_step, create_campaign and create_and_launch_campaign.
+""", {
+    'search':   {'type': 'string', 'description': 'Filter by template name (partial, case-insensitive)'},
+    'category': {'type': 'string', 'enum': ['MARKETING', 'UTILITY', 'AUTHENTICATION'],
+                 'description': 'Only templates in this WhatsApp category'},
+})
 
 _tool('get_lead_enrollments', """
 List sequence enrollments for a lead.
@@ -679,6 +780,17 @@ update_sequence_step / delete_sequence_step.
     'sequence_id': {'type': 'integer', 'description': 'ID of the sequence. Get it from list_sequences.'},
 }, ['sequence_id'])
 
+_tool('list_active_sequences_with_steps', """
+List every ACTIVE WhatsApp sequence together with its full ordered step list.
+
+Returns id, name, description, step_count and steps (step_number, delay_days,
+template_uid, template_name, template_variable_mapping) for each sequence.
+Takes no arguments.
+Use this to pick a sequence for enroll_lead_in_sequence /
+bulk_enroll_leads_in_sequence without a second call to get_sequence_steps.
+Use list_sequences when you also need inactive sequences or pagination.
+""", {})
+
 _tool('create_sequence', """
 Create a new WhatsApp follow-up sequence.
 
@@ -733,6 +845,20 @@ The sequence will automatically send the step messages at the configured interva
     'lead_id':     {'type': 'integer'},
     'sequence_id': {'type': 'integer'},
 }, ['lead_id', 'sequence_id'])
+
+_tool('bulk_enroll_leads_in_sequence', """
+Enroll many leads into one WhatsApp follow-up sequence in a single call.
+
+Returns { sequence, enrolled[], skipped[] } — skipped explains why each lead
+was left out (not found, or already actively enrolled).
+The sequence must be active. Get sequence_id from list_sequences or
+list_active_sequences_with_steps, and lead ids from list_leads.
+This action is written to the agent audit log (see list_agent_action_logs).
+""", {
+    'lead_ids':    {'type': 'array', 'items': {'type': 'integer'},
+                    'description': 'IDs of the leads to enroll'},
+    'sequence_id': {'type': 'integer', 'description': 'ID of the active sequence. Get it from list_sequences.'},
+}, ['lead_ids', 'sequence_id'])
 
 _tool('pause_enrollment', """
 Pause an active sequence enrollment.
@@ -805,6 +931,27 @@ Returns the campaign object in DRAFT status. Call launch_campaign to send.
     'notes':               {'type': 'string'},
 }, ['name', 'lead_group_id', 'template_uid'])
 
+_tool('create_and_launch_campaign', """
+Create a WhatsApp broadcast campaign from an explicit list of leads and launch
+it immediately — no pre-created campaign or lead group needed.
+
+Returns campaign_id, status, contacts_count and laravel_campaign_uid.
+This SENDS MESSAGES to every lead with a phone number. It cannot be undone.
+Get template_uid from list_whatsapp_templates_detailed (check its body for
+{{n}} placeholders and supply matching template_components), and lead ids from
+list_leads or list_group_leads.
+Use create_campaign + launch_campaign instead when the audience is a saved lead
+group.
+""", {
+    'name':                {'type': 'string',  'description': 'Campaign display name'},
+    'lead_ids':            {'type': 'array', 'items': {'type': 'integer'},
+                            'description': 'IDs of the leads to message'},
+    'template_uid':        {'type': 'string',  'description': 'Template uid from list_whatsapp_templates_detailed'},
+    'template_components': {'type': 'array', 'items': {'type': 'object'},
+                            'description': 'WhatsApp template component values, e.g. [{"type":"BODY","parameters":[{"type":"text","text":"Ravi"}]}]. Required when the template body has {{n}} placeholders.'},
+    'scheduled_at':        {'type': 'string',  'description': 'ISO 8601 datetime to send at. Omit to send now.'},
+}, ['name', 'lead_ids', 'template_uid'])
+
 _tool('launch_campaign', """
 Launch a DRAFT campaign — submits it to the WhatsApp adapter and sets status to RUNNING.
 
@@ -820,6 +967,31 @@ Returns: total, sent, delivered, read, failed, pending counts.
 """, {
     'campaign_id': {'type': 'integer'},
 }, ['campaign_id'])
+
+
+# ---------------------------------------------------------------------------
+# TELEPHONY
+# ---------------------------------------------------------------------------
+
+_tool('list_call_logs', """
+List call history (TeleCMI CDR records) for this workspace.
+
+Returns a paginated list with id, direction, call_type, from_number, to_number,
+duration, call_time, lead_id, agent_user_id, call_outcome and
+call_outcome_note, newest first.
+Use it to answer "has anyone rung this lead?" before calling or messaging them.
+Get lead_id from list_leads or lookup_lead_by_phone, and agent_user_id from
+list_users. Use set_call_outcome to record a disposition on a call.
+""", {
+    'lead_id':       {'type': 'integer', 'description': 'Only calls linked to this lead'},
+    'direction':     {'type': 'string',  'enum': ['inbound', 'outbound'], 'description': 'Only calls in this direction'},
+    'call_type':     {'type': 'string',  'enum': ['answered', 'missed'], 'description': 'Only answered or only missed calls'},
+    'agent_user_id': {'type': 'string',  'description': 'User UUID who handled the call. Resolve names via list_users.'},
+    'date_from':     {'type': 'string',  'description': 'Only calls at/after this ISO 8601 datetime'},
+    'date_to':       {'type': 'string',  'description': 'Only calls at/before this ISO 8601 datetime'},
+    'page':          {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size':     {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
 
 
 # ===========================================================================
