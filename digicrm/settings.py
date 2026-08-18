@@ -41,6 +41,7 @@ INSTALLED_APPS = [
     'payments',
     'tasks',
     'notifications',
+    'scheduling',            # Calendar / scheduling (URL prefix /api/calendar/)
     'integrations',
     'telephony',
     'whatsapp_integration',   # DigiCRM WhatsApp adapter app

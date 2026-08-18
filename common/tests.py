@@ -53,13 +53,41 @@ def _make_jwt(tenant_id, user_id, permissions=None, is_super_admin=False, roles=
 
 
 class FakeQuerySet:
-    """Minimal queryset stand-in for TenantViewSetMixin tests."""
+    """Minimal queryset stand-in for TenantViewSetMixin tests.
+
+    Supports the two call shapes ``get_queryset_for_permission`` uses: keyword
+    lookups and a single OR-ed ``Q`` object (team scope).
+    """
 
     def __init__(self, data):
         self._data = data
 
-    def filter(self, **kwargs):
-        return FakeQuerySet([d for d in self._data if all(d.get(k) == v for k, v in kwargs.items())])
+    @staticmethod
+    def _matches_q(row, q):
+        results = []
+        for child in q.children:
+            if isinstance(child, Q):
+                results.append(FakeQuerySet._matches_q(row, child))
+            else:
+                key, value = child
+                results.append(str(row.get(key)) == str(value))
+        if not results:
+            return True
+        matched = any(results) if q.connector == Q.OR else all(results)
+        return not matched if q.negated else matched
+
+    def filter(self, *args, **kwargs):
+        data = self._data
+        for q in args:
+            data = [d for d in data if self._matches_q(d, q)]
+        data = [
+            d for d in data
+            if all(str(d.get(k)) == str(v) for k, v in kwargs.items())
+        ]
+        return FakeQuerySet(data)
+
+    def distinct(self):
+        return self
 
     def none(self):
         return FakeQuerySet([])

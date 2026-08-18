@@ -10,8 +10,13 @@ class ReminderStatus(models.TextChoices):
     MISSED = 'MISSED', 'Missed'
 
 
+class ReminderSubjectType(models.TextChoices):
+    LEAD_FOLLOW_UP = 'LEAD_FOLLOW_UP', 'Lead follow-up'
+    MEETING = 'MEETING', 'Meeting'
+
+
 class Reminder(models.Model):
-    """A durable, tenant-scoped reminder for a lead follow-up."""
+    """A durable, tenant-scoped reminder for a lead follow-up or a meeting occurrence."""
 
     id = models.BigAutoField(primary_key=True)
     tenant_id = models.UUIDField(db_index=True)
@@ -19,7 +24,29 @@ class Reminder(models.Model):
         'crm.Lead',
         on_delete=models.CASCADE,
         related_name='reminders',
+        null=True,
+        blank=True,
     )
+    meeting = models.ForeignKey(
+        'meetings.Meeting',
+        on_delete=models.CASCADE,
+        related_name='delivery_reminders',
+        null=True,
+        blank=True,
+    )
+    occurrence_start_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='UTC start of the specific meeting occurrence this reminder belongs to. '
+                  'Null for lead follow-ups.',
+    )
+    subject_type = models.CharField(
+        max_length=32,
+        default=ReminderSubjectType.LEAD_FOLLOW_UP,
+        db_index=True,
+    )
+    method = models.CharField(max_length=12, default='IN_APP')
     recipient_user_id = models.UUIDField(db_index=True)
     created_by_user_id = models.UUIDField(db_index=True)
     follow_up_at = models.DateTimeField()
@@ -52,10 +79,26 @@ class Reminder(models.Model):
             ),
         ]
         constraints = [
+            # ``lead__isnull=False`` added so a meeting-only reminder (lead is NULL) is not
+            # collapsed into a single row per (tenant, NULL, recipient) and so a lead can
+            # carry several meeting reminders without tripping the follow-up constraint.
             models.UniqueConstraint(
                 fields=['tenant_id', 'lead', 'recipient_user_id'],
-                condition=Q(status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING]),
+                condition=Q(
+                    lead__isnull=False,
+                    meeting__isnull=True,
+                    status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+                ),
                 name='uniq_active_lead_reminder',
+            ),
+            models.UniqueConstraint(
+                fields=['tenant_id', 'meeting', 'occurrence_start_at',
+                        'recipient_user_id', 'offset_minutes'],
+                condition=Q(
+                    meeting__isnull=False,
+                    status__in=[ReminderStatus.PENDING, ReminderStatus.PROCESSING],
+                ),
+                name='uniq_active_meeting_reminder',
             ),
         ]
 
