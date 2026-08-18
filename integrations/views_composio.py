@@ -490,7 +490,20 @@ class ComposioConnectionViewSet(_ComposioViewMixin, viewsets.ModelViewSet):
         # may close the tab before Composio redirects.
         try:
             from integrations.tasks import poll_composio_connection
-            poll_composio_connection.apply_async(args=[connection.id], countdown=5)
+            # This dispatch must never stall the HTTP request. With the
+            # defaults, a dead Redis makes apply_async spend ~100s inside the
+            # result backend's reconnect loop and another ~30s retrying the
+            # publish. ignore_result skips the result backend entirely (nobody
+            # reads this task's return value) and the retry policy caps the
+            # publish attempt. The poll is only a safety net anyway - the
+            # hosted-auth callback resolves the status on the happy path.
+            poll_composio_connection.apply_async(
+                args=[connection.id],
+                countdown=5,
+                ignore_result=True,
+                retry=False,
+                retry_policy={'max_retries': 0, 'interval_start': 0, 'timeout': 2},
+            )
         except Exception as exc:  # noqa: BLE001 - a missing broker must not fail the request
             logger.warning('Could not schedule poll_composio_connection: %s', exc)
 
