@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DigiCRM MCP HTTP Test Suite — all 31 tools
+DigiCRM MCP HTTP Test Suite — all 78 tools
 Usage:
     python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse --secret 'letmegoin@0008'
     python mcp/test_http.py --tool list_leads
@@ -109,7 +109,7 @@ def run_all(args):
     results = {'passed': 0, 'failed': 0, 'skipped': 0}
     sample  = {}
 
-    print('\n%s%sDigiCRM MCP HTTP Test Suite — 31 tools%s' % (BOLD, CYAN, RESET))
+    print('\n%s%sDigiCRM MCP HTTP Test Suite — 78 tools%s' % (BOLD, CYAN, RESET))
     print('%sURL   : %s%s' % (CYAN, args.url, RESET))
     print('%sAuth  : %s%s' % (CYAN, ('Bearer ***' if args.secret else 'none'), RESET))
     print('%sDry   : %s%s\n' % (CYAN, dry_run, RESET))
@@ -181,8 +181,9 @@ def run_all(args):
 
     r = run('list_leads', {'page': 1, 'page_size': 3})
     if r and r.get('results'):
-        sample['lead_id']   = r['results'][0]['id']
-        sample['lead_name'] = r['results'][0].get('name', '')
+        sample['lead_id']    = r['results'][0]['id']
+        sample['lead_name']  = r['results'][0].get('name', '')
+        sample['lead_phone'] = r['results'][0].get('phone', '')
         print('        i sample lead id=%s  name=%s' % (sample['lead_id'], sample['lead_name']))
 
     if sample.get('lead_id'):
@@ -209,6 +210,7 @@ def run_all(args):
         r = run('list_lead_statuses', {})
         if r and r.get('results') and target:
             status_id = r['results'][0]['id']
+            sample['status_id'] = status_id
             run('update_lead_status', {'lead_id': target, 'status_id': status_id}, write=True)
 
     if target:
@@ -231,6 +233,81 @@ def run_all(args):
             'lead_id': sample['lead_id'],
             'lead_group_id': sample.get('lead_group_id', 1),
         }, write=True)
+
+    # ── Batch 1: Discovery reads (P0) ────────────────────────────────────────────
+    print('\n%s── Batch 1: Discovery reads (P0)%s' % (BOLD, RESET))
+
+    ctx = run('get_ai_context', {})
+    if ctx and ctx.get('lead_groups'):
+        sample.setdefault('lead_group_id', ctx['lead_groups'][0]['id'])
+
+    run('get_sales_dashboard', {})
+    run('get_lead_kanban', {'limit_per_status': 3})
+    run('get_lead_field_schema', {})
+    run('list_agent_action_logs', {'limit': 5})
+
+    if sample.get('lead_group_id'):
+        run('list_group_leads', {'lead_group_id': sample['lead_group_id'], 'page_size': 5})
+    else:
+        print('  %sSKIP%s  list_group_leads (no lead_group_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    if sample.get('lead_phone'):
+        run('lookup_lead_by_phone', {'phone': sample['lead_phone']},
+            label='phone=%s' % sample['lead_phone'])
+    else:
+        print('  %sSKIP%s  lookup_lead_by_phone (no lead phone)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # list_leads advanced filters (search_leads_advanced lives on list_leads)
+    run('list_leads', {'priority': 'HIGH', 'page_size': 3}, label='priority=HIGH')
+    run('list_leads', {'ordering': '-lead_score', 'lead_score_min': 0, 'page_size': 3},
+        label='ordering=-lead_score')
+    if sample.get('lead_group_id'):
+        run('list_leads', {'lead_group_id': sample['lead_group_id'], 'page_size': 3},
+            label='lead_group_id filter')
+
+    if sample.get('lead_id'):
+        run('get_lead_follow_up', {'lead_id': sample['lead_id']})
+        run('list_lead_activities', {'lead_id': sample['lead_id'], 'page_size': 5})
+    else:
+        print('  %sSKIP%s  get_lead_follow_up / list_lead_activities (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    tl = run('list_tasks', {'page_size': 5})
+    if tl and tl.get('results'):
+        sample['existing_task_id'] = tl['results'][0]['id']
+    run('list_tasks', {'overdue': True, 'page_size': 5}, label='overdue=true')
+    if sample.get('existing_task_id'):
+        run('get_task', {'task_id': sample['existing_task_id']})
+    else:
+        print('  %sSKIP%s  get_task (no task in tenant yet)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    run('list_meetings', {'page_size': 5})
+    run('get_meetings_calendar', {})
+
+    sq = run('list_sequences', {'page_size': 5})
+    if sq and sq.get('results'):
+        sample['existing_seq_id'] = sq['results'][0]['id']
+    if sample.get('existing_seq_id'):
+        run('get_sequence_steps', {'sequence_id': sample['existing_seq_id']})
+    else:
+        print('  %sSKIP%s  get_sequence_steps (no sequence in tenant yet)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    cl = run('list_campaigns', {'page_size': 5})
+    if cl and cl.get('results'):
+        for row in cl['results']:
+            if row.get('laravel_campaign_uid'):
+                sample['launched_campaign_id'] = row['id']
+                break
+    if sample.get('launched_campaign_id'):
+        run('get_campaign_replies',
+            {'campaign_id': sample['launched_campaign_id'], 'per_page': 5})
+    else:
+        print('  %sSKIP%s  get_campaign_replies (no launched campaign)' % (YELLOW, RESET))
+        results['skipped'] += 1
 
     # ── Phase 1: Tasks & Meetings ────────────────────────────────────────────────
     print('\n%s── Phase 1: Tasks & Meetings%s' % (BOLD, RESET))
@@ -392,6 +469,161 @@ def run_all(args):
     if sample.get('campaign_id'):
         run('launch_campaign', {'campaign_id': sample['campaign_id']}, write=True)
         run('get_campaign_analytics', {'campaign_id': sample['campaign_id']})
+
+    # ── Batch 2: P1 writes & core reads ──────────────────────────────────────────
+    print('\n%s── Batch 2: P1 writes & core reads (11 tools)%s' % (BOLD, RESET))
+
+    run('list_whatsapp_templates_detailed', {})
+    run('list_active_sequences_with_steps', {})
+    run('list_call_logs', {'page_size': 5})
+
+    if target:
+        run('append_lead_note', {'lead_id': target, 'text': 'MCP test append'}, write=True)
+        run('set_lead_follow_up', {
+            'lead_id':                 target,
+            'follow_up_at':            (now + timedelta(days=2)).isoformat(),
+            'reminder_enabled':        True,
+            'reminder_offset_minutes': 30,
+        }, write=True)
+    else:
+        print('  %sSKIP%s  append_lead_note / set_lead_follow_up (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    if target and sample.get('status_id'):
+        run('bulk_update_lead_status',
+            {'lead_ids': [target], 'status_id': sample['status_id']}, write=True)
+    else:
+        print('  %sSKIP%s  bulk_update_lead_status (no lead_id or status_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    if target and sample.get('lead_group_id'):
+        run('add_leads_to_group',
+            {'lead_group_id': sample['lead_group_id'], 'lead_ids': [target]}, write=True)
+        run('remove_leads_from_group',
+            {'lead_group_id': sample['lead_group_id'], 'lead_ids': [target]}, write=True)
+    else:
+        print('  %sSKIP%s  add/remove_leads_to_group (no lead_id or lead_group_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    if target and sample.get('seq_id'):
+        run('bulk_enroll_leads_in_sequence',
+            {'lead_ids': [target], 'sequence_id': sample['seq_id']}, write=True)
+    else:
+        print('  %sSKIP%s  bulk_enroll_leads_in_sequence (no lead_id or seq_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # NOTE: this actually broadcasts WhatsApp messages, like launch_campaign above.
+    if target and sample.get('template_uid'):
+        camp_args = {
+            'name':         '_MCP_TEST_AI_CAMP_' + datetime.now().strftime('%H%M%S%f'),
+            'lead_ids':     [target],
+            'template_uid': sample['template_uid'],
+        }
+        comps = _template_components(sample.get('template_var_count', 0))
+        if comps:
+            camp_args['template_components'] = comps
+        run('create_and_launch_campaign', camp_args, write=True)
+    else:
+        print('  %sSKIP%s  create_and_launch_campaign (no lead_id or template UID)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # ── Batch 3a: Payments ───────────────────────────────────────────────────────
+    print('\n%s── Batch 3a: Payments (3 tools)%s' % (BOLD, RESET))
+
+    run('list_payments', {'page_size': 5})
+    if target:
+        pay = run('create_payment', {
+            'lead_id':      target,
+            'amount':       1,
+            'type':         'ADVANCE',
+            'status':       'PENDING',
+            'currency':     'INR',
+            'method':       'mcp_test',
+            'reference_no': '_MCP_TEST',
+            'notes':        'created by mcp/test_http.py',
+        }, write=True)
+        if pay and pay.get('id'):
+            run('update_payment',
+                {'payment_id': pay['id'], 'status': 'CANCELLED',
+                 'notes': 'voided by mcp/test_http.py'}, write=True)
+        else:
+            print('  %sSKIP%s  update_payment (create_payment did not return an id)' % (YELLOW, RESET))
+            results['skipped'] += 1
+    else:
+        print('  %sSKIP%s  create_payment / update_payment (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    # ── Batch 3b: Real estate ────────────────────────────────────────────────────
+    print('\n%s── Batch 3b: Real estate (6 tools)%s' % (BOLD, RESET))
+
+    proj = run('list_projects', {'page_size': 5})
+    if proj and proj.get('results'):
+        sample['project_id'] = proj['results'][0]['id']
+        print('        i sample project id=%s  name=%s' % (
+            sample['project_id'], proj['results'][0].get('name', '')))
+
+    if sample.get('project_id'):
+        run('get_project_summary', {'project_id': sample['project_id']})
+    else:
+        print('  %sSKIP%s  get_project_summary (no project in tenant)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    unit_args = {'page_size': 5}
+    if sample.get('project_id'):
+        unit_args['project_id'] = sample['project_id']
+    units = run('list_units', unit_args)
+    if units and units.get('results'):
+        sample['unit_id']     = units['results'][0]['id']
+        sample['unit_status'] = units['results'][0].get('status')
+
+    if target and sample.get('project_id'):
+        run('create_project_interest', {
+            'lead_id':    target,
+            'project_id': sample['project_id'],
+            'notes':      'created by mcp/test_http.py',
+        }, write=True)
+    else:
+        print('  %sSKIP%s  create_project_interest (no lead_id or project_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    if target and sample.get('unit_id'):
+        run('create_unit_lead', {
+            'lead_id':       target,
+            'unit_id':       sample['unit_id'],
+            'relation_type': 'interested',
+            'notes':         'created by mcp/test_http.py',
+        }, write=True)
+        # Re-assert the unit's CURRENT status so the test never changes real
+        # inventory availability.
+        if sample.get('unit_status'):
+            run('update_unit_status',
+                {'unit_id': sample['unit_id'], 'status': sample['unit_status']},
+                write=True, label='re-asserts existing status (no-op)')
+        else:
+            print('  %sSKIP%s  update_unit_status (unknown current status)' % (YELLOW, RESET))
+            results['skipped'] += 1
+    else:
+        print('  %sSKIP%s  create_unit_lead / update_unit_status (no lead_id or unit_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    # ── Batch 3d: Telephony ──────────────────────────────────────────────────────
+    print('\n%s── Batch 3d: Telephony (2 tools)%s' % (BOLD, RESET))
+
+    run('get_telephony_analytics', {'days': 7})
+
+    calls = run('list_call_logs', {'page_size': 20}, label='looking for an undisposed call')
+    undisposed = None
+    if calls and calls.get('results'):
+        undisposed = next((c for c in calls['results'] if not c.get('call_outcome')), None)
+    if undisposed:
+        run('set_call_outcome', {
+            'call_id': undisposed['id'],
+            'outcome': 'follow_up',
+            'note':    '_MCP_TEST',
+        }, write=True)
+    else:
+        print('  %sSKIP%s  set_call_outcome (no call without an existing outcome)' % (YELLOW, RESET))
+        results['skipped'] += 1
 
     # ── Summary ───────────────────────────────────────────────────────────────────
     total = results['passed'] + results['failed'] + results['skipped']
