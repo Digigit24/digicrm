@@ -147,8 +147,20 @@ class LeadActivityObjectPermissionTest(APITestCase):
             by_user_id=USER_B,
         )
 
+    # LeadActivityViewSet is gated on ``crm.activities.*`` (its
+    # ``permission_resource``), not on ``crm.leads.*``. The module-level
+    # default token only grants ``crm.leads``, so these tests must ask for the
+    # activities scope explicitly or every request 403s before scope is
+    # even considered.
+    ACTIVITY_PERMS = {
+        'crm': {
+            'leads': {'view': 'own'},
+            'activities': {'view': 'own', 'create': True, 'edit': True, 'delete': True},
+        }
+    }
+
     def _auth_client(self, user_id, permissions=None):
-        token = _make_token(user_id, permissions=permissions)
+        token = _make_token(user_id, permissions=permissions or self.ACTIVITY_PERMS)
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
 
     def test_own_scope_can_retrieve_activity_on_owned_lead(self):
@@ -157,6 +169,20 @@ class LeadActivityObjectPermissionTest(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    # KNOWN FAILING -- this asserts a product decision that has not been made.
+    #
+    # With the activities scope granted, ``get_queryset`` filters the unowned
+    # activity out, so DRF returns 404, not 403. Returning 404 is the
+    # information-disclosure-safe answer: it does not confirm the row exists.
+    # Getting 403 instead requires dropping the queryset scope filter on
+    # ``retrieve`` and relying on ``check_object_permission``.
+    #
+    # Do NOT make that change until ``common.permissions.get_object_owner_id``
+    # is de-duplicated: it is defined twice (registry-backed, then a loose
+    # duck-typed version that silently shadows it), so the object-level check
+    # currently resolves ownership through the weaker resolver. Removing the
+    # queryset guard while that shadowing stands would widen access, not
+    # narrow it.
     def test_own_scope_cannot_retrieve_activity_on_unowned_lead(self):
         self._auth_client(USER_A)
         url = reverse('lead-activity-detail', kwargs={'pk': self.activity_on_b.id})
