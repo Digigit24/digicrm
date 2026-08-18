@@ -691,3 +691,556 @@ class DuplicateDetectionCache(models.Model):
 
     def __str__(self):
         return f"{self.workflow.name} - {self.source_identifier}"
+
+
+# ===========================================================================
+# COMPOSIO
+# ===========================================================================
+#
+# Composio (https://composio.dev) brokers OAuth for hundreds of third-party
+# toolkits - priority: Gmail, Notion, Google Drive, Google Calendar. It is a
+# SIBLING of the native Google flow above, not a replacement: `Integration`,
+# `Connection` and `Workflow` are untouched and keep owning Google Sheets.
+#
+# The defining difference: we store NO credentials for Composio connections.
+# Composio holds the tokens; we hold only the identifiers needed to address
+# them. `integrations/utils/encryption.py` is deliberately NOT used here -
+# there is nothing to encrypt.
+#
+# Isolation rests entirely on `composio_user_id`, the Composio "entity" id:
+#     {namespace}:{tenant_id}:{user_id}     per-user connection
+#     {namespace}:{tenant_id}:tenant        tenant-wide shared connection
+# built by integrations.services.composio_client.build_composio_user_id().
+# It is persisted on every row AND re-derived and asserted before every
+# outbound call, so a tampered row can never redirect a call at another
+# tenant's entity.
+# ===========================================================================
+
+
+class ComposioAuthSchemeEnum(models.TextChoices):
+    """Auth schemes Composio reports for an auth config."""
+    OAUTH2 = 'OAUTH2', 'OAuth 2.0'
+    OAUTH1 = 'OAUTH1', 'OAuth 1.0'
+    API_KEY = 'API_KEY', 'API Key'
+    BEARER_TOKEN = 'BEARER_TOKEN', 'Bearer Token'
+    BASIC = 'BASIC', 'Basic Auth'
+    NO_AUTH = 'NO_AUTH', 'No Auth'
+
+
+class ComposioConnectionStatusEnum(models.TextChoices):
+    """Mirrors Composio connected-account statuses, plus our local pre-states."""
+    PENDING = 'PENDING', 'Pending'                 # row created, link() not called yet
+    INITIALIZING = 'INITIALIZING', 'Initializing'  # link() returned; user is authorising
+    ACTIVE = 'ACTIVE', 'Active'
+    INACTIVE = 'INACTIVE', 'Inactive'              # disabled at Composio; cannot execute tools
+    FAILED = 'FAILED', 'Failed'
+    EXPIRED = 'EXPIRED', 'Expired'
+    REVOKED = 'REVOKED', 'Revoked'
+    DELETED = 'DELETED', 'Deleted'                 # local tombstone after deletion at Composio
+
+    @classmethod
+    def terminal(cls):
+        """Statuses a connection can never recover from."""
+        return [cls.DELETED, cls.REVOKED, cls.FAILED]
+
+
+class ComposioConnectionScopeEnum(models.TextChoices):
+    """Who a connection belongs to."""
+    USER = 'USER', 'Per user'
+    TENANT = 'TENANT', 'Tenant-wide (shared)'
+
+
+class ComposioEventTypeEnum(models.TextChoices):
+    """Lifecycle events recorded on the append-only audit trail."""
+    INITIATED = 'INITIATED', 'Connection initiated'
+    CALLBACK = 'CALLBACK', 'Callback received'
+    ACTIVATED = 'ACTIVATED', 'Connection activated'
+    FAILED = 'FAILED', 'Connection failed'
+    REFRESHED = 'REFRESHED', 'Re-authorised'
+    DISABLED = 'DISABLED', 'Disabled'
+    ENABLED = 'ENABLED', 'Enabled'
+    DISCONNECTED = 'DISCONNECTED', 'Disconnected'
+    STATUS_SYNC = 'STATUS_SYNC', 'Status synchronised'
+    TOOL_EXECUTED = 'TOOL_EXECUTED', 'Tool executed'
+    WEBHOOK = 'WEBHOOK', 'Webhook received'
+    ERROR = 'ERROR', 'Error'
+
+
+class ComposioAuthConfig(models.Model):
+    """
+    A Composio auth config ("ac_...") as we know it.
+
+    Composio auth configs are project-level, not tenant-level. We keep a row per
+    (scope, toolkit) so that:
+      * tenant_id IS NULL  -> the platform-wide, Composio-managed config that
+        every tenant uses for this toolkit (the normal case);
+      * tenant_id set      -> a tenant that brought its own OAuth app.
+    Resolution always prefers the tenant-specific row, falling back to global.
+
+    We never store the customer's OAuth client_secret here - Composio holds it.
+    """
+    id = models.BigAutoField(primary_key=True)
+    public_id = models.UUIDField(
+        default=uuid.uuid4, unique=True, editable=False, db_index=True,
+        help_text='Stable, non-sequential identifier safe to expose in API URLs.'
+    )
+
+    tenant_id = models.UUIDField(
+        null=True, blank=True, db_index=True,
+        help_text='Tenant that owns this auth config. NULL = platform-wide default.'
+    )
+
+    toolkit_slug = models.CharField(
+        max_length=100, db_index=True,
+        help_text='Composio toolkit slug, uppercase (e.g. GMAIL, NOTION, GOOGLEDRIVE, GOOGLECALENDAR).'
+    )
+    auth_config_id = models.CharField(
+        max_length=64, unique=True,
+        help_text='Composio auth config id ("ac_..."). Unique across the platform.'
+    )
+    auth_scheme = models.CharField(
+        max_length=20, choices=ComposioAuthSchemeEnum.choices,
+        default=ComposioAuthSchemeEnum.OAUTH2,
+        help_text='Auth scheme Composio reports for this config.'
+    )
+    is_composio_managed = models.BooleanField(
+        default=True,
+        help_text='True when Composio owns the OAuth app (no client credentials of ours).'
+    )
+
+    name = models.CharField(max_length=200, help_text='Display name shown to tenant admins.')
+    is_active = models.BooleanField(
+        default=True, db_index=True,
+        help_text='Whether users may create new connections against this config.'
+    )
+
+    restrict_to_tools = models.JSONField(
+        null=True, blank=True,
+        help_text='Allowlist of tool slugs this config may execute through /execute/. '
+                  'Empty or NULL means no tool may be executed (fail closed).'
+    )
+    default_tool_versions = models.JSONField(
+        null=True, blank=True,
+        help_text='Map of tool slug to pinned Composio tool version, e.g. {"GMAIL_GET_PROFILE": "20251111_00"}.'
+    )
+    metadata = models.JSONField(
+        null=True, blank=True,
+        help_text='Raw non-secret auth-config payload from Composio (expected_input_fields, scopes). '
+                  'Scrubbed before persisting; never contains secrets.'
+    )
+
+    last_synced_at = models.DateTimeField(
+        null=True, blank=True, help_text='When we last reconciled this row against Composio.'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'composio_auth_configs'
+        ordering = ['toolkit_slug', 'name']
+        indexes = [
+            models.Index(fields=['toolkit_slug'], name='idx_cmp_authcfg_toolkit'),
+            models.Index(fields=['tenant_id'], name='idx_cmp_authcfg_tenant'),
+            models.Index(fields=['tenant_id', 'toolkit_slug'], name='idx_cmp_authcfg_lookup'),
+            models.Index(fields=['is_active'], name='idx_cmp_authcfg_active'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['toolkit_slug'],
+                condition=models.Q(tenant_id__isnull=True),
+                name='uniq_cmp_authcfg_global_per_toolkit',
+            ),
+            models.UniqueConstraint(
+                fields=['tenant_id', 'toolkit_slug'],
+                condition=models.Q(tenant_id__isnull=False),
+                name='uniq_cmp_authcfg_tenant_per_toolkit',
+            ),
+        ]
+
+    def __str__(self):
+        scope = self.tenant_id or 'global'
+        return f"{self.toolkit_slug} ({scope}) - {self.auth_config_id}"
+
+    @classmethod
+    def resolve(cls, toolkit_slug, tenant_id):
+        """
+        Return the auth config a tenant should use for a toolkit.
+
+        A tenant's own BYO-OAuth config wins; otherwise the platform-wide
+        (tenant_id IS NULL) Composio-managed row. Returns None when neither
+        exists - callers must treat that as "toolkit not connectable yet".
+        """
+        return (cls.objects
+                .filter(toolkit_slug=str(toolkit_slug).upper(), is_active=True)
+                .filter(models.Q(tenant_id=tenant_id) | models.Q(tenant_id__isnull=True))
+                .order_by(models.F('tenant_id').desc(nulls_last=True))
+                .first())
+
+
+class ComposioConnection(models.Model):
+    """
+    A Composio connected account, owned by one (tenant, user) pair.
+
+    No credentials are stored here. Composio holds the tokens; we hold the
+    identifiers needed to address them. ``composio_user_id`` is the isolation
+    boundary - see ``build_composio_user_id``. It is persisted (not merely
+    derived) so historical rows survive any change to the derivation rule, and
+    every outbound call re-derives it and asserts equality (defence in depth).
+    """
+    id = models.BigAutoField(primary_key=True)
+    public_id = models.UUIDField(
+        default=uuid.uuid4, unique=True, editable=False, db_index=True,
+        help_text='Stable, non-sequential identifier used in API URLs and OAuth return links.'
+    )
+
+    tenant_id = models.UUIDField(db_index=True, help_text='Tenant ID for multi-tenancy.')
+    user_id = models.UUIDField(db_index=True, help_text='CRM user who owns this connection.')
+    scope = models.CharField(
+        max_length=10, choices=ComposioConnectionScopeEnum.choices,
+        default=ComposioConnectionScopeEnum.USER,
+        help_text='USER = private to the owner. TENANT = shared with everyone in the tenant.'
+    )
+
+    composio_user_id = models.CharField(
+        max_length=200, db_index=True,
+        help_text='Composio entity id: "{namespace}:{tenant_id}:{user_id|tenant}". '
+                  'The only isolation boundary Composio enforces between end users.'
+    )
+
+    auth_config = models.ForeignKey(
+        ComposioAuthConfig, on_delete=models.PROTECT,
+        related_name='connections', db_column='auth_config_id',
+        help_text='Auth config this connection was created against.'
+    )
+    toolkit_slug = models.CharField(
+        max_length=100, db_index=True,
+        help_text='Denormalised from auth_config for cheap filtering (e.g. GMAIL).'
+    )
+
+    connected_account_id = models.CharField(
+        max_length=64, null=True, blank=True, unique=True,
+        help_text='Composio connected account id ("ca_..."). link() returns it BEFORE the user '
+                  'authorises, so it is set from initiate time onward.'
+    )
+
+    status = models.CharField(
+        max_length=20, choices=ComposioConnectionStatusEnum.choices,
+        default=ComposioConnectionStatusEnum.PENDING, db_index=True,
+        help_text='Local mirror of the Composio connected-account status.'
+    )
+    alias = models.CharField(
+        max_length=200, null=True, blank=True,
+        help_text='User-facing label (e.g. "Sales inbox"). Passed to Composio as alias.'
+    )
+    account_label = models.CharField(
+        max_length=320, null=True, blank=True,
+        help_text='Third-party account identifier surfaced by the provider (e.g. the connected '
+                  'Gmail address), when Composio returns it. Display only, never a credential.'
+    )
+
+    granted_scopes = models.JSONField(
+        null=True, blank=True,
+        help_text='OAuth scopes Composio reports as granted, when available.'
+    )
+    expires_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Credential expiry as reported by Composio, when available. We do NOT hold the token.'
+    )
+
+    connected_at = models.DateTimeField(
+        null=True, blank=True, help_text='When the account first became ACTIVE.'
+    )
+    last_status_check_at = models.DateTimeField(
+        null=True, blank=True, help_text='Last time we polled Composio for status.'
+    )
+    last_used_at = models.DateTimeField(
+        null=True, blank=True, help_text='Last time a tool was executed with this account.'
+    )
+    disconnected_at = models.DateTimeField(
+        null=True, blank=True, help_text='When this connection was disconnected/deleted.'
+    )
+
+    last_error = models.TextField(null=True, blank=True, help_text='Last error message from Composio, if any.')
+    last_error_at = models.DateTimeField(null=True, blank=True, help_text='When the last error occurred.')
+
+    metadata = models.JSONField(
+        null=True, blank=True,
+        help_text='Raw NON-SECRET Composio payload (toolkit meta, account type, link expiry). '
+                  'Always passed through composio_client.scrub() first - state.val is dropped entirely.'
+    )
+
+    created_by_user_id = models.UUIDField(
+        null=True, blank=True,
+        help_text='User who initiated the connection (differs from user_id for TENANT scope).'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'composio_connections'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_cmp_conn_tenant'),
+            models.Index(fields=['user_id'], name='idx_cmp_conn_user'),
+            models.Index(fields=['status'], name='idx_cmp_conn_status'),
+            models.Index(fields=['toolkit_slug'], name='idx_cmp_conn_toolkit'),
+            models.Index(fields=['composio_user_id'], name='idx_cmp_conn_entity'),
+            models.Index(fields=['tenant_id', 'user_id', 'toolkit_slug'], name='idx_cmp_conn_lookup'),
+            models.Index(fields=['tenant_id', 'status'], name='idx_cmp_conn_tenant_status'),
+        ]
+        constraints = [
+            # One LIVE connection per (tenant, user, toolkit, alias). Terminal
+            # rows are kept as history and excluded so a user can reconnect.
+            models.UniqueConstraint(
+                fields=['tenant_id', 'user_id', 'toolkit_slug', 'alias'],
+                condition=~models.Q(status__in=['DELETED', 'REVOKED', 'FAILED']),
+                name='uniq_cmp_conn_live_per_user_toolkit_alias',
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.toolkit_slug} - {self.alias or self.account_label or self.public_id}"
+
+    # -- status transitions (house style: transitions live on the model) --
+    def mark_initializing(self, connected_account_id=None, metadata=None):
+        """link() succeeded - Composio now owns a pending connected account."""
+        self.status = ComposioConnectionStatusEnum.INITIALIZING
+        if connected_account_id:
+            self.connected_account_id = connected_account_id
+        if metadata is not None:
+            self.metadata = metadata
+        self.save(update_fields=['status', 'connected_account_id', 'metadata', 'updated_at'])
+
+    def mark_active(self, connected_account_id=None, metadata=None):
+        self.status = ComposioConnectionStatusEnum.ACTIVE
+        if connected_account_id:
+            self.connected_account_id = connected_account_id
+        if self.connected_at is None:
+            self.connected_at = timezone.now()
+        self.last_status_check_at = timezone.now()
+        self.last_error = None
+        self.last_error_at = None
+        if metadata is not None:
+            self.metadata = metadata
+        self.save(update_fields=['status', 'connected_account_id', 'connected_at',
+                                 'last_status_check_at', 'last_error', 'last_error_at',
+                                 'metadata', 'updated_at'])
+
+    def mark_failed(self, error_message):
+        self.status = ComposioConnectionStatusEnum.FAILED
+        self.last_error = str(error_message)[:2000]
+        self.last_error_at = timezone.now()
+        self.save(update_fields=['status', 'last_error', 'last_error_at', 'updated_at'])
+
+    def mark_disconnected(self, status=ComposioConnectionStatusEnum.DELETED):
+        self.status = status
+        self.disconnected_at = timezone.now()
+        self.save(update_fields=['status', 'disconnected_at', 'updated_at'])
+
+    def record_event(self, event_type, actor_user_id=None, message=None,
+                     payload=None, source_ip=None):
+        """Append a row to the audit trail. Always tenant-stamped from self."""
+        return ComposioConnectionEvent.objects.create(
+            tenant_id=self.tenant_id,
+            connection=self,
+            event_type=event_type,
+            actor_user_id=actor_user_id,
+            message=(str(message)[:2000] if message else None),
+            payload=payload,
+            source_ip=source_ip,
+        )
+
+    @property
+    def is_usable(self):
+        """A connection can only execute tools when ACTIVE and addressable."""
+        return (self.status == ComposioConnectionStatusEnum.ACTIVE
+                and bool(self.connected_account_id))
+
+    @property
+    def is_terminal(self):
+        return self.status in ComposioConnectionStatusEnum.terminal()
+
+
+class ComposioConnectionEvent(models.Model):
+    """
+    Append-only audit trail for a Composio connection. Never mutated.
+
+    Answers "who connected/disconnected what, when, from where" - required for
+    the tenant-admin oversight screen and for incident response.
+    """
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True, help_text='Tenant ID for multi-tenancy.')
+
+    connection = models.ForeignKey(
+        ComposioConnection, on_delete=models.CASCADE,
+        related_name='events', db_column='connection_id',
+        help_text='Connection this event belongs to.'
+    )
+
+    event_type = models.CharField(
+        max_length=20, choices=ComposioEventTypeEnum.choices, db_index=True,
+        help_text='What happened.'
+    )
+    actor_user_id = models.UUIDField(
+        null=True, blank=True,
+        help_text='User who caused the event. NULL for system/webhook-driven events.'
+    )
+    message = models.TextField(null=True, blank=True, help_text='Human-readable summary.')
+    payload = models.JSONField(
+        null=True, blank=True,
+        help_text='Scrubbed context (tool slug, status transition, error code). Never secrets.'
+    )
+    source_ip = models.GenericIPAddressField(
+        null=True, blank=True, help_text='Client IP for user-initiated events.'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'composio_connection_events'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_cmp_evt_tenant'),
+            models.Index(fields=['connection', '-created_at'], name='idx_cmp_evt_conn_recent'),
+            models.Index(fields=['tenant_id', 'event_type', '-created_at'], name='idx_cmp_evt_lookup'),
+        ]
+
+    def __str__(self):
+        return f"{self.connection_id} - {self.event_type}"
+
+
+class ComposioLinkState(models.Model):
+    """
+    One-time-use, short-lived nonce binding a Composio hosted-auth redirect
+    back to the (tenant, user, connection) that started it.
+
+    Stored in Postgres rather than the Django cache: CACHES is FileBasedCache,
+    which is not shared across app instances, and the legacy Google OAuth flow
+    already had to add read-back verification logging because of it. The nonce
+    is the ONLY authenticator on the public callback endpoint, so it must be
+    durable.
+    """
+    id = models.BigAutoField(primary_key=True)
+    state = models.CharField(
+        max_length=64, unique=True, db_index=True,
+        help_text='Opaque nonce (secrets.token_urlsafe(32)) echoed back on the callback URL.'
+    )
+
+    tenant_id = models.UUIDField(db_index=True, help_text='Tenant that started the flow.')
+    user_id = models.UUIDField(db_index=True, help_text='User that started the flow.')
+
+    connection = models.ForeignKey(
+        ComposioConnection, on_delete=models.CASCADE,
+        related_name='link_states', db_column='connection_id',
+        help_text='Connection this hosted-auth round trip belongs to.'
+    )
+    toolkit_slug = models.CharField(
+        max_length=100, help_text='Toolkit being connected (for logging and the return redirect).'
+    )
+
+    return_to = models.CharField(
+        max_length=500, null=True, blank=True,
+        help_text='Relative frontend path to return the user to. Validated against '
+                  'settings.COMPOSIO_RETURN_TO_ALLOWLIST; never an absolute URL.'
+    )
+    link_expires_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='expires_at returned by Composio for the auth link, when available.'
+    )
+
+    expires_at = models.DateTimeField(
+        db_index=True,
+        help_text='When this nonce stops being accepted (now + COMPOSIO_LINK_TTL_SECONDS).'
+    )
+    consumed_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When the nonce was redeemed. Non-NULL = spent, replay rejected.'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'composio_link_states'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['expires_at'], name='idx_cmp_state_expiry'),
+            models.Index(fields=['tenant_id', 'user_id'], name='idx_cmp_state_tenant_user'),
+        ]
+
+    def __str__(self):
+        return f"{self.toolkit_slug} - {self.state[:8]}"
+
+    def is_valid(self):
+        """Unspent and unexpired."""
+        return self.consumed_at is None and timezone.now() < self.expires_at
+
+    def consume(self):
+        """Mark spent. Callers MUST hold select_for_update() to make this atomic."""
+        self.consumed_at = timezone.now()
+        self.save(update_fields=['consumed_at'])
+
+
+class ComposioToolkit(models.Model):
+    """
+    Local cache of Composio's toolkit catalogue.
+
+    Refreshed by integrations.tasks.sync_composio_toolkits (Celery beat, daily)
+    and by manage.py sync_composio_toolkits. Global, not tenant-scoped: the
+    catalogue is identical for everyone. Per-tenant availability is decided by
+    ComposioAuthConfig plus is_enabled.
+    """
+    id = models.BigAutoField(primary_key=True)
+    slug = models.CharField(
+        max_length=100, unique=True, db_index=True,
+        help_text='Composio toolkit slug, uppercase (GMAIL, NOTION, GOOGLEDRIVE, GOOGLECALENDAR).'
+    )
+    name = models.CharField(max_length=200, help_text='Human-readable toolkit name.')
+    description = models.TextField(null=True, blank=True, help_text='Short description from Composio meta.')
+    logo_url = models.URLField(
+        max_length=500, null=True, blank=True, help_text='Toolkit logo URL from Composio meta.'
+    )
+    categories = models.JSONField(null=True, blank=True, help_text='Category slugs reported by Composio.')
+
+    auth_schemes = models.JSONField(null=True, blank=True, help_text='All auth schemes the toolkit supports.')
+    composio_managed_auth_schemes = models.JSONField(
+        null=True, blank=True,
+        help_text='Schemes Composio manages the OAuth app for. Non-empty means one-click connect with '
+                  'no credentials of ours.'
+    )
+    no_auth = models.BooleanField(default=False, help_text='Toolkit requires no authentication at all.')
+
+    tools_count = models.IntegerField(default=0, help_text='Number of tools, from Composio meta.')
+    triggers_count = models.IntegerField(default=0, help_text='Number of triggers, from Composio meta.')
+
+    is_enabled = models.BooleanField(
+        default=False, db_index=True,
+        help_text='Whether tenants may connect this toolkit. Default False - we opt toolkits in '
+                  'explicitly rather than exposing the whole Composio catalogue.'
+    )
+    is_featured = models.BooleanField(
+        default=False, db_index=True, help_text='Pinned to the top of the catalogue grid.'
+    )
+    sort_order = models.IntegerField(default=1000, help_text='Manual ordering within the catalogue.')
+
+    metadata = models.JSONField(null=True, blank=True, help_text='Raw non-secret toolkit payload from Composio.')
+    last_synced_at = models.DateTimeField(
+        null=True, blank=True, help_text='When this row was last refreshed from Composio.'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'composio_toolkits'
+        ordering = ['-is_featured', 'sort_order', 'name']
+        indexes = [
+            models.Index(fields=['slug'], name='idx_cmp_toolkit_slug'),
+            models.Index(fields=['is_enabled', 'is_featured'], name='idx_cmp_toolkit_visible'),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.slug})"
+
+    @property
+    def supports_managed_auth(self):
+        """True when Composio owns an OAuth app for this toolkit."""
+        return bool(self.composio_managed_auth_schemes)

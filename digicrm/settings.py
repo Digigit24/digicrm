@@ -244,6 +244,14 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    # Scoped throttles used by the Composio endpoints (integrations/views_composio.py).
+    # Only views that declare `throttle_scope` are affected; nothing else throttles.
+    'DEFAULT_THROTTLE_CLASSES': [],
+    'DEFAULT_THROTTLE_RATES': {
+        'composio-initiate': '10/min',
+        'composio-status': '30/min',
+        'composio-execute': '60/min',
+    },
 }
 
 # drf-spectacular Settings
@@ -448,6 +456,62 @@ INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)
 TELECMI_MASTER_KEY = config('TELECMI_MASTER_KEY', default=None)
 
 # ===========================
+# COMPOSIO (managed third-party tool auth)
+# ===========================
+# Composio brokers OAuth for hundreds of third-party toolkits (Notion, Gmail,
+# Google Drive, Google Calendar, ...). It COEXISTS with the native Google OAuth
+# above; it does not replace it. See _plans/05-composio-integration.md.
+#
+# COMPOSIO_API_KEY is server-side ONLY. It grants access to EVERY connected
+# account across EVERY tenant, so it must never be sent to a browser, logged,
+# returned by an API response, or persisted on a model. It is read in exactly
+# one place: integrations/services/composio_client.py.
+COMPOSIO_API_KEY = config('COMPOSIO_API_KEY', default='')
+COMPOSIO_BASE_URL = config('COMPOSIO_BASE_URL', default='https://backend.composio.dev/api/v3.1')
+COMPOSIO_ENABLED = config('COMPOSIO_ENABLED', default=False, cast=bool)
+
+# Namespace prefix for Composio entity ids: "{namespace}:{tenant_id}:{user_id}".
+# Composio's user_id is the ONLY isolation boundary it enforces between end
+# users, so it encodes both the tenant and the environment. This value MUST
+# differ per environment (celiyo-dev / celiyo-staging / celiyo-prod) so a
+# staging box pointed at the same Composio project can never address a
+# production tenant's connected accounts.
+COMPOSIO_USER_NAMESPACE = config('COMPOSIO_USER_NAMESPACE', default='celiyo-dev')
+
+# Where Composio sends the browser after hosted auth completes. Public path —
+# also listed in common.middleware.JWTAuthenticationMiddleware.PUBLIC_PATHS.
+COMPOSIO_CALLBACK_URL = config(
+    'COMPOSIO_CALLBACK_URL',
+    default='http://localhost:8000/api/integrations/composio/callback/',
+)
+# Frontend page the callback bounces the browser to (query params appended).
+COMPOSIO_FRONTEND_RETURN_URL = config(
+    'COMPOSIO_FRONTEND_RETURN_URL',
+    default=f"{config('FRONTEND_URL', default='http://localhost:3000')}/integrations/composio/callback",
+)
+# Open-redirect guard: allowlist of RELATIVE paths a caller may ask to return to.
+COMPOSIO_RETURN_TO_ALLOWLIST = ['/integrations', '/settings/integrations']
+
+# Shared secret from composio.triggers.set_webhook_subscription()['secret'].
+# Blank => every inbound Composio webhook is rejected (safe default).
+COMPOSIO_WEBHOOK_SECRET = config('COMPOSIO_WEBHOOK_SECRET', default='')
+# Reject webhooks whose webhook-timestamp header is older/newer than this many
+# seconds (replay window).
+COMPOSIO_WEBHOOK_TOLERANCE_SECONDS = config('COMPOSIO_WEBHOOK_TOLERANCE_SECONDS', default=300, cast=int)
+
+COMPOSIO_HTTP_TIMEOUT = config('COMPOSIO_HTTP_TIMEOUT', default=20, cast=int)
+COMPOSIO_MAX_RETRIES = config('COMPOSIO_MAX_RETRIES', default=3, cast=int)
+# How long a hosted-auth link / ComposioLinkState nonce stays valid.
+COMPOSIO_LINK_TTL_SECONDS = config('COMPOSIO_LINK_TTL_SECONDS', default=900, cast=int)
+# Minimum seconds between two outbound status polls for the same connection.
+COMPOSIO_STATUS_MIN_INTERVAL = config('COMPOSIO_STATUS_MIN_INTERVAL', default=10, cast=int)
+# POST /connections/{id}/execute/ ships DARK. Never enable without an explicit
+# ComposioAuthConfig.restrict_to_tools allowlist on the auth config.
+COMPOSIO_EXECUTE_ENABLED = config('COMPOSIO_EXECUTE_ENABLED', default=False, cast=bool)
+# Toolkits offered out of the box (used by bootstrap_composio_auth_configs).
+COMPOSIO_PRIORITY_TOOLKITS = ['GMAIL', 'NOTION', 'GOOGLEDRIVE', 'GOOGLECALENDAR']
+
+# ===========================
 # PUSHER (real-time telephony live events)
 # ===========================
 # Server-side credentials for PUBLISHING events from CDRWebhookView /
@@ -505,6 +569,19 @@ CELERY_BEAT_SCHEDULE = {
     },
     'check-connection-health': {
         'task': 'integrations.tasks.check_connection_health',
+        'schedule': 86400.0,  # Every 24 hours
+    },
+    # ── Composio ──
+    'sync-composio-toolkits': {
+        'task': 'integrations.tasks.sync_composio_toolkits',
+        'schedule': 86400.0,  # Every 24 hours
+    },
+    'sweep-stale-composio-connections': {
+        'task': 'integrations.tasks.sweep_stale_composio_connections',
+        'schedule': 900.0,  # Every 15 minutes
+    },
+    'cleanup-composio-events': {
+        'task': 'integrations.tasks.cleanup_composio_events',
         'schedule': 86400.0,  # Every 24 hours
     },
     'sync-telecmi-cdrs': {
