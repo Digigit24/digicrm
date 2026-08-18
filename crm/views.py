@@ -26,6 +26,7 @@ from .serializers import (
     LeadGroupSerializer, BulkLeadGroupMembershipSerializer
 )
 from .zata_client import upload_to_zata, delete_from_zata
+from common.authentication import JWTRequestAuthentication
 from common.mixins import TenantViewSetMixin
 from common.permissions import (
     CRMPermissionMixin, HasCRMPermission,
@@ -42,7 +43,11 @@ from notifications.serializers import ReminderSerializer
 from datetime import datetime
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
-from .user_directory import fetch_tenant_users
+from .user_directory import (
+    fetch_tenant_users,
+    ServiceCredentialsMissing,
+    TenantScopeRequired,
+)
 try:
     import openpyxl
     EXCEL_SUPPORT = True
@@ -54,28 +59,79 @@ logger = logging.getLogger(__name__)
 
 class TenantUserListView(APIView):
     """
-    GET /api/crm/users/ -- list users for the current tenant.
+    GET /api/crm/users/ -- list users of the *caller's own* tenant.
 
     Thin proxy to the SuperAdmin (admin.celiyo.com) user directory. Users are
     not stored in the CRM; leads reference them by UUID via ``assigned_to``.
-    Used by the MCP ``list_users`` tool so an agent can resolve a person's name
-    to the UUID required when assigning leads.
+    Used by the SPA to render owner/assignee names and by the MCP ``list_users``
+    tool so an agent can resolve a person's name to the UUID required when
+    assigning leads.
+
+    Tenant scoping: the tenant is taken exclusively from the caller's verified
+    JWT claim (``request.tenant_id``, set by
+    ``common.middleware.JWTAuthenticationMiddleware``) and forwarded upstream as
+    ``x-tenant-id``. A caller with no tenant claim gets 403 -- there is no
+    unscoped fallback. Query params/headers can never influence the tenant.
 
     Query params:
         search    optional name/email filter
-        page_size max users to return (default 100)
+        page_size upstream page size (default 100, clamped to 1..500); all
+                  pages are followed, so the full tenant directory is returned
+
+    Response (pinned contract for the SPA)::
+
+        {"count": 42,
+         "results": [{"id": "<uuid>", "email": "a@b.com", "first_name": "Asha",
+                      "last_name": "Rao", "full_name": "Asha Rao",
+                      "is_active": true, "avatar": null}]}
     """
-    authentication_classes = [JWTAuthentication]
+    # NOTE: common.permissions.JWTAuthentication returns the bare user_id
+    # *string* as request.user, which makes DRF's IsAuthenticated blow up with
+    # "'str' object has no attribute 'is_authenticated'" (HTTP 500 on every
+    # call). JWTRequestAuthentication returns a real TenantUser and is the
+    # project-wide default.
+    authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        tenant_id = getattr(request, 'tenant_id', None)
+        if isinstance(tenant_id, str):
+            tenant_id = tenant_id.strip()
+        if not tenant_id:
+            # Fail closed: without a tenant claim we would otherwise ask the
+            # auth service for *every* user on the platform.
+            logger.warning(
+                'User directory denied: no tenant claim on request (user=%s)',
+                getattr(request, 'user_id', None),
+            )
+            return Response(
+                {'error': 'Tenant scope required'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         search = request.query_params.get('search')
         try:
             page_size = int(request.query_params.get('page_size', 100))
         except (TypeError, ValueError):
             page_size = 100
         try:
-            data = fetch_tenant_users(search=search, page_size=page_size)
+            data = fetch_tenant_users(
+                search=search,
+                page_size=page_size,
+                tenant_id=tenant_id,
+            )
+        except TenantScopeRequired:
+            logger.warning('User directory denied: unresolved tenant scope')
+            return Response(
+                {'error': 'Tenant scope required'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        except ServiceCredentialsMissing as exc:
+            logger.error('User directory misconfigured: %s', exc)
+            return Response(
+                {'error': 'User directory is not configured'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         except requests.HTTPError as exc:
             code = exc.response.status_code if exc.response is not None else None
             logger.warning('User directory upstream error: %s', code)
@@ -89,7 +145,9 @@ class TenantUserListView(APIView):
                 {'error': f'Auth service unreachable: {exc}'},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
-        return Response(data)
+
+        results = data.get('results') or []
+        return Response({'count': data.get('count', len(results)), 'results': results})
 
 
 class CSVRenderer(BaseRenderer):
