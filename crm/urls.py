@@ -8,10 +8,10 @@ from .views import (
 router = DefaultRouter()
 router.register(r'leads', LeadViewSet, basename='lead')
 router.register(r'statuses', LeadStatusViewSet, basename='leadstatus')
-router.register(r'activities', LeadActivityViewSet, basename='leadactivity')
+router.register(r'activities', LeadActivityViewSet, basename='lead-activity')
 router.register(r'orders', LeadOrderViewSet, basename='leadorder')
 router.register(r'field-configurations', LeadFieldConfigurationViewSet, basename='leadfieldconfiguration')
-router.register(r'lead-groups', LeadGroupViewSet, basename='leadgroup')
+router.register(r'lead-groups', LeadGroupViewSet, basename='lead-group')
 
 urlpatterns = [
     path('users/', TenantUserListView.as_view(), name='tenant-users'),

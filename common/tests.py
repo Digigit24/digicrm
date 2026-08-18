@@ -58,8 +58,35 @@ class FakeQuerySet:
     def __init__(self, data):
         self._data = data
 
-    def filter(self, **kwargs):
-        return FakeQuerySet([d for d in self._data if all(d.get(k) == v for k, v in kwargs.items())])
+    @staticmethod
+    def _eq(actual, expected):
+        """Compare the way the ORM does.
+
+        Django matches a ``UUID`` against a ``UUIDField`` whether the value
+        arrives as a ``UUID`` or as its string form. This fake stores plain
+        dicts, so normalise both sides here -- otherwise the double, rather
+        than the code under test, decides whether a scope filter matched.
+        """
+        if isinstance(actual, uuid.UUID) or isinstance(expected, uuid.UUID):
+            return str(actual) == str(expected)
+        return actual == expected
+
+    def _matches_q(self, d, node):
+        """Evaluate a ``Q`` tree against one row."""
+        if not isinstance(node, Q):
+            key, value = node
+            return self._eq(d.get(key), value)
+        combine = any if node.connector == Q.OR else all
+        result = combine(self._matches_q(d, child) for child in node.children)
+        return not result if node.negated else result
+
+    def filter(self, *args, **kwargs):
+        rows = [
+            d for d in self._data
+            if all(self._matches_q(d, q) for q in args)
+            and all(self._eq(d.get(k), v) for k, v in kwargs.items())
+        ]
+        return FakeQuerySet(rows)
 
     def none(self):
         return FakeQuerySet([])
