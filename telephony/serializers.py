@@ -159,6 +159,8 @@ class CallLogSerializer(serializers.ModelSerializer):
     direction_display = serializers.CharField(source='get_direction_display', read_only=True)
     call_type_display = serializers.CharField(source='get_call_type_display', read_only=True)
     has_recording = serializers.SerializerMethodField()
+    crm_lead_id = serializers.IntegerField(read_only=True, allow_null=True, default=None)
+    crm_lead_name = serializers.CharField(read_only=True, allow_null=True, default=None)
 
     def get_has_recording(self, obj):
         return bool(obj.recording_file or obj.recording_object_key)
@@ -170,7 +172,8 @@ class CallLogSerializer(serializers.ModelSerializer):
             'call_type', 'call_type_display',
             'from_number', 'to_number', 'duration', 'billed_sec', 'rate',
             'caller_name', 'telecmi_notes', 'call_time',
-            'lead_id', 'agent_user_id', 'synced_via',
+            'lead_id', 'crm_lead_id', 'crm_lead_name',
+            'agent_user_id', 'synced_via',
             'recording_file', 'has_recording', 'created_at',
             'recording_storage_status', 'recording_content_type',
             'recording_size', 'recording_archived_at',

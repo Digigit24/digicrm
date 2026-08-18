@@ -300,6 +300,12 @@ class CallLogServiceTest(TestCase):
         log = process_cdr_record(TENANT_ID, raw, 'inbound')
         self.assertEqual(log.lead_id, lead.id)
 
+    def test_links_formatted_crm_phone_to_unformatted_telecmi_number(self):
+        lead = self._make_lead(phone='+91 90000-00000')
+        raw = self._raw_cdr(**{'from': '919000000000'})
+        log = process_cdr_record(TENANT_ID, raw, 'inbound')
+        self.assertEqual(log.lead_id, lead.id)
+
     def test_no_lead_match_gives_null_lead_id(self):
         raw = self._raw_cdr(**{'from': '9199999999999'})
         log = process_cdr_record(TENANT_ID, raw, 'inbound')

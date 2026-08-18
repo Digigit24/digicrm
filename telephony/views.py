@@ -47,6 +47,7 @@ from telephony.services.token_service import (
 )
 from telephony.services.call_log_service import (
     process_cdr_record, sync_cdr_for_agent, set_call_outcome,
+    phone_digits_expression,
 )
 from telephony.services.analytics_service import (
     get_agent_summary, get_team_summary, get_missed_unattended,
@@ -280,7 +281,44 @@ class CallLogViewSet(TenantViewSetMixin, viewsets.ReadOnlyModelViewSet):
     List and retrieve CDR records for this tenant.
     Supports filtering by direction, call_type, lead_id, date range.
     """
-    queryset = CallLog.objects.select_related().order_by('-call_time')
+    # Resolve the CRM lead by the stored lead_id first, then by a normalized
+    # phone-number match. This also repairs the display for historical logs
+    # whose lead_id is null/stale, without an N+1 query per table row.
+    from django.db.models import Case, F, OuterRef, Subquery, TextField, When
+    from django.db.models.functions import Coalesce, Right
+    from crm.models import Lead
+
+    _call_number = Case(
+        When(direction=CallDirectionEnum.INBOUND, then=F('from_number')),
+        default=F('to_number'),
+        output_field=TextField(),
+    )
+    _linked_lead = Lead.objects.filter(
+        tenant_id=OuterRef('tenant_id'), id=OuterRef('lead_id')
+    )
+    _phone_lead = (
+        Lead.objects.filter(tenant_id=OuterRef('tenant_id'))
+        .annotate(phone_digits=phone_digits_expression(F('phone')))
+        .filter(phone_digits__endswith=OuterRef('call_phone_suffix'))
+        .order_by('id')
+    )
+    queryset = (
+        CallLog.objects.annotate(
+            call_phone_digits=phone_digits_expression(_call_number),
+        )
+        .annotate(call_phone_suffix=Right('call_phone_digits', 10))
+        .annotate(
+            crm_lead_id=Coalesce(
+                Subquery(_linked_lead.values('id')[:1]),
+                Subquery(_phone_lead.values('id')[:1]),
+            ),
+            crm_lead_name=Coalesce(
+                Subquery(_linked_lead.values('name')[:1]),
+                Subquery(_phone_lead.values('name')[:1]),
+            ),
+        )
+        .order_by('-call_time')
+    )
     serializer_class = CallLogSerializer
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [HasDigiPermission]

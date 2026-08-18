@@ -260,21 +260,44 @@ def _find_lead_id(tenant_id, phone_number: str):
     if not digits:
         return None
 
-    # Try exact match first, then suffix match (handles country code variants)
+    # Try exact match first, then compare normalized digits. CRM phone numbers
+    # are commonly stored as "+91 98765-43210" while TeleCMI returns
+    # "919876543210"; a raw `endswith` lookup cannot match those separators.
     lead = (
         Lead.objects.filter(tenant_id=tenant_id, phone=phone_number)
         .only('id')
         .first()
     )
     if not lead:
-        # Try matching last 10 digits to handle +91XXXXXXXXXX vs 0XXXXXXXXXX
+        from django.db.models import F
+
+        # Match the last ten digits to handle +91XXXXXXXXXX, 0XXXXXXXXXX and
+        # formatted values without ever crossing the tenant boundary.
         suffix = digits[-10:] if len(digits) >= 10 else digits
         lead = (
-            Lead.objects.filter(tenant_id=tenant_id, phone__endswith=suffix)
+            Lead.objects.filter(tenant_id=tenant_id)
+            .annotate(phone_digits=phone_digits_expression(F('phone')))
+            .filter(phone_digits__endswith=suffix)
+            .order_by('id')
             .only('id')
             .first()
         )
     return lead.id if lead else None
+
+
+def phone_digits_expression(expression):
+    """Return a database expression stripping common phone separators."""
+    from django.db.models import TextField, Value
+    from django.db.models.functions import Replace
+
+    for character in ('+', ' ', '-', '(', ')', '.', '/', '\\'):
+        expression = Replace(
+            expression,
+            Value(character),
+            Value(''),
+            output_field=TextField(),
+        )
+    return expression
 
 
 def _create_call_activity(tenant_id, call_log, lead_id):

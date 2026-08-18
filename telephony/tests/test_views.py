@@ -442,6 +442,25 @@ class CallLogViewSetTest(TestCase):
         self.assertIn('list-b-001', cmis)
         self.assertNotIn('list-a-001', cmis)
 
+    def test_list_resolves_lead_name_from_formatted_phone_when_link_is_stale(self):
+        from crm.models import Lead
+
+        lead = Lead.objects.create(
+            tenant_id=TENANT_A,
+            name='Matched CRM Lead',
+            phone='919-000-0010',
+            owner_user_id=USER_A,
+        )
+        CallLog.objects.filter(tenant_id=TENANT_A, cmiuid='list-a-001').update(
+            lead_id=999999,
+            caller_name='unknown',
+        )
+
+        response = _authed_client(TENANT_A, USER_A).get('/api/telephony/calls/')
+        row = next(item for item in response.data['results'] if item['cmiuid'] == 'list-a-001')
+        self.assertEqual(row['crm_lead_id'], lead.id)
+        self.assertEqual(row['crm_lead_name'], 'Matched CRM Lead')
+
 
 @override_settings(JWT_SECRET_KEY=TEST_JWT_SECRET, JWT_ALGORITHM=TEST_JWT_ALGO)
 class TeleCMICredentialViewSetTest(TestCase):
