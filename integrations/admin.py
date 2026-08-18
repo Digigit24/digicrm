@@ -13,7 +13,9 @@ from django.utils.safestring import mark_safe
 from integrations.models import (
     Integration, Connection, Workflow, WorkflowTrigger,
     WorkflowAction, WorkflowMapping, ExecutionLog,
-    DuplicateDetectionCache
+    DuplicateDetectionCache,
+    ComposioAuthConfig, ComposioConnection, ComposioConnectionEvent,
+    ComposioLinkState, ComposioToolkit,
 )
 
 
@@ -390,3 +392,189 @@ class DuplicateDetectionCacheAdmin(admin.ModelAdmin):
         return format_html('<a href="{}">{}</a>', url, obj.workflow.name)
 
     workflow_link.short_description = 'Workflow'
+
+
+# ===========================================================================
+# COMPOSIO
+# ===========================================================================
+# Every Composio admin below is intentionally READ-MOSTLY. Composio holds the
+# credentials, not us, so there is nothing here to reveal - but the Composio
+# identifiers (auth_config_id, connected_account_id, composio_user_id) address
+# live third-party accounts and must never be hand-edited into pointing at
+# another tenant's entity.
+
+
+class ComposioConnectionEventInline(admin.TabularInline):
+    """Last 20 audit events for a connection. Read-only."""
+    model = ComposioConnectionEvent
+    extra = 0
+    can_delete = False
+    fields = ['created_at', 'event_type', 'actor_user_id', 'message', 'source_ip']
+    readonly_fields = fields
+    ordering = ['-created_at']
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request).order_by('-created_at')
+        recent = qs.values_list('id', flat=True)[:20]
+        return qs.filter(id__in=list(recent))
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ComposioAuthConfig)
+class ComposioAuthConfigAdmin(admin.ModelAdmin):
+    """Admin for ComposioAuthConfig - platform-wide and per-tenant auth configs."""
+    list_display = [
+        'id', 'toolkit_slug', 'scope_display', 'auth_config_id', 'auth_scheme',
+        'is_composio_managed', 'is_active', 'last_synced_at'
+    ]
+    list_filter = ['toolkit_slug', 'auth_scheme', 'is_composio_managed', 'is_active']
+    search_fields = ['toolkit_slug', 'auth_config_id', 'name', 'tenant_id']
+    readonly_fields = ['public_id', 'created_at', 'updated_at', 'last_synced_at']
+
+    fieldsets = (
+        ('Auth Config', {
+            'fields': ('toolkit_slug', 'name', 'auth_config_id', 'auth_scheme',
+                       'is_composio_managed', 'is_active')
+        }),
+        ('Scope', {
+            'fields': ('tenant_id',),
+            'description': 'Leave blank for the platform-wide, Composio-managed config.'
+        }),
+        ('Tool policy', {
+            'fields': ('restrict_to_tools', 'default_tool_versions'),
+            'description': 'restrict_to_tools bounds what POST /execute/ can ever call. '
+                           'Empty means nothing may be executed (fail closed).'
+        }),
+        ('Metadata', {
+            'fields': ('public_id', 'metadata', 'last_synced_at', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+    def scope_display(self, obj):
+        return str(obj.tenant_id) if obj.tenant_id else 'GLOBAL'
+
+    scope_display.short_description = 'Scope'
+
+
+@admin.register(ComposioConnection)
+class ComposioConnectionAdmin(admin.ModelAdmin):
+    """
+    Admin for ComposioConnection.
+
+    All Composio identifiers are read-only: editing composio_user_id or
+    connected_account_id by hand would point this row at a different entity,
+    which the service layer treats as tampering and refuses to act on.
+    """
+    list_display = [
+        'id', 'toolkit_slug', 'alias', 'account_label', 'status', 'scope',
+        'tenant_id', 'user_id', 'connected_at'
+    ]
+    list_filter = ['status', 'scope', 'toolkit_slug', 'created_at']
+    search_fields = [
+        'tenant_id', 'user_id', 'alias', 'account_label',
+        'connected_account_id', 'composio_user_id', 'public_id'
+    ]
+    readonly_fields = [
+        'public_id', 'composio_user_id', 'connected_account_id', 'toolkit_slug',
+        'granted_scopes', 'expires_at', 'connected_at', 'last_status_check_at',
+        'last_used_at', 'disconnected_at', 'last_error', 'last_error_at',
+        'metadata', 'created_at', 'updated_at'
+    ]
+    inlines = [ComposioConnectionEventInline]
+
+    fieldsets = (
+        ('Ownership', {
+            'fields': ('tenant_id', 'user_id', 'scope', 'created_by_user_id', 'composio_user_id'),
+            'description': 'composio_user_id is the only isolation boundary Composio enforces. '
+                           'It is derived from (namespace, tenant_id, user_id) and is read-only.'
+        }),
+        ('Composio identifiers', {
+            'fields': ('auth_config', 'toolkit_slug', 'connected_account_id', 'status')
+        }),
+        ('Display', {
+            'fields': ('alias', 'account_label', 'granted_scopes', 'expires_at')
+        }),
+        ('Health', {
+            'fields': ('connected_at', 'last_status_check_at', 'last_used_at',
+                       'disconnected_at', 'last_error', 'last_error_at')
+        }),
+        ('Metadata', {
+            'fields': ('public_id', 'metadata', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+
+@admin.register(ComposioConnectionEvent)
+class ComposioConnectionEventAdmin(admin.ModelAdmin):
+    """Admin for the append-only Composio audit trail. Never editable."""
+    list_display = ['id', 'created_at', 'event_type', 'connection', 'tenant_id',
+                    'actor_user_id', 'source_ip']
+    list_filter = ['event_type', 'created_at']
+    search_fields = ['tenant_id', 'actor_user_id', 'message', 'connection__public_id']
+    readonly_fields = ['tenant_id', 'connection', 'event_type', 'actor_user_id',
+                       'message', 'payload', 'source_ip', 'created_at']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ComposioLinkState)
+class ComposioLinkStateAdmin(admin.ModelAdmin):
+    """Admin for the one-time hosted-auth nonces. Read-only; swept by Celery."""
+    list_display = ['id', 'toolkit_slug', 'tenant_id', 'user_id', 'created_at',
+                    'expires_at', 'consumed_at']
+    list_filter = ['toolkit_slug', 'created_at']
+    search_fields = ['tenant_id', 'user_id', 'toolkit_slug']
+    readonly_fields = ['state', 'tenant_id', 'user_id', 'connection', 'toolkit_slug',
+                       'return_to', 'link_expires_at', 'expires_at', 'consumed_at', 'created_at']
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ComposioToolkit)
+class ComposioToolkitAdmin(admin.ModelAdmin):
+    """
+    Admin for the cached Composio toolkit catalogue.
+
+    is_enabled / is_featured / sort_order are OPERATOR-OWNED - the nightly sync
+    task never clobbers them. Everything else is refreshed from Composio.
+    """
+    list_display = ['id', 'slug', 'name', 'is_enabled', 'is_featured', 'sort_order',
+                    'tools_count', 'triggers_count', 'last_synced_at']
+    list_filter = ['is_enabled', 'is_featured', 'no_auth']
+    search_fields = ['slug', 'name', 'description']
+    list_editable = ['is_enabled', 'is_featured', 'sort_order']
+    readonly_fields = ['slug', 'name', 'description', 'logo_url', 'categories',
+                       'auth_schemes', 'composio_managed_auth_schemes', 'no_auth',
+                       'tools_count', 'triggers_count', 'metadata',
+                       'last_synced_at', 'created_at', 'updated_at']
+
+    fieldsets = (
+        ('Catalogue entry (synced from Composio)', {
+            'fields': ('slug', 'name', 'description', 'logo_url', 'categories',
+                       'auth_schemes', 'composio_managed_auth_schemes', 'no_auth',
+                       'tools_count', 'triggers_count')
+        }),
+        ('Operator controls', {
+            'fields': ('is_enabled', 'is_featured', 'sort_order'),
+            'description': 'Never overwritten by the nightly sync.'
+        }),
+        ('Metadata', {
+            'fields': ('metadata', 'last_synced_at', 'created_at', 'updated_at'),
+            'classes': ('collapse',)
+        }),
+    )
+
+    def has_add_permission(self, request):
+        return False

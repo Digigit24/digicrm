@@ -53,6 +53,15 @@ class JWTAuthenticationMiddleware(MiddlewareMixin):
         '/api/whatsapp/webhooks/',  # WhatsApp inbound callbacks (secured by X-Adapter-Secret)
         '/mcp/',                    # MCP server endpoints (Claude connector — auth handled internally)
         '/.well-known/',            # OAuth discovery (required by MCP spec)
+        # Composio hosted-auth browser redirect. The browser arrives here from
+        # Composio with no Authorization header; the single-use state nonce in
+        # ComposioLinkState is the authenticator, and the tenant/user are read
+        # from that row, never from a query parameter. Exact path only.
+        '/api/integrations/composio/callback/',
+        # Composio trigger events. Verified inside the view with HMAC-SHA256
+        # over "{webhook-id}.{webhook-timestamp}.{body}" plus a timestamp
+        # replay window; an unset COMPOSIO_WEBHOOK_SECRET rejects everything.
+        '/api/integrations/composio/webhook/',
     ]
 
     def process_request(self, request):

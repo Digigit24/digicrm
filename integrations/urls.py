@@ -9,7 +9,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from rest_framework_nested import routers as nested_routers
 
-from integrations import views
+from integrations import views, views_composio
 
 # Main router
 router = DefaultRouter()
@@ -19,6 +19,17 @@ router.register(r'integrations', views.IntegrationViewSet, basename='integration
 router.register(r'connections', views.ConnectionViewSet, basename='connection')
 router.register(r'workflows', views.WorkflowViewSet, basename='workflow')
 router.register(r'execution-logs', views.ExecutionLogViewSet, basename='execution-log')
+
+# Composio - managed third-party tool auth (Notion, Gmail, Drive, Calendar, ...).
+# A sibling surface to the native Google OAuth above, not a replacement.
+router.register(r'composio/toolkits', views_composio.ComposioToolkitViewSet,
+                basename='composio-toolkit')
+router.register(r'composio/connections', views_composio.ComposioConnectionViewSet,
+                basename='composio-connection')
+router.register(r'composio/auth-configs', views_composio.ComposioAuthConfigViewSet,
+                basename='composio-auth-config')
+router.register(r'composio/admin/connections', views_composio.ComposioAdminConnectionViewSet,
+                basename='composio-admin-connection')
 
 # Nested routers for workflow triggers
 workflows_router = nested_routers.NestedDefaultRouter(
@@ -53,6 +64,15 @@ urlpatterns = [
     # Must come before the routers so its <uuid:public_id> segment can't be
     # swallowed by a router pattern.
     path('webhook/inbound/<uuid:public_id>/', views.InboundWebhookView.as_view(), name='webhook-inbound'),
+
+    # Public Composio endpoints. MUST precede the routers, and are listed in
+    # JWTAuthenticationMiddleware.PUBLIC_PATHS - the browser arrives at the
+    # callback straight from Composio's hosted auth page with no Authorization
+    # header, and Composio's webhook sender has no JWT either. Both authenticate
+    # themselves inside the view: the callback by a single-use state nonce, the
+    # webhook by an HMAC signature plus a timestamp replay window.
+    path('composio/callback/', views_composio.ComposioCallbackView.as_view(), name='composio-callback'),
+    path('composio/webhook/', views_composio.ComposioWebhookView.as_view(), name='composio-webhook'),
 
     # Include main router URLs
     path('', include(router.urls)),
@@ -118,4 +138,38 @@ FIELD MAPPINGS:
 EXECUTION LOGS:
 - GET    /api/integrations/execution-logs/                    - List execution logs
 - GET    /api/integrations/execution-logs/:id/                - Get execution log details
+
+COMPOSIO (managed third-party tool auth - Notion, Gmail, Drive, Calendar, ...):
+
+  Catalogue (permission: integrations.providers.view):
+  - GET    /api/integrations/composio/toolkits/                        - List connectable toolkits
+                                                                         ?search=&category=&connected=true|false
+  - GET    /api/integrations/composio/toolkits/:slug/                  - Toolkit details
+  - POST   /api/integrations/composio/toolkits/sync/                   - Refresh catalogue (tenant admin)
+
+  Connections (permission: integrations.connections.*, scoped to tenant+user):
+  - POST   /api/integrations/composio/connections/initiate/            - Start hosted auth -> redirect_url + state
+  - GET    /api/integrations/composio/connections/                     - List own + tenant-shared connections
+  - GET    /api/integrations/composio/connections/:public_id/          - Connection details
+  - GET    /api/integrations/composio/connections/:public_id/status/   - Poll status (?force=true)
+  - POST   /api/integrations/composio/connections/:public_id/refresh/  - Re-authorise
+  - POST   /api/integrations/composio/connections/:public_id/disable/  - Disable at Composio
+  - POST   /api/integrations/composio/connections/:public_id/enable/   - Re-enable at Composio
+  - POST   /api/integrations/composio/connections/:public_id/disconnect/ - Revoke at Composio + tombstone
+  - DELETE /api/integrations/composio/connections/:public_id/          - Same as disconnect
+  - GET    /api/integrations/composio/connections/:public_id/events/   - Audit trail
+  - POST   /api/integrations/composio/connections/:public_id/execute/  - Execute a tool (off by default)
+
+  Auth configs (tenant admin only):
+  - GET    /api/integrations/composio/auth-configs/                    - Tenant + platform-wide configs
+  - POST   /api/integrations/composio/auth-configs/                    - Create a tenant-owned config
+  - PATCH  /api/integrations/composio/auth-configs/:public_id/         - Update a tenant-owned config
+
+  Tenant admin oversight (tenant admin only, still tenant-scoped):
+  - GET    /api/integrations/composio/admin/connections/               - All connections in the tenant
+  - POST   /api/integrations/composio/admin/connections/:public_id/revoke/ - Revoke someone else's connection
+
+  Public (no JWT; authenticated by nonce / HMAC inside the view):
+  - GET    /api/integrations/composio/callback/                        - Composio hosted-auth return -> 302
+  - POST   /api/integrations/composio/webhook/                         - Composio trigger events
 """

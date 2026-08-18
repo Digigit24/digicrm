@@ -44,7 +44,7 @@ from integrations.utils.encryption import encrypt_token, decrypt_token
 from integrations.services.google_sheets import create_sheets_service, GoogleSheetsError
 from integrations.services.workflow_engine import WorkflowEngine, WorkflowEngineError
 from common.authentication import JWTRequestAuthentication
-from common.permissions import HasDigiPermission
+from common.permissions import HasDigiPermission, is_admin_request
 
 logger = logging.getLogger(__name__)
 
@@ -92,26 +92,34 @@ class ConnectionViewSet(viewsets.ModelViewSet):
     permission_resource = 'connections'
 
     def get_queryset(self):
-        """Get connections for current tenant and user"""
-        tenant_id = getattr(self.request, 'tenant_id', None)
+        """
+        Get connections for the current tenant AND user.
 
-        # Debug logging
-        logger.info(f"ConnectionViewSet.get_queryset - tenant_id from request: {tenant_id} (type: {type(tenant_id).__name__})")
-        logger.info(f"All connections count: {Connection.objects.count()}")
+        SECURITY: this used to filter on tenant_id alone, which meant any user
+        in a tenant could read - and `disconnect` - a colleague's Google Sheets
+        connection, because a Connection row also carries that colleague's
+        encrypted OAuth tokens. It is now scoped to (tenant_id, user_id).
+
+        Tenant administrators (common.permissions.is_admin_request: an explicit
+        is_super_admin or admin.full_access grant, never a role name) keep
+        tenant-wide visibility so they can audit and clean up connections.
+        """
+        tenant_id = getattr(self.request, 'tenant_id', None)
+        user_id = getattr(self.request, 'user_id', None)
 
         if not tenant_id:
-            logger.warning("get_queryset called without tenant_id")
+            logger.warning("ConnectionViewSet.get_queryset called without tenant_id")
             return Connection.objects.none()
 
-        # Filter by tenant_id (no conversion needed, Django handles UUID comparison)
         queryset = Connection.objects.filter(
             tenant_id=tenant_id
         ).select_related('integration')
 
-        logger.info(f"Filtered connections count: {queryset.count()}")
-        if queryset.exists():
-            for conn in queryset:
-                logger.info(f"  Found connection: id={conn.id}, name={conn.name}, status={conn.status}, tenant={conn.tenant_id}")
+        if not is_admin_request(self.request):
+            if not user_id:
+                logger.warning("ConnectionViewSet.get_queryset called without user_id")
+                return Connection.objects.none()
+            queryset = queryset.filter(user_id=user_id)
 
         return queryset
 
