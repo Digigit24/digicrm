@@ -1,6 +1,8 @@
 from datetime import timedelta
 
 from django.db import transaction
+from drf_spectacular.utils import extend_schema_field
+from drf_spectacular.types import OpenApiTypes
 from rest_framework import serializers
 
 from common.mixins import TenantMixin
@@ -152,6 +154,7 @@ class MeetingSerializer(TenantMixin):
         request = self.context.get('request')
         return getattr(request, 'user_id', None) if request else None
 
+    @extend_schema_field(OpenApiTypes.INT)
     def get_occurrence_count(self, obj):
         """Number of materialisable occurrences, or None for an open-ended series."""
         if not obj.recurrence_rule:
@@ -165,6 +168,7 @@ class MeetingSerializer(TenantMixin):
         )
         return len(occurrences)
 
+    @extend_schema_field(OpenApiTypes.OBJECT)
     def get_attendee_summary(self, obj):
         summary = {'accepted': 0, 'declined': 0, 'tentative': 0, 'needs_action': 0}
         for attendee in obj.attendees.all():
@@ -178,6 +182,7 @@ class MeetingSerializer(TenantMixin):
                 summary[key] += 1
         return summary
 
+    @extend_schema_field(OpenApiTypes.STR)
     def get_my_response(self, obj):
         viewer = self._viewer_id()
         if not viewer:
@@ -187,12 +192,14 @@ class MeetingSerializer(TenantMixin):
                 return attendee.response_status
         return None
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_can_edit(self, obj):
         request = self.context.get('request')
         if not request:
             return False
         return check_object_permission(request, obj, CRMPermissions.CRM_MEETINGS_EDIT)
 
+    @extend_schema_field(OpenApiTypes.BOOL)
     def get_can_delete(self, obj):
         request = self.context.get('request')
         if not request:

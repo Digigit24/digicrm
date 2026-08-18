@@ -19,6 +19,7 @@ MAX_RANGE_DAYS = 366
 
 _UNTIL_RE = re.compile(r'(UNTIL=)([0-9T:\-]+Z?)', re.IGNORECASE)
 _COUNT_RE = re.compile(r'(^|;)COUNT=\d+', re.IGNORECASE)
+_NAKED_OFFSET_RE = re.compile(r'(\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s(\d{2}:\d{2})$')
 
 _AVAILABLE_TIMEZONES = None
 
@@ -216,6 +217,8 @@ def parse_instant(value):
         return None
     if text.endswith('Z'):
         text = text[:-1] + '+00:00'
+    # A "+HH:MM" offset sent unencoded in a query string arrives as " HH:MM".
+    text = _NAKED_OFFSET_RE.sub(lambda m: m.group(1) + '+' + m.group(2), text)
     try:
         return to_utc(datetime.fromisoformat(text))
     except ValueError:
