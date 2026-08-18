@@ -52,7 +52,7 @@
 
 ### 1.3 Rotate MCP secret
 
-- `letmegoin@0008` has appeared in logs — rotate before production deploy
+- The previous MCP secret (`<redacted — see incident notes>`) has appeared in logs, test runs and this repo’s git history — rotate before production deploy
 - Update `MCP_SECRET` in `.env` and update any clients using it
 
 ### 1.4 Deploy to production

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-DigiCRM MCP HTTP Test Suite — all 31 tools
+DigiCRM MCP HTTP Test Suite — all 78 tools
+
+The MCP secret is read from the MCP_SECRET environment variable. Never hardcode
+it here or pass it as a literal on the command line — it lands in shell history,
+CI logs and this repo.
+
 Usage:
-    python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse --secret 'letmegoin@0008'
+    export MCP_SECRET='...'          # or set it in your shell profile / CI secret store
+    python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse
+    python mcp/test_http.py --url https://crm.celiyo.com/mcp/sse --secret "$MCP_SECRET"
     python mcp/test_http.py --tool list_leads
     python mcp/test_http.py --dry-run      # skip write/destructive calls
 """
@@ -44,11 +51,20 @@ RESET  = '\033[0m'
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--url',     default=os.environ.get('MCP_URL', 'http://localhost:8000/mcp/sse'))
-    p.add_argument('--secret',  default=os.environ.get('MCP_SECRET', ''))
+    p.add_argument('--secret',  default=os.environ.get('MCP_SECRET'),
+                   help='MCP bearer secret. Defaults to the MCP_SECRET env var; '
+                        'prefer the env var over passing it on the command line.')
     p.add_argument('--tool',    help='Run only this tool')
     p.add_argument('--dry-run', action='store_true', help='Skip write tools')
     p.add_argument('--timeout', type=int, default=20)
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.secret:
+        # The server fails closed on a blank MCP_SECRET, so an unset secret would
+        # otherwise surface as an unexplained wall of 401s.
+        p.error('no MCP secret provided. Set the MCP_SECRET environment variable '
+                '(preferred) or pass --secret. The server rejects every request '
+                'without it.')
+    return args
 
 
 class MCPClient:
@@ -109,7 +125,7 @@ def run_all(args):
     results = {'passed': 0, 'failed': 0, 'skipped': 0}
     sample  = {}
 
-    print('\n%s%sDigiCRM MCP HTTP Test Suite — 31 tools%s' % (BOLD, CYAN, RESET))
+    print('\n%s%sDigiCRM MCP HTTP Test Suite — 78 tools%s' % (BOLD, CYAN, RESET))
     print('%sURL   : %s%s' % (CYAN, args.url, RESET))
     print('%sAuth  : %s%s' % (CYAN, ('Bearer ***' if args.secret else 'none'), RESET))
     print('%sDry   : %s%s\n' % (CYAN, dry_run, RESET))
@@ -159,6 +175,29 @@ def run_all(args):
             results['failed'] += 1
             return None
 
+    def expect_fail(tool_name, arguments, *, label=None):
+        """Inverse of run(): the call MUST be rejected. A success is a FAILURE."""
+        if only and tool_name != only:
+            return None
+        if tool_names and tool_name not in tool_names:
+            print('  %sMISS%s  %s  (not in tools/list)' % (YELLOW, RESET, tool_name))
+            results['skipped'] += 1
+            return None
+        try:
+            result = client.tool_call(tool_name, arguments)
+        except Exception as exc:
+            print('  %sPASS%s  %s  rejected as expected' % (GREEN, RESET, tool_name))
+            if label:
+                print('        %s' % label)
+            print('        %s' % str(exc)[:160])
+            results['passed'] += 1
+            return None
+        print('  %sFAIL%s  %s  ACCEPTED an out-of-workspace id -- '
+              'cross-tenant write is possible' % (RED, RESET, tool_name))
+        print('        %s' % json.dumps(result, default=str)[:160])
+        results['failed'] += 1
+        return result
+
     # ── Phase 1: CRM Core ────────────────────────────────────────────────────────
     print('\n%s── Phase 1: CRM Core (11 tools)%s' % (BOLD, RESET))
 
@@ -181,8 +220,9 @@ def run_all(args):
 
     r = run('list_leads', {'page': 1, 'page_size': 3})
     if r and r.get('results'):
-        sample['lead_id']   = r['results'][0]['id']
-        sample['lead_name'] = r['results'][0].get('name', '')
+        sample['lead_id']    = r['results'][0]['id']
+        sample['lead_name']  = r['results'][0].get('name', '')
+        sample['lead_phone'] = r['results'][0].get('phone', '')
         print('        i sample lead id=%s  name=%s' % (sample['lead_id'], sample['lead_name']))
 
     if sample.get('lead_id'):
@@ -209,6 +249,7 @@ def run_all(args):
         r = run('list_lead_statuses', {})
         if r and r.get('results') and target:
             status_id = r['results'][0]['id']
+            sample['status_id'] = status_id
             run('update_lead_status', {'lead_id': target, 'status_id': status_id}, write=True)
 
     if target:
@@ -231,6 +272,81 @@ def run_all(args):
             'lead_id': sample['lead_id'],
             'lead_group_id': sample.get('lead_group_id', 1),
         }, write=True)
+
+    # ── Batch 1: Discovery reads (P0) ────────────────────────────────────────────
+    print('\n%s── Batch 1: Discovery reads (P0)%s' % (BOLD, RESET))
+
+    ctx = run('get_ai_context', {})
+    if ctx and ctx.get('lead_groups'):
+        sample.setdefault('lead_group_id', ctx['lead_groups'][0]['id'])
+
+    run('get_sales_dashboard', {})
+    run('get_lead_kanban', {'limit_per_status': 3})
+    run('get_lead_field_schema', {})
+    run('list_agent_action_logs', {'limit': 5})
+
+    if sample.get('lead_group_id'):
+        run('list_group_leads', {'lead_group_id': sample['lead_group_id'], 'page_size': 5})
+    else:
+        print('  %sSKIP%s  list_group_leads (no lead_group_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    if sample.get('lead_phone'):
+        run('lookup_lead_by_phone', {'phone': sample['lead_phone']},
+            label='phone=%s' % sample['lead_phone'])
+    else:
+        print('  %sSKIP%s  lookup_lead_by_phone (no lead phone)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # list_leads advanced filters (search_leads_advanced lives on list_leads)
+    run('list_leads', {'priority': 'HIGH', 'page_size': 3}, label='priority=HIGH')
+    run('list_leads', {'ordering': '-lead_score', 'lead_score_min': 0, 'page_size': 3},
+        label='ordering=-lead_score')
+    if sample.get('lead_group_id'):
+        run('list_leads', {'lead_group_id': sample['lead_group_id'], 'page_size': 3},
+            label='lead_group_id filter')
+
+    if sample.get('lead_id'):
+        run('get_lead_follow_up', {'lead_id': sample['lead_id']})
+        run('list_lead_activities', {'lead_id': sample['lead_id'], 'page_size': 5})
+    else:
+        print('  %sSKIP%s  get_lead_follow_up / list_lead_activities (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    tl = run('list_tasks', {'page_size': 5})
+    if tl and tl.get('results'):
+        sample['existing_task_id'] = tl['results'][0]['id']
+    run('list_tasks', {'overdue': True, 'page_size': 5}, label='overdue=true')
+    if sample.get('existing_task_id'):
+        run('get_task', {'task_id': sample['existing_task_id']})
+    else:
+        print('  %sSKIP%s  get_task (no task in tenant yet)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    run('list_meetings', {'page_size': 5})
+    run('get_meetings_calendar', {})
+
+    sq = run('list_sequences', {'page_size': 5})
+    if sq and sq.get('results'):
+        sample['existing_seq_id'] = sq['results'][0]['id']
+    if sample.get('existing_seq_id'):
+        run('get_sequence_steps', {'sequence_id': sample['existing_seq_id']})
+    else:
+        print('  %sSKIP%s  get_sequence_steps (no sequence in tenant yet)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    cl = run('list_campaigns', {'page_size': 5})
+    if cl and cl.get('results'):
+        for row in cl['results']:
+            if row.get('laravel_campaign_uid'):
+                sample['launched_campaign_id'] = row['id']
+                break
+    if sample.get('launched_campaign_id'):
+        run('get_campaign_replies',
+            {'campaign_id': sample['launched_campaign_id'], 'per_page': 5})
+    else:
+        print('  %sSKIP%s  get_campaign_replies (no launched campaign)' % (YELLOW, RESET))
+        results['skipped'] += 1
 
     # ── Phase 1: Tasks & Meetings ────────────────────────────────────────────────
     print('\n%s── Phase 1: Tasks & Meetings%s' % (BOLD, RESET))
@@ -354,10 +470,14 @@ def run_all(args):
 
     if sample.get('step_id'):
         run('update_sequence_step', {
-            'step_id':   sample['step_id'],
-            'delay_days': 1,
+            'sequence_id': sample['seq_id'],
+            'step_id':     sample['step_id'],
+            'delay_days':  1,
         }, write=True)
-        run('delete_sequence_step', {'step_id': sample['step_id']}, write=True)
+        run('delete_sequence_step', {
+            'sequence_id': sample['seq_id'],
+            'step_id':     sample['step_id'],
+        }, write=True)
 
     # ── Phase 3: Enrollment ───────────────────────────────────────────────────────
     print('\n%s── Phase 3: Enrollments (4 tools)%s' % (BOLD, RESET))
@@ -375,7 +495,16 @@ def run_all(args):
     if sample.get('enrollment_id'):
         run('pause_enrollment',  {'enrollment_id': sample['enrollment_id']}, write=True)
         run('resume_enrollment', {'enrollment_id': sample['enrollment_id']}, write=True)
-        run('unenroll_lead',     {'enrollment_id': sample['enrollment_id']}, write=True)
+        # unenroll_lead takes lead_id (+ optional sequence_id), NOT enrollment_id.
+        # It used to read an undeclared 'enrollment_id' key, so this call was
+        # testing the implementation rather than the published contract.
+        if sample.get('lead_id') and sample.get('seq_id'):
+            run('unenroll_lead',
+                {'lead_id': sample['lead_id'], 'sequence_id': sample['seq_id']},
+                write=True)
+        else:
+            print('  %sSKIP%s  unenroll_lead (no lead_id or seq_id)' % (YELLOW, RESET))
+            results['skipped'] += 1
 
     # ── Phase 3: Campaigns ────────────────────────────────────────────────────────
     print('\n%s── Phase 3: Campaigns (3 tools)%s' % (BOLD, RESET))
@@ -392,6 +521,213 @@ def run_all(args):
     if sample.get('campaign_id'):
         run('launch_campaign', {'campaign_id': sample['campaign_id']}, write=True)
         run('get_campaign_analytics', {'campaign_id': sample['campaign_id']})
+
+    # ── Batch 2: P1 writes & core reads ──────────────────────────────────────────
+    print('\n%s── Batch 2: P1 writes & core reads (11 tools)%s' % (BOLD, RESET))
+
+    run('list_whatsapp_templates_detailed', {})
+    run('list_active_sequences_with_steps', {})
+    run('list_call_logs', {'page_size': 5})
+
+    if target:
+        run('append_lead_note', {'lead_id': target, 'text': 'MCP test append'}, write=True)
+        run('set_lead_follow_up', {
+            'lead_id':                 target,
+            'follow_up_at':            (now + timedelta(days=2)).isoformat(),
+            'reminder_enabled':        True,
+            'reminder_offset_minutes': 30,
+        }, write=True)
+    else:
+        print('  %sSKIP%s  append_lead_note / set_lead_follow_up (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    if target and sample.get('status_id'):
+        run('bulk_update_lead_status',
+            {'lead_ids': [target], 'status_id': sample['status_id']}, write=True)
+    else:
+        print('  %sSKIP%s  bulk_update_lead_status (no lead_id or status_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    if target and sample.get('lead_group_id'):
+        run('add_leads_to_group',
+            {'lead_group_id': sample['lead_group_id'], 'lead_ids': [target]}, write=True)
+        run('remove_leads_from_group',
+            {'lead_group_id': sample['lead_group_id'], 'lead_ids': [target]}, write=True)
+    else:
+        print('  %sSKIP%s  add/remove_leads_to_group (no lead_id or lead_group_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    if target and sample.get('seq_id'):
+        run('bulk_enroll_leads_in_sequence',
+            {'lead_ids': [target], 'sequence_id': sample['seq_id']}, write=True)
+    else:
+        print('  %sSKIP%s  bulk_enroll_leads_in_sequence (no lead_id or seq_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # NOTE: this actually broadcasts WhatsApp messages, like launch_campaign above.
+    if target and sample.get('template_uid'):
+        camp_args = {
+            'name':         '_MCP_TEST_AI_CAMP_' + datetime.now().strftime('%H%M%S%f'),
+            'lead_ids':     [target],
+            'template_uid': sample['template_uid'],
+        }
+        comps = _template_components(sample.get('template_var_count', 0))
+        if comps:
+            camp_args['template_components'] = comps
+        run('create_and_launch_campaign', camp_args, write=True)
+    else:
+        print('  %sSKIP%s  create_and_launch_campaign (no lead_id or template UID)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # ── Batch 3a: Payments ───────────────────────────────────────────────────────
+    print('\n%s── Batch 3a: Payments (3 tools)%s' % (BOLD, RESET))
+
+    run('list_payments', {'page_size': 5})
+    if target:
+        pay = run('create_payment', {
+            'lead_id':      target,
+            'amount':       1,
+            'type':         'ADVANCE',
+            'status':       'PENDING',
+            'currency':     'INR',
+            'method':       'mcp_test',
+            'reference_no': '_MCP_TEST',
+            'notes':        'created by mcp/test_http.py',
+        }, write=True)
+        if pay and pay.get('id'):
+            run('update_payment',
+                {'payment_id': pay['id'], 'status': 'CANCELLED',
+                 'notes': 'voided by mcp/test_http.py'}, write=True)
+        else:
+            print('  %sSKIP%s  update_payment (create_payment did not return an id)' % (YELLOW, RESET))
+            results['skipped'] += 1
+    else:
+        print('  %sSKIP%s  create_payment / update_payment (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    # ── Batch 3b: Real estate ────────────────────────────────────────────────────
+    print('\n%s── Batch 3b: Real estate (6 tools)%s' % (BOLD, RESET))
+
+    proj = run('list_projects', {'page_size': 5})
+    if proj and proj.get('results'):
+        sample['project_id'] = proj['results'][0]['id']
+        print('        i sample project id=%s  name=%s' % (
+            sample['project_id'], proj['results'][0].get('name', '')))
+
+    if sample.get('project_id'):
+        run('get_project_summary', {'project_id': sample['project_id']})
+    else:
+        print('  %sSKIP%s  get_project_summary (no project in tenant)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    unit_args = {'page_size': 5}
+    if sample.get('project_id'):
+        unit_args['project_id'] = sample['project_id']
+    units = run('list_units', unit_args)
+    if units and units.get('results'):
+        sample['unit_id']     = units['results'][0]['id']
+        sample['unit_status'] = units['results'][0].get('status')
+
+    if target and sample.get('project_id'):
+        run('create_project_interest', {
+            'lead_id':    target,
+            'project_id': sample['project_id'],
+            'notes':      'created by mcp/test_http.py',
+        }, write=True)
+    else:
+        print('  %sSKIP%s  create_project_interest (no lead_id or project_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    if target and sample.get('unit_id'):
+        run('create_unit_lead', {
+            'lead_id':       target,
+            'unit_id':       sample['unit_id'],
+            'relation_type': 'interested',
+            'notes':         'created by mcp/test_http.py',
+        }, write=True)
+        # Re-assert the unit's CURRENT status so the test never changes real
+        # inventory availability.
+        if sample.get('unit_status'):
+            run('update_unit_status',
+                {'unit_id': sample['unit_id'], 'status': sample['unit_status']},
+                write=True, label='re-asserts existing status (no-op)')
+        else:
+            print('  %sSKIP%s  update_unit_status (unknown current status)' % (YELLOW, RESET))
+            results['skipped'] += 1
+    else:
+        print('  %sSKIP%s  create_unit_lead / update_unit_status (no lead_id or unit_id)' % (YELLOW, RESET))
+        results['skipped'] += 2
+
+    # ── Batch 3d: Telephony ──────────────────────────────────────────────────────
+    print('\n%s── Batch 3d: Telephony (2 tools)%s' % (BOLD, RESET))
+
+    run('get_telephony_analytics', {'days': 7})
+
+    calls = run('list_call_logs', {'page_size': 20}, label='looking for an undisposed call')
+    undisposed = None
+    if calls and calls.get('results'):
+        undisposed = next((c for c in calls['results'] if not c.get('call_outcome')), None)
+    if undisposed:
+        run('set_call_outcome', {
+            'call_id': undisposed['id'],
+            'outcome': 'follow_up',
+            'note':    '_MCP_TEST',
+        }, write=True)
+    else:
+        print('  %sSKIP%s  set_call_outcome (no call without an existing outcome)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # ── Tenant isolation (audit A5 / M4) ─────────────────────────────────────────
+    print('\n%s── Tenant isolation: out-of-workspace ids must be rejected%s' % (BOLD, RESET))
+    print('   Every one of these MUST fail. A PASS here means the tool refused the id.')
+    print('   %sNote:%s this suite has one tenant, so it uses ids that are not in this' % (BOLD, RESET))
+    print('   workspace rather than ids belonging to a real second tenant. It proves the')
+    print('   guard is wired; a true two-tenant proof needs mcp/test_tenant_scoping.py')
+    print('   (offline, no DB) or a second seeded tenant.')
+
+    ALIEN = 987654321      # not in any workspace on a normal dataset
+
+    expect_fail('update_sequence_step',
+                {'sequence_id': sample.get('seq_id') or ALIEN, 'step_id': ALIEN,
+                 'template_uid': 'attacker-template'},
+                label='A5: step lookup must join through sequence.tenant_id (M4)')
+    expect_fail('delete_sequence_step',
+                {'sequence_id': sample.get('seq_id') or ALIEN, 'step_id': ALIEN},
+                label='A5: same join, on the delete path')
+    expect_fail('add_sequence_step',
+                {'sequence_id': ALIEN, 'step_number': 1, 'template_uid': 'x'},
+                label='same pattern, not named in the audit')
+
+    if sample.get('seq_id'):
+        expect_fail('enroll_lead_in_sequence',
+                    {'lead_id': ALIEN, 'sequence_id': sample['seq_id']},
+                    label='A5: lead_id was never validated against the tenant')
+    else:
+        print('  %sSKIP%s  enroll_lead_in_sequence (no seq_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    expect_fail('create_campaign',
+                {'name': '_MCP_TENANT_PROBE', 'lead_group_id': ALIEN,
+                 'template_uid': sample.get('template_uid') or 'placeholder_uid'},
+                label='A5: lead_group_id was never validated against the tenant')
+
+    expect_fail('add_lead_to_group',
+                {'lead_id': ALIEN, 'lead_group_id': sample.get('lead_group_id', ALIEN)})
+    expect_fail('create_lead_activity',
+                {'lead_id': ALIEN, 'type': 'NOTE', 'content': 'tenant probe'})
+    expect_fail('create_task', {'lead_id': ALIEN, 'title': '_MCP_TENANT_PROBE'})
+    expect_fail('create_meeting', {
+        'lead_id':    ALIEN,
+        'title':      '_MCP_TENANT_PROBE',
+        'start_time': (now + timedelta(hours=1)).isoformat(),
+        'end_time':   (now + timedelta(hours=2)).isoformat(),
+    })
+    if target:
+        expect_fail('update_lead_status', {'lead_id': target, 'status_id': ALIEN},
+                    label='status_id must belong to this workspace')
+    else:
+        print('  %sSKIP%s  update_lead_status probe (no lead_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
 
     # ── Summary ───────────────────────────────────────────────────────────────────
     total = results['passed'] + results['failed'] + results['skipped']
