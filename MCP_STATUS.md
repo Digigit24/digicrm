@@ -105,12 +105,12 @@ All under base path `/api/` · Auth: JWT Bearer token
 | GET | `/api/whatsapp/campaigns/{id}/analytics/` | Delivery analytics |
 | GET | `/api/whatsapp/campaigns/{id}/replies/` | Inbound replies |
 | GET/POST | `/api/whatsapp/sequences/` | Sequence CRUD |
-| POST | `/api/whatsapp/sequences/{id}/add-step/` | Add step |
-| PATCH | `/api/whatsapp/sequences/{id}/update-step/{step_id}/` | Edit step |
-| DELETE | `/api/whatsapp/sequences/{id}/delete-step/{step_id}/` | Delete step |
+| POST | `/api/whatsapp/sequences/{id}/steps/add/` | Add step |
+| PUT/PATCH | `/api/whatsapp/sequences/{id}/steps/{step_id}/` | Edit step |
+| DELETE | `/api/whatsapp/sequences/{id}/steps/{step_id}/delete/` | Delete step |
 | GET | `/api/whatsapp/leads/{lead_id}/chat/` | WA chat history |
 | POST | `/api/whatsapp/leads/{lead_id}/send/` | Send template msg |
-| POST | `/api/whatsapp/leads/{lead_id}/send-text/` | Send text msg |
+| POST | `/api/whatsapp/leads/{lead_id}/send_text/` | Send text msg |
 | PATCH | `/api/whatsapp/enrollments/{id}/` | Pause/resume/cancel enrolment |
 
 ### Agent endpoints (`/api/whatsapp/agent/`)

@@ -311,6 +311,24 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             'errors': errors,
         }
 
+    # ── list_lead_groups ─────────────────────────────────────────
+    if name == 'list_lead_groups':
+        from django.db.models import Count
+        qs = LeadGroup.objects.filter(tenant_id=TENANT_ID).annotate(
+            lead_count=Count('memberships')
+        )
+        search = (args.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        page      = max(int(args.get('page', 1)), 1)
+        page_size = min(max(int(args.get('page_size', 50)), 1), 200)
+        offset    = (page - 1) * page_size
+        total     = qs.count()
+        rows = list(qs.order_by('name').values(
+            'id', 'name', 'description', 'color_hex', 'lead_count', 'created_at',
+        )[offset:offset + page_size])
+        return {'count': total, 'page': page, 'page_size': page_size, 'results': rows}
+
     # -- create_lead_group --
     if name == 'create_lead_group':
         group = LeadGroup.objects.create(

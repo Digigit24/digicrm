@@ -1,18 +1,39 @@
 #!/usr/bin/env python3
 """
-DigiCRM Sales Agent MCP Server
+DigiCRM Sales Agent MCP Server — tool catalog (TOOLS)
 
-Provides 31 tools for a Claude sales agent to interact with DigiCRM:
-  Phase 1 (10) — CRM core: leads, tasks, activities, meetings, status
+Registers 40 tools for a Claude sales agent to interact with DigiCRM:
+  Phase 1 (18) — CRM core: leads, groups, tasks, activities, meetings, status
   Phase 2 (10) — WhatsApp messaging: send, chat, sequences, inbox ops
   Phase 3 (11) — Automation: sequences, enrollments, campaigns
+  Phase 4 (1)  — Discovery reads
 
-Transport: stdio (run as subprocess by Claude Desktop / Claude Code)
+The authoritative count is always ``len(TOOLS)``; ``GET /mcp/health`` reports it.
 
-Usage:
+-----------------------------------------------------------------------------
+SUPPORTED EXECUTION PATH — HTTP only
+-----------------------------------------------------------------------------
+The only supported dispatcher is ``mcp/django_view.py::_dispatch_tool``, served
+at ``POST /mcp/sse`` (and ``/mcp/message``). It runs inside Django and hits the
+ORM directly. New tools are implemented there, and only there.
+
+This module still owns ``TOOLS`` — ``django_view.py`` imports it verbatim for
+``tools/list`` — so registering a tool schema here is step 1 of 2 for every new
+tool.
+
+.. deprecated::
+   ``_dispatch`` / ``execute_tool`` / ``run_stdio`` below (the stdio transport
+   that proxies to the REST API through ``mcp/client.py``) are DEPRECATED and
+   unmaintained. They are kept only so existing Claude Desktop stdio configs do
+   not hard-crash. They cover the original 39 tools only; every tool added after
+   2026-08-19 is HTTP-only and ``_dispatch`` will raise "Unknown tool" for it.
+   Do NOT add new tools to ``_dispatch``. Do not delete it without first
+   migrating any remaining stdio consumers to the HTTP endpoint.
+
+Usage (deprecated stdio transport):
   python -m mcp.server
 
-Required env vars (see mcp/config.py):
+Required env vars for the deprecated stdio path (see mcp/config.py):
   DIGICRM_BASE_URL, DIGICRM_JWT_TOKEN, DIGICRM_TENANT_ID
 
 Optional:
@@ -211,6 +232,20 @@ Returns per-lead success/failure counts.
     'lead_ids':    {'type': 'array', 'items': {'type': 'integer'}, 'description': 'IDs of the leads to assign'},
     'assigned_to': {'type': ['string', 'null'], 'description': 'User UUID to assign all leads to, or null to unassign'},
 }, ['lead_ids', 'assigned_to'])
+
+_tool('list_lead_groups', """
+List CRM lead groups (lists/segments) for this workspace.
+
+Returns id, name, description, color_hex and lead_count for each group,
+paginated.
+Use a group's id as lead_group_id when calling add_lead_to_group,
+add_leads_to_group, remove_leads_from_group, list_group_leads or
+create_campaign.
+""", {
+    'search':    {'type': 'string',  'description': 'Filter by group name or description (partial match)'},
+    'page':      {'type': 'integer', 'description': 'Page number (default 1)'},
+    'page_size': {'type': 'integer', 'description': 'Results per page (default 50, max 200)'},
+})
 
 _tool('create_lead_group', """
 Create a new CRM lead group (list/segment).
@@ -558,7 +593,14 @@ def execute_tool(name: str, args: dict) -> str:
 
 
 def _dispatch(name: str, args: dict) -> Any:  # noqa: C901
-    """Route tool name → digicrm API call."""
+    """DEPRECATED — stdio/REST dispatcher. Route tool name → digicrm REST call.
+
+    Superseded by ``mcp/django_view.py::_dispatch_tool`` (the HTTP path served
+    at ``POST /mcp/sse``), which is the single supported dispatcher. This
+    function covers only the original 39 tools; anything registered in TOOLS
+    after 2026-08-19 falls through to "Unknown tool". Do not add new tools
+    here — see the module docstring.
+    """
 
     # ---- PHASE 1 ----
 
