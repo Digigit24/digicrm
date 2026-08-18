@@ -15,11 +15,14 @@ How a Hermes (Nous Research) agent connects to the live DigiCRM MCP server and c
 | JSON-RPC endpoint | `POST https://crm.celiyo.com/mcp/sse` |
 | SSE stream (optional) | `GET https://crm.celiyo.com/mcp/sse` |
 | Health check | `GET https://crm.celiyo.com/mcp/health` |
-| Auth header | `Authorization: Bearer <MCP_SECRET>` |
-| Auth fallback | `?secret=<MCP_SECRET>` query param |
+| Auth header | `Authorization: Bearer <MCP_SECRET>` (**the only accepted method**) |
+| ~~Auth fallback~~ | ~~`?secret=<MCP_SECRET>` query param~~ **REMOVED 2026-08-19** — a secret in a URL lands in access logs, proxy logs, browser history and `Referer` headers. Requests using it now get 401; send the header instead. |
+| Allowed browser origins | `MCP_ALLOWED_ORIGINS` env var (comma-separated). Defaults to claude.ai + celiyo.com. Server-to-server clients send no `Origin` and are unaffected. |
 | Content-Type | `application/json` |
 
 Auth is a single shared secret (`MCP_SECRET`), **not** per-user OAuth. Keep it server-side; never expose it to the model or in client code shipped to users.
+
+If `MCP_SECRET` is unset the server **fails closed** and rejects every request with 401 — it no longer runs unauthenticated.
 
 > The simplest integration is **plain `POST /mcp/sse`** with a JSON-RPC body. You do not need the SSE stream — that exists only for UI connectors (Claude Desktop etc.). Hermes should POST directly.
 

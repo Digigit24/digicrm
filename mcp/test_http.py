@@ -175,6 +175,29 @@ def run_all(args):
             results['failed'] += 1
             return None
 
+    def expect_fail(tool_name, arguments, *, label=None):
+        """Inverse of run(): the call MUST be rejected. A success is a FAILURE."""
+        if only and tool_name != only:
+            return None
+        if tool_names and tool_name not in tool_names:
+            print('  %sMISS%s  %s  (not in tools/list)' % (YELLOW, RESET, tool_name))
+            results['skipped'] += 1
+            return None
+        try:
+            result = client.tool_call(tool_name, arguments)
+        except Exception as exc:
+            print('  %sPASS%s  %s  rejected as expected' % (GREEN, RESET, tool_name))
+            if label:
+                print('        %s' % label)
+            print('        %s' % str(exc)[:160])
+            results['passed'] += 1
+            return None
+        print('  %sFAIL%s  %s  ACCEPTED an out-of-workspace id -- '
+              'cross-tenant write is possible' % (RED, RESET, tool_name))
+        print('        %s' % json.dumps(result, default=str)[:160])
+        results['failed'] += 1
+        return result
+
     # ── Phase 1: CRM Core ────────────────────────────────────────────────────────
     print('\n%s── Phase 1: CRM Core (11 tools)%s' % (BOLD, RESET))
 
@@ -639,6 +662,56 @@ def run_all(args):
         }, write=True)
     else:
         print('  %sSKIP%s  set_call_outcome (no call without an existing outcome)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    # ── Tenant isolation (audit A5 / M4) ─────────────────────────────────────────
+    print('\n%s── Tenant isolation: out-of-workspace ids must be rejected%s' % (BOLD, RESET))
+    print('   Every one of these MUST fail. A PASS here means the tool refused the id.')
+    print('   %sNote:%s this suite has one tenant, so it uses ids that are not in this' % (BOLD, RESET))
+    print('   workspace rather than ids belonging to a real second tenant. It proves the')
+    print('   guard is wired; a true two-tenant proof needs mcp/test_tenant_scoping.py')
+    print('   (offline, no DB) or a second seeded tenant.')
+
+    ALIEN = 987654321      # not in any workspace on a normal dataset
+
+    expect_fail('update_sequence_step',
+                {'step_id': ALIEN, 'template_uid': 'attacker-template'},
+                label='A5: step lookup must join through sequence.tenant_id (M4)')
+    expect_fail('delete_sequence_step', {'step_id': ALIEN},
+                label='A5: same join, on the delete path')
+    expect_fail('add_sequence_step',
+                {'sequence_id': ALIEN, 'step_number': 1, 'template_uid': 'x'},
+                label='same pattern, not named in the audit')
+
+    if sample.get('seq_id'):
+        expect_fail('enroll_lead_in_sequence',
+                    {'lead_id': ALIEN, 'sequence_id': sample['seq_id']},
+                    label='A5: lead_id was never validated against the tenant')
+    else:
+        print('  %sSKIP%s  enroll_lead_in_sequence (no seq_id)' % (YELLOW, RESET))
+        results['skipped'] += 1
+
+    expect_fail('create_campaign',
+                {'name': '_MCP_TENANT_PROBE', 'lead_group_id': ALIEN,
+                 'template_uid': sample.get('template_uid') or 'placeholder_uid'},
+                label='A5: lead_group_id was never validated against the tenant')
+
+    expect_fail('add_lead_to_group',
+                {'lead_id': ALIEN, 'lead_group_id': sample.get('lead_group_id', ALIEN)})
+    expect_fail('create_lead_activity',
+                {'lead_id': ALIEN, 'type': 'NOTE', 'content': 'tenant probe'})
+    expect_fail('create_task', {'lead_id': ALIEN, 'title': '_MCP_TENANT_PROBE'})
+    expect_fail('create_meeting', {
+        'lead_id':    ALIEN,
+        'title':      '_MCP_TENANT_PROBE',
+        'start_time': (now + timedelta(hours=1)).isoformat(),
+        'end_time':   (now + timedelta(hours=2)).isoformat(),
+    })
+    if target:
+        expect_fail('update_lead_status', {'lead_id': target, 'status_id': ALIEN},
+                    label='status_id must belong to this workspace')
+    else:
+        print('  %sSKIP%s  update_lead_status probe (no lead_id)' % (YELLOW, RESET))
         results['skipped'] += 1
 
     # ── Summary ───────────────────────────────────────────────────────────────────

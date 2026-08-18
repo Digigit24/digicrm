@@ -11,7 +11,10 @@ database; they were verified offline (see *Verification status* below).
 ## MCP Server
 
 - **Endpoint:** `POST /mcp/sse`  
-- **Auth:** `Authorization: Bearer <MCP_SECRET>`  
+- **Auth:** `Authorization: Bearer <MCP_SECRET>` — header only. The `?secret=` query
+  parameter was removed 2026-08-19 and now returns 401.  
+- **CORS:** restricted to `MCP_ALLOWED_ORIGINS` (defaults to claude.ai + celiyo.com);
+  previously `*`.  
 - **Protocol:** MCP Streamable HTTP 2025-03-26 (JSON-RPC 2.0)  
 - **Tools registered:** 78
 
@@ -280,6 +283,11 @@ All under base path `/api/` · Auth: JWT Bearer token
 | Unauthenticated / wrong-secret request | 401 |
 | Blank `MCP_SECRET` | 401 (fail closed) |
 | Live `tools/call` against a database | **not run** — no local database available |
+| `python mcp/test_tenant_scoping.py` (offline, no DB) | 27 passed · 0 failed |
+| Cross-tenant id rejected by all 4 tools named in audit A5 | proven offline with faked managers |
+| `WhatsAppSequenceStep` scoped via `sequence__tenant_id`, never a bare `tenant_id` | asserted |
+| `?secret=` query parameter rejected even with the correct value | pass |
+| Unknown browser `Origin` receives no `Access-Control-Allow-Origin` | pass |
 
 ---
 
@@ -374,6 +382,17 @@ And earlier where `t_uid` is set, also do `sample['template_uid'] = t_uid`.
   in test runs and session logs. Change it in `.env` and restart the service.
 - [ ] **Add `DIGICRM_TENANT_ID` and `MCP_OWNER_USER_ID` to the production `.env`** if not
   already there. Several tools raise `RuntimeError` without them.
+- [x] **Cross-tenant writes closed (audit A5 / M4).** Eleven dispatch branches looked a
+  row up by primary key with no tenant predicate, so an id from another workspace was
+  written to or read. All now resolve through `_require(model, id, label, **scope)`,
+  which raises a readable error instead. `WhatsAppSequenceStep` has no `tenant_id`
+  column of its own (audit M4), so it is scoped by joining to its parent sequence
+  (`sequence__tenant_id=TENANT_ID`) rather than by adding a migration.
+- [x] **`?secret=` query-parameter auth removed.** Header-only. Secrets in URLs land in
+  access logs, proxies and browser history. A request still using it is refused and
+  logs a warning naming the replacement.
+- [x] **CORS narrowed from `*` to an allowlist** (`MCP_ALLOWED_ORIGINS`). An unknown
+  `Origin` now receives no `Access-Control-Allow-Origin` header at all.
 - [ ] **Standing gap — no RBAC on the MCP HTTP path.** `_dispatch_tool` talks to the ORM
   directly, so DRF's `HasCRMPermission` / `HasDigiPermission` never run. Every write tool
   (including payments and real-estate inventory) is guarded only by the shared

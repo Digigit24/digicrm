@@ -22,9 +22,41 @@ TENANT_ID     = _cfg('DIGICRM_TENANT_ID', '').strip()
 OWNER_USER_ID = _cfg('MCP_OWNER_USER_ID', '').strip()
 MCP_CLIENT_ID = 'digicrm-mcp'
 
+# Browser origins allowed to call the MCP endpoint. Previously this was '*',
+# which let any page on the internet script a cross-origin request against the
+# endpoint. Override with a comma-separated MCP_ALLOWED_ORIGINS env var.
+#
+# Note: server-to-server MCP clients (curl, the Claude remote-MCP connector,
+# the stdio bridge) send no Origin header at all. CORS does not apply to them,
+# so they are unaffected by this list — it only constrains browsers.
+_DEFAULT_MCP_ORIGINS = (
+    'https://claude.ai',
+    'https://www.claude.ai',
+    'https://crm.celiyo.com',
+    'https://admin.celiyo.com',
+)
+MCP_ALLOWED_ORIGINS = tuple(
+    o.strip().rstrip('/')
+    for o in _cfg('MCP_ALLOWED_ORIGINS', '').split(',')
+    if o.strip()
+) or _DEFAULT_MCP_ORIGINS
 
-def _cors(response):
-    response['Access-Control-Allow-Origin']  = '*'
+
+def _cors(response, request=None):
+    """Attach CORS headers, restricted to MCP_ALLOWED_ORIGINS.
+
+    An unrecognised Origin gets NO Access-Control-Allow-Origin header, so the
+    browser blocks the response. A request with no Origin (non-browser client)
+    also gets no header, because CORS is not involved.
+    """
+    origin = ''
+    if request is not None:
+        origin = (request.headers.get('Origin') or '').strip().rstrip('/')
+    if origin and origin in MCP_ALLOWED_ORIGINS:
+        response['Access-Control-Allow-Origin'] = origin
+    elif origin:
+        logger.warning('MCP CORS: rejected origin %r', origin)
+    response['Vary']                         = 'Origin'
     response['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     response['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
     return response
@@ -45,10 +77,20 @@ def _check_auth(request) -> bool:
             'Set MCP_SECRET in the environment to enable the MCP endpoint.'
         )
         return False
+    if 'secret' in request.GET:
+        # Removed on purpose: a secret in the query string is written to access
+        # logs, proxy logs, browser history and Referer headers.
+        logger.warning(
+            'MCP auth: ?secret= query parameter is no longer accepted; '
+            'send Authorization: Bearer <MCP_SECRET> instead.'
+        )
     auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer ') and auth[7:].strip() == MCP_SECRET:
-        return True
-    return request.GET.get('secret', '') == MCP_SECRET
+    if not auth.startswith('Bearer '):
+        return False
+    # Compare as bytes: secrets.compare_digest() raises TypeError on str
+    # operands that are not ASCII-only.
+    return secrets.compare_digest(
+        auth[7:].strip().encode('utf-8'), MCP_SECRET.encode('utf-8'))
 
 
 def oauth_well_known(request):
@@ -62,7 +104,7 @@ def oauth_well_known(request):
         'grant_types_supported':                 ['authorization_code', 'client_credentials'],
         'token_endpoint_auth_methods_supported': ['client_secret_post', 'client_secret_basic'],
         'code_challenge_methods_supported':      ['S256'],
-    }))
+    }), request)
 
 
 def oauth_protected_resource(request, path=''):
@@ -71,26 +113,26 @@ def oauth_protected_resource(request, path=''):
         'resource':                f'{base}/mcp/sse',
         'authorization_servers':   [base],
         'bearer_methods_supported':['header'],
-    }))
+    }), request)
 
 
 @csrf_exempt
 def oauth_register(request):
     if request.method == 'OPTIONS':
-        return _cors(HttpResponse())
+        return _cors(HttpResponse(), request)
     return _cors(JsonResponse({
         'client_id':                     MCP_CLIENT_ID,
         'client_secret':                 MCP_SECRET or 'configure-MCP_SECRET-env-var',
         'client_name':                   'DigiCRM MCP',
         'grant_types':                   ['client_credentials'],
         'token_endpoint_auth_method':    'client_secret_post',
-    }, status=201))
+    }, status=201), request)
 
 
 @csrf_exempt
 def oauth_token(request):
     if request.method == 'OPTIONS':
-        return _cors(HttpResponse())
+        return _cors(HttpResponse(), request)
     try:
         body = (json.loads(request.body) if request.content_type and 'json' in request.content_type
                 else request.POST.dict() or json.loads(request.body or '{}'))
@@ -102,14 +144,14 @@ def oauth_token(request):
         logger.error('MCP_SECRET is not configured — refusing to issue an OAuth token.')
         return _cors(JsonResponse({'error': 'server_error',
                                    'error_description': 'MCP_SECRET is not configured'},
-                                  status=503))
+                                  status=503), request)
     if client_secret != MCP_SECRET:
-        return _cors(JsonResponse({'error': 'invalid_client'}, status=401))
+        return _cors(JsonResponse({'error': 'invalid_client'}, status=401), request)
     return _cors(JsonResponse({
         'access_token': MCP_SECRET,
         'token_type':   'bearer',
         'expires_in':   31536000,
-    }))
+    }), request)
 
 
 @csrf_exempt
@@ -138,6 +180,29 @@ def oauth_authorize(request):
         '</form></body></html>'
     )
     return HttpResponse(html)
+
+
+def _require(model, obj_id, label, **scope):
+    """Resolve `obj_id` inside `scope` or raise. NEVER fetch by bare primary key.
+
+    Every id in `args` is model-supplied and therefore untrusted. The MCP HTTP
+    path talks to the ORM directly, so DRF's tenant mixins and permission
+    classes never run: an `.objects.get(pk=...)` with no tenant filter is a
+    cross-tenant read or write (audit finding A5).
+
+    `scope` is the tenant predicate. It is usually ``tenant_id=TENANT_ID``, but
+    for a model with no tenant column of its own -- WhatsAppSequenceStep -- it
+    joins to the owning row instead, e.g. ``sequence__tenant_id=TENANT_ID``
+    (audit finding M4). Adding the column would need a migration, which this
+    layer must not do.
+    """
+    if obj_id is None:
+        raise RuntimeError('%s id is required' % label)
+    obj = model.objects.filter(pk=obj_id, **scope).first()
+    if obj is None:
+        raise RuntimeError(
+            '%s %s does not exist in this workspace.' % (label, obj_id))
+    return obj
 
 
 def _paginate(args: dict, default_size: int = 50, max_size: int = 200):
@@ -425,6 +490,9 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     # ── update_lead_status ──────────────────────────────────────────────────────
     if name == 'update_lead_status':
         lead = Lead.objects.get(id=args['lead_id'], tenant_id=TENANT_ID)
+        # The status id is untrusted: without this check a lead could be pointed
+        # at another tenant's pipeline stage.
+        _require(LeadStatus, args['status_id'], 'Lead status', tenant_id=TENANT_ID)
         lead.status_id = args['status_id']
         lead.save(update_fields=['status'])
         return {'id': lead.id, 'status_id': args['status_id']}
@@ -575,11 +643,14 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── add_lead_to_group ───────────────────────────────────────────────────────
     if name == 'add_lead_to_group':
-        LeadGroupMembership.objects.get_or_create(
-            lead_id=args['lead_id'],
-            group_id=args['lead_group_id'],
+        lead  = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
+        group = _require(LeadGroup, args['lead_group_id'], 'Lead group',
+                         tenant_id=TENANT_ID)
+        _membership, created = LeadGroupMembership.objects.get_or_create(
+            lead_id=lead.id,
+            group_id=group.id,
         )
-        return {'lead_id': args['lead_id'], 'group_id': args['lead_group_id'], 'added': True}
+        return {'lead_id': lead.id, 'group_id': group.id, 'added': created}
 
     # ── add_leads_to_group ──────────────────────────────────────────────────────
     if name == 'add_leads_to_group':
@@ -767,15 +838,16 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── create_lead_activity ────────────────────────────────────────────────────
     if name == 'create_lead_activity':
+        lead = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
         activity = LeadActivity.objects.create(
             tenant_id=TENANT_ID,
-            lead_id=args['lead_id'],
+            lead_id=lead.id,
             type=args['type'],
             content=args['content'],
             happened_at=args.get('happened_at') or timezone.now(),
             by_user_id=OWNER_USER_ID or None,
         )
-        return {'id': activity.id, 'lead_id': args['lead_id']}
+        return {'id': activity.id, 'lead_id': lead.id}
 
     # ── list_tasks ──────────────────────────────────────────────────────────────
     if name == 'list_tasks':
@@ -831,12 +903,16 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     if name == 'create_task':
         if not OWNER_USER_ID:
             raise RuntimeError('MCP_OWNER_USER_ID env var not set')
+        # Task.lead is non-nullable; an unvalidated id would attach this
+        # tenant's task to another tenant's lead and leak its name back through
+        # list_tasks(lead__name).
+        lead = _require(Lead, args.get('lead_id'), 'Lead', tenant_id=TENANT_ID)
         task = Task.objects.create(
             tenant_id=TENANT_ID,
             owner_user_id=OWNER_USER_ID,
             title=args['title'],
             description=args.get('description') or '',
-            lead_id=args.get('lead_id'),
+            lead_id=lead.id,
             due_date=args.get('due_date'),
             priority=args.get('priority', 'MEDIUM'),
             assignee_user_id=args.get('assignee_user_id') or None,
@@ -930,10 +1006,11 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     if name == 'create_meeting':
         if not OWNER_USER_ID:
             raise RuntimeError('MCP_OWNER_USER_ID env var not set')
+        lead = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
         meeting = Meeting.objects.create(
             tenant_id=TENANT_ID,
             owner_user_id=OWNER_USER_ID,
-            lead_id=args['lead_id'],
+            lead_id=lead.id,
             title=args['title'],
             start_at=args['start_time'],
             end_at=args['end_time'],
@@ -1262,8 +1339,10 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── add_sequence_step ───────────────────────────────────────────────────────
     if name == 'add_sequence_step':
+        seq = _require(WhatsAppSequence, args['sequence_id'], 'Sequence',
+                       tenant_id=TENANT_ID)
         step = WhatsAppSequenceStep.objects.create(
-            sequence_id=args['sequence_id'],
+            sequence_id=seq.id,
             step_number=args['step_number'],
             delay_days=args.get('delay_days', 0),
             template_uid=args['template_uid'],
@@ -1274,7 +1353,10 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── update_sequence_step ────────────────────────────────────────────────────
     if name == 'update_sequence_step':
-        step = WhatsAppSequenceStep.objects.get(id=args['step_id'])
+        # WhatsAppSequenceStep has no tenant_id column (audit M4), so scope
+        # through the parent sequence rather than adding a migration.
+        step = _require(WhatsAppSequenceStep, args['step_id'], 'Sequence step',
+                        sequence__tenant_id=TENANT_ID)
         for f in ['delay_days', 'template_uid', 'template_name', 'template_variable_mapping']:
             if f in args:
                 setattr(step, f, args[f])
@@ -1283,18 +1365,22 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── delete_sequence_step ────────────────────────────────────────────────────
     if name == 'delete_sequence_step':
-        deleted, _ = WhatsAppSequenceStep.objects.filter(id=args['step_id']).delete()
+        # Scoped through the parent sequence -- see update_sequence_step.
+        step = _require(WhatsAppSequenceStep, args['step_id'], 'Sequence step',
+                        sequence__tenant_id=TENANT_ID)
+        deleted, _detail = WhatsAppSequenceStep.objects.filter(pk=step.pk).delete()
         return {'deleted': deleted > 0}
 
     # ── enroll_lead_in_sequence ─────────────────────────────────────────────────
     if name == 'enroll_lead_in_sequence':
-        seq = WhatsAppSequence.objects.get(id=args['sequence_id'], tenant_id=TENANT_ID)
+        seq  = WhatsAppSequence.objects.get(id=args['sequence_id'], tenant_id=TENANT_ID)
+        lead = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
         first_step = seq.steps.order_by('step_number').first()
         delay = first_step.delay_days if first_step else 0
         next_step_at = timezone.now() + timezone.timedelta(days=delay)
         enrollment, created = LeadSequenceEnrollment.objects.update_or_create(
-            lead_id=args['lead_id'],
-            sequence_id=args['sequence_id'],
+            lead_id=lead.id,
+            sequence_id=seq.id,
             defaults={
                 'tenant_id':    TENANT_ID,
                 'status':       SequenceEnrollmentStatusEnum.ACTIVE,
@@ -1424,10 +1510,12 @@ def _dispatch_tool(name: str, args: dict) -> dict:
 
     # ── create_campaign ─────────────────────────────────────────────────────────
     if name == 'create_campaign':
+        group = _require(LeadGroup, args['lead_group_id'], 'Lead group',
+                         tenant_id=TENANT_ID)
         campaign = WhatsAppCampaign.objects.create(
             tenant_id=TENANT_ID,
             name=args['name'],
-            lead_group_id=args['lead_group_id'],
+            lead_group_id=group.id,
             template_uid=args['template_uid'],
             template_name=args.get('template_name', ''),
             template_components=args.get('template_components', []),
@@ -1536,8 +1624,12 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             raise RuntimeError(
                 'Campaign %s not in DRAFT (is %s)' % (campaign.id, campaign.status)
             )
+        # Defence in depth: create_campaign now validates the group, but a row
+        # written before that fix could still point at a foreign group.
         memberships = LeadGroupMembership.objects.filter(
-            group_id=campaign.lead_group_id
+            group_id=campaign.lead_group_id,
+            group__tenant_id=TENANT_ID,
+            lead__tenant_id=TENANT_ID,
         ).select_related('lead')
         contacts = [
             {'phone': m.lead.phone, 'name': m.lead.name, 'digicrm_lead_id': m.lead.id}
@@ -1986,16 +2078,16 @@ def mcp_health(request):
         tool_count = len(TOOLS)
     except Exception:  # noqa: BLE001
         tool_count = None
-    return _cors(JsonResponse({'status': 'ok', 'server': 'digicrm-mcp', 'tools': tool_count}))
+    return _cors(JsonResponse({'status': 'ok', 'server': 'digicrm-mcp', 'tools': tool_count}), request)
 
 
 @csrf_exempt
 def mcp_sse(request):
     if request.method == 'OPTIONS':
-        return _cors(HttpResponse())
+        return _cors(HttpResponse(), request)
     if not _check_auth(request):
         logger.warning('MCP auth FAILED method=%s', request.method)
-        return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
+        return _cors(JsonResponse({'error': 'Unauthorized'}, status=401), request)
 
     logger.info('MCP SSE: method=%s', request.method)
 
@@ -2003,19 +2095,19 @@ def mcp_sse(request):
         try:
             body = json.loads(request.body)
         except json.JSONDecodeError:
-            return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400))
+            return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400), request)
         method = body.get('method', '?')
         logger.info('MCP POST: method=%s id=%s', method, body.get('id'))
         if body.get('id') is None and method.startswith('notifications/'):
-            return _cors(HttpResponse(status=202))
+            return _cors(HttpResponse(status=202), request)
         try:
             result = _handle_mcp_request(body)
             logger.info('MCP POST: %s ok', method)
-            return _cors(JsonResponse(result, safe=False))
+            return _cors(JsonResponse(result, safe=False), request)
         except Exception as exc:
             logger.exception('MCP POST %s FAILED', method)
             return _cors(JsonResponse({'jsonrpc': '2.0', 'id': body.get('id'),
-                'error': {'code': -32603, 'message': str(exc)}}, status=500))
+                'error': {'code': -32603, 'message': str(exc)}}, status=500), request)
 
     def event_stream():
         try:
@@ -2037,29 +2129,29 @@ def mcp_sse(request):
     response['Cache-Control']     = 'no-cache'
     response['X-Accel-Buffering'] = 'no'
     response['Connection']        = 'keep-alive'
-    return _cors(response)
+    return _cors(response, request)
 
 
 @csrf_exempt
 def mcp_message(request):
     if request.method == 'OPTIONS':
-        return _cors(HttpResponse())
+        return _cors(HttpResponse(), request)
     if request.method != 'POST':
         return HttpResponse(status=405)
     if not _check_auth(request):
-        return _cors(JsonResponse({'error': 'Unauthorized'}, status=401))
+        return _cors(JsonResponse({'error': 'Unauthorized'}, status=401), request)
     try:
         body = json.loads(request.body)
     except json.JSONDecodeError:
-        return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400))
+        return _cors(JsonResponse({'error': 'Invalid JSON'}, status=400), request)
     method = body.get('method', '?')
     logger.info('MCP message: method=%s', method)
     try:
         result = _handle_mcp_request(body)
-        return _cors(JsonResponse(result, safe=False))
+        return _cors(JsonResponse(result, safe=False), request)
     except Exception as exc:
         logger.exception('MCP message %s FAILED', method)
-        return _cors(JsonResponse({'error': str(exc)}, status=500))
+        return _cors(JsonResponse({'error': str(exc)}, status=500), request)
 
 
 mcp_urlpatterns = [

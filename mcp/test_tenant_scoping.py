@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+DigiCRM MCP -- tenant-isolation and auth tests (offline, NO database required).
+
+Covers audit findings A4, A5, M4 and improvement item P0-7 of
+`_plans/03-whatsapp-audit-2026-08.md`.
+
+Why this file exists as well as `test_http.py`: `test_http.py` needs a live
+server and a live database, so it cannot run in CI or on a dev box with no DB.
+The cross-tenant guarantees are the highest-severity thing in this layer, so
+they get a test that always runs. Model managers are replaced with in-memory
+fakes, which means the real dispatch branch is executed and the exact scope
+kwargs it passes to `_require()` are asserted -- without touching a database.
+
+Usage:
+    python mcp/test_tenant_scoping.py
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Must be set before mcp.django_view is imported: it reads them at module scope.
+TENANT_A = '11111111-1111-1111-1111-111111111111'
+TENANT_B = '22222222-2222-2222-2222-222222222222'
+os.environ['DIGICRM_TENANT_ID'] = TENANT_A
+os.environ['MCP_OWNER_USER_ID'] = '33333333-3333-3333-3333-333333333333'
+os.environ['MCP_SECRET'] = 'unit-test-secret'
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'digicrm.settings')
+
+import django  # noqa: E402
+django.setup()
+
+from django.test import RequestFactory  # noqa: E402
+
+import mcp.django_view as dv  # noqa: E402
+
+GREEN, RED, YELLOW, BOLD, RESET = (
+    '\033[92m', '\033[91m', '\033[93m', '\033[1m', '\033[0m')
+
+_results = {'passed': 0, 'failed': 0}
+
+
+def check(label, cond, detail=''):
+    if cond:
+        _results['passed'] += 1
+        print('  %sPASS%s  %s' % (GREEN, RESET, label))
+    else:
+        _results['failed'] += 1
+        print('  %sFAIL%s  %s  %s' % (RED, RESET, label, detail))
+
+
+def expect_raises(label, fn, must_contain=None):
+    """Assert fn() raises, optionally with a readable message."""
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if must_contain and must_contain.lower() not in msg.lower():
+            check(label, False, 'raised but message was %r' % msg)
+        else:
+            check(label, True)
+            print('        raised: %s' % msg)
+        return
+    check(label, False, 'did NOT raise -- cross-tenant write would succeed')
+
+
+# ---------------------------------------------------------------------------
+# In-memory fakes. A row carries the scope predicate it satisfies, so a
+# `.filter(pk=..., sequence__tenant_id=...)` is matched literally -- which is
+# exactly the assertion we want: the branch must pass the tenant predicate.
+# ---------------------------------------------------------------------------
+
+class FakeRow:
+    def __init__(self, pk, scope, **attrs):
+        self.pk = pk
+        self.id = pk
+        self._scope = scope
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+
+class FakeQS:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def delete(self):
+        n = len(self._rows)
+        self._rows = []
+        return n, {}
+
+
+class FakeManager:
+    def __init__(self, rows):
+        self.rows = rows
+        self.filter_calls = []
+
+    def filter(self, pk=None, id=None, **scope):
+        key = pk if pk is not None else id
+        self.filter_calls.append(dict(scope, pk=key))
+        return FakeQS([
+            r for r in self.rows
+            if (key is None or r.pk == key)
+            and all(r._scope.get(k) == v for k, v in scope.items())
+        ])
+
+    def get(self, id=None, pk=None, **scope):
+        row = self.filter(pk=(pk if pk is not None else id), **scope).first()
+        if row is None:
+            raise LookupError('not found')
+        return row
+
+
+class FakeModel:
+    """Stands in for a Django model class in a patched module."""
+
+    DoesNotExist = LookupError
+
+    def __init__(self, rows):
+        self.objects = FakeManager(rows)
+
+
+def dispatch(tool, args):
+    return dv._dispatch_tool(tool, args)
+
+
+print('\n%s%sDigiCRM MCP -- tenant isolation & auth (offline)%s' % (BOLD, YELLOW, RESET))
+print('%stenant under test : %s%s' % (YELLOW, TENANT_A, RESET))
+print('%sforeign tenant    : %s%s\n' % (YELLOW, TENANT_B, RESET))
+
+
+# ---------------------------------------------------------------------------
+# 1. _require() itself
+# ---------------------------------------------------------------------------
+print('%s-- _require() helper%s' % (BOLD, RESET))
+
+mine = FakeModel([FakeRow(1, {'tenant_id': TENANT_A})])
+theirs = FakeModel([FakeRow(99, {'tenant_id': TENANT_B})])
+
+check('returns the row when the tenant matches',
+      dv._require(mine, 1, 'Thing', tenant_id=TENANT_A).pk == 1)
+expect_raises('rejects a row owned by another tenant',
+              lambda: dv._require(theirs, 99, 'Thing', tenant_id=TENANT_A),
+              'does not exist in this workspace')
+expect_raises('rejects an id that exists nowhere',
+              lambda: dv._require(mine, 12345, 'Thing', tenant_id=TENANT_A),
+              'does not exist in this workspace')
+expect_raises('rejects a missing id', lambda: dv._require(mine, None, 'Thing'),
+              'is required')
+
+
+# ---------------------------------------------------------------------------
+# 2. A5 -- the four tools the audit named
+# ---------------------------------------------------------------------------
+print('\n%s-- A5: the four cross-tenant write tools%s' % (BOLD, RESET))
+
+import crm.models as crm_models                      # noqa: E402
+import whatsapp_integration.models as wa_models      # noqa: E402
+
+_orig = {
+    'Lead': crm_models.Lead,
+    'LeadGroup': crm_models.LeadGroup,
+    'LeadStatus': crm_models.LeadStatus,
+    'WhatsAppSequence': wa_models.WhatsAppSequence,
+    'WhatsAppSequenceStep': wa_models.WhatsAppSequenceStep,
+}
+
+# Tenant B's rows. Each declares the scope predicate that WOULD match it.
+foreign_lead = FakeModel([FakeRow(99, {'tenant_id': TENANT_B}, name='B lead')])
+foreign_group = FakeModel([FakeRow(99, {'tenant_id': TENANT_B}, name='B group')])
+foreign_status = FakeModel([FakeRow(99, {'tenant_id': TENANT_B})])
+# WhatsAppSequenceStep has no tenant_id of its own (audit M4) -- it can only be
+# scoped by joining to its sequence.
+foreign_step = FakeModel([FakeRow(99, {'sequence__tenant_id': TENANT_B})])
+own_sequence = FakeModel([FakeRow(7, {'tenant_id': TENANT_A}, name='A seq')])
+
+crm_models.Lead = foreign_lead
+crm_models.LeadGroup = foreign_group
+crm_models.LeadStatus = foreign_status
+wa_models.WhatsAppSequenceStep = foreign_step
+wa_models.WhatsAppSequence = own_sequence
+
+expect_raises(
+    "update_sequence_step refuses another tenant's step_id",
+    lambda: dispatch('update_sequence_step',
+                     {'step_id': 99, 'template_uid': 'attacker-template'}),
+    'sequence step')
+
+expect_raises(
+    "delete_sequence_step refuses another tenant's step_id",
+    lambda: dispatch('delete_sequence_step', {'step_id': 99}),
+    'sequence step')
+
+expect_raises(
+    "enroll_lead_in_sequence refuses another tenant's lead_id",
+    lambda: dispatch('enroll_lead_in_sequence', {'lead_id': 99, 'sequence_id': 7}),
+    'lead')
+
+expect_raises(
+    "create_campaign refuses another tenant's lead_group_id",
+    lambda: dispatch('create_campaign', {
+        'name': 'x', 'lead_group_id': 99, 'template_uid': 'u'}),
+    'lead group')
+
+# The step lookup must join through the sequence, not filter a (nonexistent)
+# tenant_id column on the step table -- this is the M4 half of the fix.
+step_scopes = [c for c in foreign_step.objects.filter_calls]
+check('sequence step is scoped via sequence__tenant_id (audit M4)',
+      any('sequence__tenant_id' in c for c in step_scopes), str(step_scopes))
+check('sequence step is NOT scoped by a bare tenant_id column',
+      all('tenant_id' not in c for c in step_scopes), str(step_scopes))
+
+
+# ---------------------------------------------------------------------------
+# 3. Same pattern, found by auditing the other 74 tools
+# ---------------------------------------------------------------------------
+print('\n%s-- Same pattern in tools the audit did not name%s' % (BOLD, RESET))
+
+expect_raises(
+    "add_sequence_step refuses another tenant's sequence_id",
+    lambda: dispatch('add_sequence_step', {
+        'sequence_id': 4242, 'step_number': 1, 'template_uid': 'u'}),
+    'sequence')
+
+expect_raises(
+    "add_lead_to_group refuses another tenant's lead_id",
+    lambda: dispatch('add_lead_to_group', {'lead_id': 99, 'lead_group_id': 99}),
+    'lead')
+
+expect_raises(
+    "create_lead_activity refuses another tenant's lead_id",
+    lambda: dispatch('create_lead_activity',
+                     {'lead_id': 99, 'type': 'NOTE', 'content': 'x'}),
+    'lead')
+
+expect_raises(
+    "create_task refuses another tenant's lead_id",
+    lambda: dispatch('create_task', {'lead_id': 99, 'title': 'x'}),
+    'lead')
+
+expect_raises(
+    "create_meeting refuses another tenant's lead_id",
+    lambda: dispatch('create_meeting', {
+        'lead_id': 99, 'title': 'x',
+        'start_time': '2026-09-01T10:00:00Z', 'end_time': '2026-09-01T11:00:00Z'}),
+    'lead')
+
+# update_lead_status: the lead lookup is already tenant-scoped, so give it a
+# lead it CAN find and prove the status_id is what gets rejected.
+crm_models.Lead = FakeModel([FakeRow(1, {'tenant_id': TENANT_A}, status_id=None)])
+expect_raises(
+    "update_lead_status refuses another tenant's status_id",
+    lambda: dispatch('update_lead_status', {'lead_id': 1, 'status_id': 99}),
+    'lead status')
+
+for k, v in _orig.items():
+    setattr(crm_models if hasattr(crm_models, k) else wa_models, k, v)
+
+
+# ---------------------------------------------------------------------------
+# 4. A4 / P0-7 -- auth and CORS
+# ---------------------------------------------------------------------------
+print('\n%s-- A4 / P0-7: auth transport and CORS%s' % (BOLD, RESET))
+
+rf = RequestFactory()
+SECRET = 'unit-test-secret'
+dv.MCP_SECRET = SECRET
+
+check('Bearer header with the right secret is accepted',
+      dv._check_auth(rf.post('/mcp/sse', HTTP_AUTHORIZATION='Bearer ' + SECRET)))
+check('Bearer header with a wrong secret is rejected',
+      not dv._check_auth(rf.post('/mcp/sse', HTTP_AUTHORIZATION='Bearer nope')))
+check('no Authorization header is rejected',
+      not dv._check_auth(rf.post('/mcp/sse')))
+check('?secret= query parameter is NO LONGER accepted',
+      not dv._check_auth(rf.post('/mcp/sse?secret=' + SECRET)))
+check('?secret= is rejected even when it holds the correct value',
+      not dv._check_auth(rf.post('/mcp/sse?secret=' + SECRET + '&x=1')))
+
+dv.MCP_SECRET = ''
+check('blank MCP_SECRET fails closed (A4)',
+      not dv._check_auth(rf.post('/mcp/sse', HTTP_AUTHORIZATION='Bearer ' + SECRET)))
+dv.MCP_SECRET = SECRET
+
+from django.http import HttpResponse  # noqa: E402
+
+allowed = dv.MCP_ALLOWED_ORIGINS[0]
+r = dv._cors(HttpResponse(), rf.post('/mcp/sse', HTTP_ORIGIN=allowed))
+check('allow-listed Origin is echoed back',
+      r.get('Access-Control-Allow-Origin') == allowed,
+      repr(r.get('Access-Control-Allow-Origin')))
+
+r = dv._cors(HttpResponse(), rf.post('/mcp/sse', HTTP_ORIGIN='https://evil.example'))
+check('unknown Origin gets NO Access-Control-Allow-Origin header',
+      r.get('Access-Control-Allow-Origin') is None,
+      repr(r.get('Access-Control-Allow-Origin')))
+
+r = dv._cors(HttpResponse(), rf.post('/mcp/sse'))
+check('no Origin (non-browser client) gets no ACAO header',
+      r.get('Access-Control-Allow-Origin') is None,
+      repr(r.get('Access-Control-Allow-Origin')))
+check('Vary: Origin is always set (cache safety)', r.get('Vary') == 'Origin')
+
+check('wildcard CORS is gone',
+      '*' not in [dv._cors(HttpResponse(), rf.post('/mcp/sse')).get(
+          'Access-Control-Allow-Origin')])
+
+
+# ---------------------------------------------------------------------------
+print('\n%s%s%s' % (BOLD, '-' * 55, RESET))
+print('%sResults: %s%d passed%s  %s%d failed%s%s\n' % (
+    BOLD, GREEN, _results['passed'], RESET,
+    RED, _results['failed'], RESET, RESET))
+sys.exit(1 if _results['failed'] else 0)
