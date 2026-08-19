@@ -1,13 +1,15 @@
+from django.db import transaction
 from rest_framework import serializers
 from common.mixins import TenantMixin
 from telephony.models import (
     TeleCMICredential, TeleCMIAgent, ZataStorageCredential,
+    TeleCMICallingProfile, TeleCMIProfileAssignment,
     CallLog, SMSLog, TeleCMICampaign,
 )
 from crm.models import LeadGroup
 from crm.serializers import LeadGroupMinimalSerializer
 from integrations.utils.encryption import encrypt_token
-from telephony.services.crypto import encrypt_secret
+from telephony.services.crypto import encrypt_secret, encrypt_profile_password
 
 
 class TeleCMICredentialSerializer(TenantMixin):
@@ -252,6 +254,185 @@ class TeleCMIAgentSerializer(TenantMixin):
             validated_data['cached_token'] = None
             validated_data['token_obtained_at'] = None
         return super().update(instance, validated_data)
+
+
+class TeleCMICallingProfileSerializer(TenantMixin):
+    """
+    A tenant's named calling identity.
+
+    The SIP password is write-only in the strongest sense: no field on this
+    serializer can ever render it, and the encrypted column is not in `fields`
+    either. Clients get `has_password` — enough to show "configured" or "not
+    set" — and nothing more.
+    """
+
+    password = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, trim_whitespace=False,
+        help_text='SIP password for the extension. Write-only; stored encrypted.',
+    )
+    has_password = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TeleCMICallingProfile
+        fields = [
+            'id', 'label', 'telecmi_user_id', 'caller_id', 'is_default',
+            'is_active', 'has_password', 'verified_at', 'verify_error',
+            'password',
+        ]
+        read_only_fields = ['id', 'has_password', 'verified_at', 'verify_error']
+        extra_kwargs = {
+            'label': {'help_text': 'Human name, e.g. "Sales line".'},
+            'telecmi_user_id': {'help_text': 'TeleCMI extension, e.g. 103_1111112.'},
+            'caller_id': {'help_text': 'PSTN number this profile presents on outgoing calls.'},
+            'is_default': {'help_text': 'Used by users with no explicit assignment. One per tenant.'},
+        }
+
+    def get_has_password(self, obj) -> bool:
+        return bool(obj.password_encrypted)
+
+    def _tenant_id(self):
+        request = self.context.get('request')
+        tenant_id = getattr(request, 'tenant_id', None) if request else None
+        if tenant_id is None and self.instance is not None:
+            tenant_id = self.instance.tenant_id
+        return tenant_id
+
+    def validate_telecmi_user_id(self, value):
+        """One profile per extension per tenant — checked here for a clean 400."""
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('An extension is required.')
+
+        tenant_id = self._tenant_id()
+        if tenant_id:
+            qs = TeleCMICallingProfile.objects.filter(
+                tenant_id=tenant_id, telecmi_user_id=value
+            )
+            if self.instance is not None:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError(
+                    'A calling profile for extension {} already exists.'.format(value)
+                )
+        return value
+
+    def _clear_other_defaults(self, tenant_id, keep_pk=None):
+        """
+        Make room for a new default instead of tripping the unique index.
+
+        The partial unique constraint is the backstop; demoting the incumbent
+        here is what makes "make this the default" one click rather than a
+        two-step dance the admin has to get right.
+        """
+        qs = TeleCMICallingProfile.objects.filter(tenant_id=tenant_id, is_default=True)
+        if keep_pk is not None:
+            qs = qs.exclude(pk=keep_pk)
+        qs.update(is_default=False)
+
+    def create(self, validated_data):
+        password = validated_data.pop('password', None)
+        if not password:
+            raise serializers.ValidationError(
+                {'password': 'A password is required when creating a calling profile.'}
+            )
+
+        tenant_id = self._tenant_id()
+        encrypted, dek_wrapped = encrypt_profile_password(password, tenant_id=tenant_id)
+        validated_data['password_encrypted'] = encrypted
+        validated_data['dek_wrapped'] = dek_wrapped
+
+        with transaction.atomic():
+            if validated_data.get('is_default'):
+                self._clear_other_defaults(tenant_id)
+            profile = super().create(validated_data)
+        verify_profile(profile, password, save=True)
+        return profile
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop('password', None)
+        if password:
+            encrypted, dek_wrapped = encrypt_profile_password(password, profile=instance)
+            validated_data['password_encrypted'] = encrypted
+            validated_data['dek_wrapped'] = dek_wrapped
+            # The cached token was minted from the OLD password; serving it
+            # after a correction would keep failing for up to 20 hours.
+            validated_data['cached_token'] = None
+            validated_data['token_obtained_at'] = None
+
+        # A changed number must be re-pushed to TeleCMI on the next session.
+        if 'caller_id' in validated_data and validated_data['caller_id'] != instance.caller_id:
+            validated_data['caller_id_pushed_value'] = None
+
+        with transaction.atomic():
+            if validated_data.get('is_default'):
+                self._clear_other_defaults(instance.tenant_id, keep_pk=instance.pk)
+            profile = super().update(instance, validated_data)
+        if password:
+            verify_profile(profile, password, save=True)
+        return profile
+
+
+def verify_profile(profile, password=None, save=False):
+    """
+    Check a profile's extension and password against TeleCMI.
+
+    Returns `(ok, error_or_None)`. Deliberately non-blocking in both
+    directions: a rejection is recorded on the row rather than raised, so an
+    admin can still save a half-right profile and correct it, and a TeleCMI
+    outage never blocks a save. Either way the admin gets the verdict straight
+    away through `verified_at`/`verify_error` and the `verify` action, instead
+    of discovering it when an agent cannot dial.
+    """
+    from django.utils import timezone
+    from telephony.services.crypto import decrypt_profile_password
+    from telephony.services.telecmi_client import get_user_login_token, TeleCMIError
+
+    if password is None:
+        if not profile.password_encrypted:
+            return False, 'No password is stored for this calling profile.'
+        try:
+            password = decrypt_profile_password(profile)
+        except Exception as exc:  # EncryptionError and friends
+            error = 'The stored password cannot be decrypted: {}'.format(exc)[:2000]
+            profile.verified_at = None
+            profile.verify_error = error
+            if save:
+                profile.save(update_fields=['verified_at', 'verify_error', 'updated_at'])
+            return False, error
+
+    ok, error = True, ''
+    try:
+        get_user_login_token(profile.telecmi_user_id, password)
+    except TeleCMIError as exc:
+        ok = False
+        if _is_unreachable(exc):
+            error = 'Saved without verification - TeleCMI was unreachable: {}'.format(exc)
+        else:
+            error = (
+                'TeleCMI rejected extension {}: {}. Check the extension ID and '
+                'password in the TeleCMI dashboard.'
+            ).format(profile.telecmi_user_id, exc)
+        error = error[:2000]
+
+    profile.verified_at = timezone.now() if ok else None
+    profile.verify_error = error
+    if save:
+        profile.save(update_fields=['verified_at', 'verify_error', 'updated_at'])
+    return ok, (error or None)
+
+
+class TeleCMIProfileAssignmentSerializer(serializers.ModelSerializer):
+    """Read-only view of who is on which profile."""
+
+    class Meta:
+        model = TeleCMIProfileAssignment
+        fields = ['user_id', 'profile_id']
+
+
+class ProfileAssignmentActionSerializer(serializers.Serializer):
+    """Body for assign/unassign: just the CRM user."""
+
+    user_id = serializers.UUIDField()
 
 
 class ZataStorageCredentialSerializer(TenantMixin):
