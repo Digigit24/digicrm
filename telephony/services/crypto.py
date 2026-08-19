@@ -178,6 +178,50 @@ def decrypt_default_agent_password(credential) -> str:
     )
 
 
+def tenant_dek_wrapped(tenant_id) -> str:
+    """
+    The wrapped DEK this tenant already uses, or '' if it has none yet.
+
+    Calling profiles are their own rows but must not invent their own key
+    material: a tenant gets exactly one data key, minted the first time any of
+    its TeleCMI secrets is saved, and every later save reuses it. Returning ''
+    lets `encrypt_secret()` mint one.
+    """
+    from telephony.models import TeleCMICredential
+
+    return (
+        TeleCMICredential.objects.filter(tenant_id=tenant_id)
+        .values_list('dek_wrapped', flat=True)
+        .first()
+        or ''
+    )
+
+
+def encrypt_profile_password(password: str, profile=None, tenant_id=None) -> tuple[str, str]:
+    """
+    Encrypt a calling-profile SIP password. Returns `(ciphertext, dek_wrapped)`.
+
+    Prefers the key already on the profile, then the tenant credential's, and
+    mints a fresh one only when the tenant has none — so a profile created
+    before the tenant credential still works, and adopts nothing it should not.
+    """
+    existing = (getattr(profile, 'dek_wrapped', '') or '')
+    if not existing:
+        existing = tenant_dek_wrapped(
+            tenant_id if tenant_id is not None else getattr(profile, 'tenant_id', None)
+        )
+    return encrypt_secret(password, existing)
+
+
+def decrypt_profile_password(profile) -> str:
+    """Decrypt a calling profile's SIP password."""
+    return decrypt_with_dek(
+        profile.password_encrypted,
+        profile.dek_wrapped,
+        label='calling profile password',
+    )
+
+
 def needs_upgrade(credential) -> bool:
     """True when a row is still on the legacy shared-key scheme."""
     return bool(credential.secret_encrypted) and not credential.dek_wrapped

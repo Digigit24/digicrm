@@ -31,10 +31,13 @@ from common.mixins import TenantViewSetMixin
 from common.permissions import HasDigiPermission, is_admin_request
 from telephony.models import (
     TeleCMICredential, TeleCMIAgent, ZataStorageCredential, CallLog, SMSLog,
-    TeleCMICampaign, CallDirectionEnum, SMSStatusEnum, RecordingStorageStatusEnum,
+    TeleCMICampaign, TeleCMICallingProfile, TeleCMIProfileAssignment,
+    CallDirectionEnum, SMSStatusEnum, RecordingStorageStatusEnum,
 )
 from telephony.serializers import (
     TeleCMICredentialSerializer, TeleCMIAgentSerializer, ZataStorageCredentialSerializer,
+    TeleCMICallingProfileSerializer, TeleCMIProfileAssignmentSerializer,
+    ProfileAssignmentActionSerializer, verify_profile,
     CallLogSerializer, SMSLogSerializer,
     ClickToCallSerializer, HangupSerializer, SMSSendSerializer,
     CallerIDUpdateSerializer, CDRSyncSerializer, AddNoteSerializer,
@@ -60,7 +63,8 @@ from telephony.services.campaign_service import (
 )
 from telephony.services.callback_service import create_callback_task_if_needed
 from telephony.services.softphone_service import (
-    resolve_softphone_auth, SoftphoneConfigError, REASON_TENANT_NOT_CONFIGURED,
+    resolve_softphone_auth, push_caller_id, usable_profiles_for,
+    SoftphoneConfigError, REASON_TENANT_NOT_CONFIGURED,
 )
 from telephony.services.realtime import publish_live_event
 
@@ -173,6 +177,139 @@ class TeleCMIAgentViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
         if err:
             return err
         return Response({'detail': 'Token refreshed successfully.'})
+
+
+# ──────────────────────────────────────────────────────────────
+# Calling profiles
+# ──────────────────────────────────────────────────────────────
+
+class TeleCMICallingProfileViewSet(TenantViewSetMixin, viewsets.ModelViewSet):
+    """
+    Manage this tenant's calling profiles — the named softphone identities
+    (e.g. "Sales line", "Support line") users register as.
+
+    Read/write split
+    ----------------
+    Writes are admin-only: a profile carries a SIP password and decides which
+    number a whole team dials out from, which is a tenant-configuration
+    decision, not a per-user preference. Reads are open to anyone with the
+    telephony settings permission, but a non-admin sees only the profiles that
+    can actually serve them — the one assigned to them and the tenant default.
+    Nobody reads another team's line configuration, and nobody ever reads a
+    password: it is write-only on the serializer.
+    """
+
+    queryset = TeleCMICallingProfile.objects.all()
+    serializer_class = TeleCMICallingProfileSerializer
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'settings'
+    http_method_names = ['get', 'post', 'patch', 'put', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if is_admin_request(self.request):
+            return qs
+        # Same shape as TeleCMIAgentViewSet.get_queryset: non-admins are scoped
+        # down rather than refused outright, so the softphone UI can still show
+        # a user which identity they are on.
+        usable = usable_profiles_for(_tenant_id(self.request), _user_id(self.request))
+        return qs.filter(pk__in=usable.values('pk'))
+
+    def _forbid_non_admin(self):
+        if is_admin_request(self.request):
+            return None
+        return Response(
+            {'error': 'Only an admin can change calling profiles.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    def create(self, request, *args, **kwargs):
+        return self._forbid_non_admin() or super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        return self._forbid_non_admin() or super().update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        return self._forbid_non_admin() or super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        return self._forbid_non_admin() or super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        """
+        POST /api/telephony/calling-profiles/<pk>/verify/
+
+        Log the stored extension and password into TeleCMI and record the
+        result. Returns ``{"ok": bool, "error": str|null}`` — always 200, since
+        "TeleCMI says no" is an answer, not a server failure. An unreachable
+        TeleCMI is reported as not-ok with an explanatory error rather than
+        failing the request.
+        """
+        forbidden = self._forbid_non_admin()
+        if forbidden:
+            return forbidden
+
+        profile = self.get_object()
+        ok, error = verify_profile(profile, save=True)
+        return Response({'ok': ok, 'error': error})
+
+    @action(detail=True, methods=['post', 'delete'], url_path='assign')
+    def assign(self, request, pk=None):
+        """
+        POST   /api/telephony/calling-profiles/<pk>/assign/  {"user_id": "..."}
+        DELETE /api/telephony/calling-profiles/<pk>/assign/  {"user_id": "..."}
+
+        A user has at most one assignment, so POST is an upsert — reassigning
+        someone from the sales line to the support line is one call, not a
+        delete plus a create with a window in between where they have neither.
+        """
+        forbidden = self._forbid_non_admin()
+        if forbidden:
+            return forbidden
+
+        profile = self.get_object()
+        serializer = ProfileAssignmentActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_id = serializer.validated_data['user_id']
+        tenant_id = _tenant_id(request)
+
+        if request.method == 'DELETE':
+            deleted, _ = TeleCMIProfileAssignment.objects.filter(
+                tenant_id=tenant_id, user_id=user_id, profile=profile
+            ).delete()
+            return Response({
+                'detail': 'Assignment removed.' if deleted else 'No such assignment.',
+                'user_id': str(user_id),
+                'profile_id': profile.id,
+            })
+
+        TeleCMIProfileAssignment.objects.update_or_create(
+            tenant_id=tenant_id, user_id=user_id, defaults={'profile': profile},
+        )
+        # Whatever extension this user was authenticating as, it is not the one
+        # they are on now — drop the cached token so REST calls follow suit.
+        invalidate_token(tenant_id, user_id)
+        return Response({
+            'detail': 'Assignment saved.',
+            'user_id': str(user_id),
+            'profile_id': profile.id,
+        })
+
+    @action(detail=False, methods=['get'])
+    def assignments(self, request):
+        """
+        GET /api/telephony/calling-profiles/assignments/
+
+        ``[{"user_id": "...", "profile_id": 1}]`` for this tenant. Admins see
+        everyone; anyone else sees only their own row.
+        """
+        qs = TeleCMIProfileAssignment.objects.filter(tenant_id=_tenant_id(request))
+        if not is_admin_request(request):
+            qs = qs.filter(user_id=_user_id(request))
+        return Response(TeleCMIProfileAssignmentSerializer(qs, many=True).data)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -867,7 +1004,13 @@ class WebRTCConfigView(APIView):
 
         {"telecmi_user_id": "103_1111112", "sbc_host": "sbcind.telecmi.com",
          "default_caller_id": null, "auth": {"kind": "password", "value": "..."},
-         "source": "user" | "tenant"}
+         "source": "user" | "assigned_profile" | "tenant_profile"
+                   | "tenant_default"}
+
+    `source` names which identity answered: the user's own extension, the
+    calling profile assigned to them, the tenant's default calling profile, or
+    the legacy tenant-wide extension. The frontend shows it so an agent knows
+    which line they are on.
 
     Response (424)::
 
@@ -917,7 +1060,7 @@ class WebRTCConfigView(APIView):
             )
 
         try:
-            telecmi_user_id, password, source = resolve_softphone_auth(
+            identity = resolve_softphone_auth(
                 cred, _tenant_id(request), _user_id(request)
             )
         except SoftphoneConfigError as exc:
@@ -926,12 +1069,19 @@ class WebRTCConfigView(APIView):
                 status=status.HTTP_424_FAILED_DEPENDENCY,
             )
 
+        # Caller ID lives on the TeleCMI extension, not on the call, so the
+        # session start is the only moment we can pin it. Best-effort by
+        # design: a failure here must never cost the user a working phone.
+        push_caller_id(identity)
+
         return Response({
-            'telecmi_user_id': telecmi_user_id,
+            'telecmi_user_id': identity.telecmi_user_id,
             'sbc_host': cred.sbc_host,
-            'default_caller_id': cred.default_caller_id,
-            'auth': {'kind': 'password', 'value': password},
-            'source': source,
+            # The resolved profile's number when there is one, else the
+            # tenant-wide default the frontend has always displayed.
+            'default_caller_id': identity.caller_id or cred.default_caller_id,
+            'auth': {'kind': 'password', 'value': identity.password},
+            'source': identity.source,
         })
 
 

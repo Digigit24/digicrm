@@ -16,7 +16,7 @@ from integrations.utils.encryption import encrypt_token
 from telephony.models import TeleCMICredential, TeleCMIAgent, SBCRegionEnum
 from telephony.services.crypto import encrypt_secret
 from telephony.services.softphone_service import (
-    REASON_NO_AGENT, REASON_TENANT_NOT_CONFIGURED,
+    REASON_NO_AGENT, REASON_TENANT_NOT_CONFIGURED, SOURCE_TENANT_DEFAULT,
 )
 
 TEST_JWT_SECRET = 'test-jwt-secret-telephony-unit-tests'
@@ -79,7 +79,12 @@ def _make_credential(tenant_id=TENANT, with_default_agent=True):
 
 @override_settings(JWT_SECRET_KEY=TEST_JWT_SECRET, JWT_ALGORITHM=TEST_JWT_ALGO)
 class WebRTCConfigResolutionTest(TestCase):
-    """The three-way resolution order and its two distinct 424 reasons."""
+    """The legacy resolution steps and the two distinct 424 reasons.
+
+    Calling profiles slot in between the per-user agent row and the legacy
+    tenant default; those steps are covered in `test_calling_profiles.py`. What
+    this class pins down is that the pre-profiles behaviour is untouched.
+    """
 
     def test_tenant_default_resolves_when_user_has_no_agent_row(self):
         _make_credential()
@@ -89,7 +94,9 @@ class WebRTCConfigResolutionTest(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['telecmi_user_id'], TENANT_EXT)
-        self.assertEqual(response.data['source'], 'tenant')
+        # Renamed from 'tenant' when calling profiles landed: the legacy
+        # tenant-wide extension is now one of two tenant-level sources.
+        self.assertEqual(response.data['source'], SOURCE_TENANT_DEFAULT)
         self.assertEqual(response.data['sbc_host'], 'sbcind.telecmi.com')
         self.assertIsNone(response.data['default_caller_id'])
         self.assertEqual(response.data['auth']['kind'], 'password')
@@ -123,7 +130,7 @@ class WebRTCConfigResolutionTest(TestCase):
         response = _authed_client().get(URL)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['source'], 'tenant')
+        self.assertEqual(response.data['source'], SOURCE_TENANT_DEFAULT)
         self.assertEqual(response.data['telecmi_user_id'], TENANT_EXT)
 
     def test_424_tenant_not_configured_when_no_credential(self):

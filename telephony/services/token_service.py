@@ -24,14 +24,17 @@ def get_agent_token(tenant_id, user_id) -> str:
     action agrees on which extension a user is:
 
       1. the user's own `TeleCMIAgent` row, using its cached token when fresh;
-      2. otherwise the tenant's shared default extension, cached on the
+      2. the calling profile assigned to them, then the tenant default profile,
+         each caching its token on its own row;
+      3. otherwise the tenant's legacy shared default extension, cached on the
          credential row.
 
-    Without step 2 a tenant that configured only a shared extension would get a
-    softphone that connects but 424s on click-to-call, SMS, caller IDs, breaks,
-    callbacks and notes — every one of those funnels through here.
+    Without steps 2 and 3 a user who resolves to anything but a personal agent
+    row would get a softphone that connects but 424s on click-to-call, SMS,
+    caller IDs, breaks, callbacks and notes — every one of those funnels
+    through here.
 
-    Raises TokenServiceError if neither resolves or login fails.
+    Raises TokenServiceError if none resolves or login fails.
     """
     # Import here to avoid circular imports at module load time
     from telephony.models import TeleCMIAgent
@@ -47,7 +50,71 @@ def get_agent_token(tenant_id, user_id) -> str:
         logger.info('TeleCMI token stale for user %s, re-authenticating', user_id)
         return _refresh_token(agent)
 
+    profile = _resolve_profile(tenant_id, user_id)
+    if profile is not None:
+        if not profile.is_token_stale():
+            logger.debug('Using cached calling-profile token for user %s', user_id)
+            return profile.cached_token
+        return _refresh_profile_token(profile)
+
     return _get_tenant_default_token(tenant_id, user_id)
+
+
+def _resolve_profile(tenant_id, user_id):
+    """
+    The calling profile this user's REST calls should authenticate as.
+
+    Same order as `softphone_service.resolve_softphone_auth` steps 2 and 3 —
+    assigned profile first, then the tenant default — so the extension a user's
+    softphone registers as is the same one their click-to-call runs from.
+    """
+    from telephony.models import TeleCMICallingProfile, TeleCMIProfileAssignment
+
+    assignment = (
+        TeleCMIProfileAssignment.objects
+        .filter(tenant_id=tenant_id, user_id=user_id)
+        .select_related('profile')
+        .first()
+    )
+    if assignment and assignment.profile.is_usable:
+        return assignment.profile
+
+    profile = TeleCMICallingProfile.objects.filter(
+        tenant_id=tenant_id, is_default=True, is_active=True
+    ).first()
+    if profile and profile.is_usable:
+        return profile
+    return None
+
+
+def _refresh_profile_token(profile) -> str:
+    """Log a calling profile's extension in and cache the token on its row."""
+    from django.utils import timezone
+
+    from telephony.services.crypto import decrypt_profile_password
+
+    try:
+        password = decrypt_profile_password(profile)
+    except EncryptionError as exc:
+        raise TokenServiceError(
+            f'The password for calling profile "{profile.label}" cannot be '
+            'decrypted. Re-enter it under Settings -> TeleCMI -> Calling '
+            'profiles and save.'
+        ) from exc
+
+    try:
+        token = get_user_login_token(profile.telecmi_user_id, password)
+    except TeleCMIError as exc:
+        raise TokenServiceError(
+            f'TeleCMI login failed for calling profile "{profile.label}" '
+            f'({profile.telecmi_user_id}): {exc}'
+        )
+
+    profile.cached_token = token
+    profile.token_obtained_at = timezone.now()
+    profile.save(update_fields=['cached_token', 'token_obtained_at', 'updated_at'])
+    logger.info('Refreshed TeleCMI token for calling profile %s', profile.id)
+    return token
 
 
 def _get_tenant_default_token(tenant_id, user_id) -> str:
@@ -127,10 +194,19 @@ def invalidate_token(tenant_id, user_id) -> None:
     )
     if updated:
         logger.info('Invalidated TeleCMI token for user %s in tenant %s', user_id, tenant_id)
-    else:
-        # The user is on the tenant's shared extension; that is the token that
-        # actually needs clearing.
-        invalidate_tenant_default_token(tenant_id)
+        return
+
+    # No personal row: the user is on whichever calling profile — or the legacy
+    # shared extension — actually served them, so that is the token to clear.
+    profile = _resolve_profile(tenant_id, user_id)
+    if profile is not None:
+        profile.cached_token = None
+        profile.token_obtained_at = None
+        profile.save(update_fields=['cached_token', 'token_obtained_at', 'updated_at'])
+        logger.info('Invalidated TeleCMI token for calling profile %s', profile.id)
+        return
+
+    invalidate_tenant_default_token(tenant_id)
 
 
 def invalidate_tenant_default_token(tenant_id) -> None:

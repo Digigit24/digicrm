@@ -201,6 +201,188 @@ class TeleCMIAgent(models.Model):
         return token_is_stale(self.cached_token, self.token_obtained_at)
 
 
+class TeleCMICallingProfile(models.Model):
+    """
+    A named TeleCMI calling identity ("calling profile") a tenant can hand out.
+
+    Why this exists
+    ---------------
+    `TeleCMICredential.default_agent_id` gave a tenant exactly *one* shared
+    softphone extension, settable only by editing the credential row. Teams that
+    own two TeleCMI numbers therefore had no way to say "support answers on the
+    support line, sales on the sales line" — and there was no admin surface for
+    entering an extension password at all, so in practice nearly every user hit
+    424 `no_agent`.
+
+    A profile is that missing first-class object: a label a human recognises, the
+    TeleCMI extension behind it, the SIP password (encrypted), and the caller ID
+    that extension should present. Profiles are assigned to users through
+    `TeleCMIProfileAssignment`; one profile per tenant may be flagged
+    `is_default` and is used by anyone with no explicit assignment.
+
+    On the password
+    ---------------
+    Stored under the same envelope scheme as every other TeleCMI secret
+    (`telephony/services/crypto.py`): encrypted with a per-tenant DEK which is
+    itself wrapped by `TELECMI_MASTER_KEY`. `dek_wrapped` is seeded from the
+    tenant's `TeleCMICredential` when one exists, so a tenant keeps a single
+    data key across its credential and all of its profiles.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    label = models.CharField(
+        max_length=150,
+        help_text='Human name for this calling identity, e.g. "Sales line".',
+    )
+    telecmi_user_id = models.CharField(
+        max_length=100,
+        help_text='TeleCMI extension this profile logs in as, e.g. 103_1111112.',
+    )
+    password_encrypted = models.TextField(
+        blank=True,
+        default='',
+        help_text="SIP password for the extension, encrypted with this tenant's DEK.",
+    )
+    dek_wrapped = models.TextField(
+        blank=True,
+        default='',
+        help_text=(
+            "This tenant's data-encryption key, itself encrypted with "
+            'TELECMI_MASTER_KEY. Shared with the tenant credential row when one '
+            'exists.'
+        ),
+    )
+    caller_id = models.CharField(
+        max_length=30,
+        null=True,
+        blank=True,
+        help_text=(
+            'PSTN number this profile should present. Pushed to TeleCMI with '
+            'POST /v2/set_callerid when a session resolves to this profile — '
+            'caller ID is a property of the extension, not of a single call.'
+        ),
+    )
+    is_default = models.BooleanField(
+        default=False,
+        help_text=(
+            'Used by any user of this tenant with no explicit assignment. At '
+            'most one profile per tenant may set this.'
+        ),
+    )
+    is_active = models.BooleanField(default=True)
+    cached_token = models.TextField(
+        null=True,
+        blank=True,
+        help_text='Cached /v2/user/login token for this extension.',
+    )
+    token_obtained_at = models.DateTimeField(null=True, blank=True)
+    caller_id_pushed_value = models.CharField(
+        max_length=30,
+        null=True,
+        blank=True,
+        help_text=(
+            'Last caller ID we successfully pushed to TeleCMI for this '
+            'extension. TeleCMI exposes no "currently active" flag, so this is '
+            'the only record of it — and it keeps the softphone path from '
+            're-pushing an unchanged value on every page load.'
+        ),
+    )
+    verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='Last time TeleCMI accepted this extension and password.',
+    )
+    verify_error = models.TextField(
+        blank=True,
+        default='',
+        help_text=(
+            'Why the last verification did not succeed. Set when TeleCMI was '
+            'unreachable, so the profile is stored but flagged rather than '
+            'silently trusted.'
+        ),
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'telephony_calling_profiles'
+        ordering = ['-is_default', 'label']
+        indexes = [
+            models.Index(fields=['tenant_id'], name='idx_tel_profile_tenant'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tenant_id', 'telecmi_user_id'],
+                name='uniq_tel_profile_tenant_ext',
+            ),
+            # Partial index: many non-default profiles are fine, one default.
+            models.UniqueConstraint(
+                fields=['tenant_id'],
+                condition=models.Q(is_default=True),
+                name='uniq_tel_profile_one_default',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.label} ({self.telecmi_user_id})'
+
+    @property
+    def has_password(self):
+        return bool(self.password_encrypted)
+
+    @property
+    def is_usable(self):
+        """True when this profile can actually log a softphone in."""
+        return bool(self.is_active and self.telecmi_user_id and self.password_encrypted)
+
+    def is_token_stale(self):
+        return token_is_stale(self.cached_token, self.token_obtained_at)
+
+
+class TeleCMIProfileAssignment(models.Model):
+    """
+    Which calling profile a given CRM user should use.
+
+    Kept as its own table rather than a FK on `TeleCMIAgent` because an agent row
+    carries its own extension and password (both NOT NULL) and *wins* the
+    softphone resolution outright. Hanging an assignment off it would mean either
+    relaxing those columns on a live table or minting placeholder agent rows that
+    would then shadow the very profile they point at. A dedicated row is purely
+    additive and leaves the existing resolution order untouched.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    user_id = models.UUIDField(db_index=True)
+    profile = models.ForeignKey(
+        TeleCMICallingProfile,
+        on_delete=models.CASCADE,
+        related_name='assignments',
+        db_column='profile_id',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'telephony_calling_profile_assignments'
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tenant_id', 'user_id'],
+                name='uniq_tel_profile_assign_user',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['tenant_id', 'user_id'], name='idx_tel_profile_assign'
+            ),
+        ]
+
+    def __str__(self):
+        return f'user {self.user_id} -> {self.profile_id}'
+
+
 class ZataStorageCredential(models.Model):
     """Tenant-owned private Zata S3 configuration for call recordings."""
 

@@ -5,6 +5,11 @@ Authenticated endpoints:
   GET/POST   /api/telephony/credentials/              TeleCMI tenant credentials
   GET/POST   /api/telephony/agents/                   Per-user agent credentials
   POST       /api/telephony/agents/refresh-token/     Force token refresh
+  GET/POST   /api/telephony/calling-profiles/         Calling profiles (admin write)
+  PATCH/DEL  /api/telephony/calling-profiles/<pk>/    Profile detail/update/delete
+  POST       /api/telephony/calling-profiles/<pk>/verify/  Test extension+password
+  POST/DEL   /api/telephony/calling-profiles/<pk>/assign/  Assign/unassign a user
+  GET        /api/telephony/calling-profiles/assignments/  user -> profile map
   POST       /api/telephony/calls/click-to-call/      Initiate a call
   POST       /api/telephony/calls/hangup/             Hang up active call
   GET        /api/telephony/calls/                    List CDR records
@@ -39,6 +44,10 @@ router = DefaultRouter()
 router.register(r'credentials', views.TeleCMICredentialViewSet, basename='telephony-credential')
 router.register(r'storage-credentials', views.ZataStorageCredentialViewSet, basename='telephony-storage-credential')
 router.register(r'agents', views.TeleCMIAgentViewSet, basename='telephony-agent')
+router.register(
+    r'calling-profiles', views.TeleCMICallingProfileViewSet,
+    basename='telephony-calling-profile',
+)
 router.register(r'calls', views.CallLogViewSet, basename='telephony-call')
 router.register(r'sms', views.SMSLogViewSet, basename='telephony-sms')
 router.register(r'campaigns', views.CampaignViewSet, basename='telephony-campaign')
