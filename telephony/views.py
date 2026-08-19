@@ -59,6 +59,9 @@ from telephony.services.campaign_service import (
     push_group_to_campaign_sync,
 )
 from telephony.services.callback_service import create_callback_task_if_needed
+from telephony.services.softphone_service import (
+    resolve_softphone_auth, SoftphoneConfigError, REASON_TENANT_NOT_CONFIGURED,
+)
 from telephony.services.realtime import publish_live_event
 
 logger = logging.getLogger(__name__)
@@ -857,9 +860,45 @@ class WebRTCConfigView(APIView):
     """
     GET /api/telephony/webrtc-config/
 
-    Returns the config the frontend PIOPIY SDK needs to call piopiy.login().
-    Does NOT expose the password — the frontend should use the TeleCMI
-    user_id + token approach, or the superadmin sets up agent credentials.
+    Returns everything the browser PIOPIY SDK needs for
+    `piopiy.login(user_id, password, SBC_URI)`.
+
+    Response (200)::
+
+        {"telecmi_user_id": "103_1111112", "sbc_host": "sbcind.telecmi.com",
+         "default_caller_id": null, "auth": {"kind": "password", "value": "..."},
+         "source": "user" | "tenant"}
+
+    Response (424)::
+
+        {"error": "...", "reason": "tenant_not_configured" | "no_agent"}
+
+    Why this returns a password
+    ---------------------------
+    An earlier version of this view deliberately withheld the password and told
+    the frontend to "use the user_id + token approach". No such approach exists.
+    Reading the shipped SDK (`piopiyjs/lib/piopiy.js`) settles it: `login()`
+    builds `{authorization_user, password, register: true}` and starts a JsSIP
+    user agent against the SBC. That is SIP digest authentication — a
+    challenge-response over the shared secret — so the browser genuinely needs
+    the password. The token from `/v2/user/login` is not an alternative
+    credential; the SDK fetches it itself, in parallel, only to open its
+    own websocket.
+
+    The exposure is therefore real and unavoidable with this vendor SDK, and is
+    contained as follows:
+
+      * the value is served only from this endpoint, only over an authenticated
+        request, and only to a caller holding `telephony.calls` permission;
+      * in the common case it is a *shared tenant extension* password rather
+        than any individual's credential, and it is a TeleCMI SIP secret with
+        no CRM privileges attached to it;
+      * it is never written to a log, never included in any serializer, and
+        never returned by the credential CRUD endpoints.
+
+    There is deliberately no server-side cache on this path: the password is
+    decrypted from the row on each request, so a credential saved a second ago
+    is reflected on the very next fetch with no re-login and no restart.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [HasDigiPermission]
@@ -870,25 +909,29 @@ class WebRTCConfigView(APIView):
         try:
             cred = get_tenant_credential(_tenant_id(request))
         except TokenServiceError as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_424_FAILED_DEPENDENCY)
-
-        from telephony.models import TeleCMIAgent
-        try:
-            agent = TeleCMIAgent.objects.get(
-                tenant_id=_tenant_id(request),
-                user_id=_user_id(request),
-                is_active=True,
-            )
-        except TeleCMIAgent.DoesNotExist:
+            # The tenant has no active TeleCMICredential at all — distinct from
+            # "configured, but nothing for you".
             return Response(
-                {'error': 'No TeleCMI agent configured for your account.'},
+                {'error': str(exc), 'reason': REASON_TENANT_NOT_CONFIGURED},
+                status=status.HTTP_424_FAILED_DEPENDENCY,
+            )
+
+        try:
+            telecmi_user_id, password, source = resolve_softphone_auth(
+                cred, _tenant_id(request), _user_id(request)
+            )
+        except SoftphoneConfigError as exc:
+            return Response(
+                {'error': str(exc), 'reason': exc.reason},
                 status=status.HTTP_424_FAILED_DEPENDENCY,
             )
 
         return Response({
-            'telecmi_user_id': agent.telecmi_user_id,
+            'telecmi_user_id': telecmi_user_id,
             'sbc_host': cred.sbc_host,
             'default_caller_id': cred.default_caller_id,
+            'auth': {'kind': 'password', 'value': password},
+            'source': source,
         })
 
 
