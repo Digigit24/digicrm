@@ -70,6 +70,39 @@ class TeleCMICredential(models.Model):
         blank=True,
         help_text='Default caller ID displayed on outgoing calls'
     )
+    default_agent_id = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text=(
+            'Shared TeleCMI extension (e.g. 103_1111112) that every user of '
+            'this tenant logs the browser softphone in with when they have no '
+            'personal TeleCMIAgent row. The app_id/secret are tenant-wide, so '
+            'this extension is too.'
+        ),
+    )
+    default_agent_password_encrypted = models.TextField(
+        blank=True,
+        default='',
+        help_text=(
+            "Password for `default_agent_id`, encrypted with this tenant's "
+            'DEK — the same envelope scheme as `secret_encrypted`.'
+        ),
+    )
+    default_agent_verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='Last time TeleCMI accepted default_agent_id/password.',
+    )
+    default_agent_verify_error = models.TextField(
+        blank=True,
+        default='',
+        help_text=(
+            'Why the last verification of the default extension did not '
+            'succeed. Set when TeleCMI was unreachable at save time, so the '
+            'credential is stored but flagged rather than silently trusted.'
+        ),
+    )
     webhook_secret = models.CharField(
         max_length=128,
         null=True,
@@ -93,6 +126,11 @@ class TeleCMICredential(models.Model):
     @property
     def sbc_host(self):
         return SBC_HOST_MAP.get(self.sbc_region, 'sbcind.telecmi.com')
+
+    @property
+    def has_default_agent(self):
+        """True when this tenant has a usable shared softphone extension."""
+        return bool(self.default_agent_id and self.default_agent_password_encrypted)
 
 
 class TeleCMIAgent(models.Model):

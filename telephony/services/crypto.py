@@ -125,6 +125,31 @@ def encrypt_secret(plaintext: str, dek_wrapped: str = '') -> tuple[str, str]:
     return secret_encrypted, dek_wrapped
 
 
+def decrypt_with_dek(ciphertext: str, dek_wrapped: str, label: str = 'value') -> str:
+    """
+    Decrypt one field written by `encrypt_secret()`.
+
+    Shared by every envelope-encrypted column on a credential row (the app
+    secret, the default agent password) so they all resolve through exactly one
+    code path. An empty `dek_wrapped` means the row predates envelope
+    encryption and falls back to the legacy shared-key scheme.
+    """
+    if not ciphertext:
+        raise EncryptionError(f'No TeleCMI {label} is stored for this tenant.')
+
+    if not dek_wrapped:
+        # Legacy row: encrypted with the SECRET_KEY-derived shared key.
+        return decrypt_token(ciphertext)
+
+    dek = unwrap_dek(dek_wrapped)
+    try:
+        return Fernet(dek).decrypt(ciphertext.encode('utf-8')).decode('utf-8')
+    except InvalidToken:
+        raise EncryptionError(
+            f'The stored TeleCMI {label} does not match this tenant\'s key.'
+        )
+
+
 def decrypt_secret(credential) -> str:
     """
     Decrypt a TeleCMICredential's app secret.
@@ -132,20 +157,25 @@ def decrypt_secret(credential) -> str:
     Falls back to the legacy shared-key path for rows that predate envelope
     encryption, so a rollout needs no data migration.
     """
-    if not credential.secret_encrypted:
-        raise EncryptionError('No TeleCMI secret is stored for this tenant.')
+    return decrypt_with_dek(
+        credential.secret_encrypted, credential.dek_wrapped, label='secret'
+    )
 
-    if not credential.dek_wrapped:
-        # Legacy row: encrypted with the SECRET_KEY-derived shared key.
-        return decrypt_token(credential.secret_encrypted)
 
-    dek = unwrap_dek(credential.dek_wrapped)
-    try:
-        return Fernet(dek).decrypt(credential.secret_encrypted.encode('utf-8')).decode('utf-8')
-    except InvalidToken:
-        raise EncryptionError(
-            'The stored TeleCMI secret does not match this tenant\'s key.'
-        )
+def decrypt_default_agent_password(credential) -> str:
+    """
+    Decrypt the tenant-wide default agent (extension) password.
+
+    This is the shared TeleCMI extension every user of the tenant falls back to
+    when they have no personal `TeleCMIAgent` row. It is stored under the same
+    per-tenant DEK as the app secret — never in plaintext, never under a
+    scheme of its own.
+    """
+    return decrypt_with_dek(
+        credential.default_agent_password_encrypted,
+        credential.dek_wrapped,
+        label='default agent password',
+    )
 
 
 def needs_upgrade(credential) -> bool:
