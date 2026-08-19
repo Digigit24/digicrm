@@ -1,6 +1,6 @@
 import logging
 from datetime import timedelta
-from decouple import config as env_config
+from common.env import config as env_config
 
 from django.utils import timezone
 from django.http import HttpResponse

@@ -4,38 +4,15 @@ Django settings for digicrm project.
 
 import os
 from pathlib import Path
-from decouple import AutoConfig, Config, Csv, RepositoryEnv
+from common.env import config, Csv  # shared .env.local resolver
 import dj_database_url
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# ---------------------------------------------------------------------------
-# Environment file resolution
-#
-# python-decouple's default AutoConfig only ever reads ``.env``. We want a
-# local developer's ``.env.local`` to win over the shared ``.env`` without
-# anyone having to edit or clobber the latter, so build the Config explicitly.
-#
-# Precedence: DJANGO_ENV_FILE (explicit override) > .env.local > .env
-# ``.env.local`` is gitignored and must contain localhost-only values.
-# ---------------------------------------------------------------------------
-def _resolve_env_file(base_dir):
-    explicit = os.environ.get('DJANGO_ENV_FILE')
-    if explicit and Path(explicit).is_file():
-        return Path(explicit)
-    for name in ('.env.local', '.env'):
-        candidate = base_dir / name
-        if candidate.is_file():
-            return candidate
-    return None
+# Environment resolution (which .env file wins) lives in common/env.py so that
+# modules importing `config` directly all agree with settings.py.
 
-
-_ENV_FILE = _resolve_env_file(BASE_DIR)
-if _ENV_FILE is not None:
-    config = Config(RepositoryEnv(str(_ENV_FILE)))
-else:
-    config = AutoConfig(search_path=str(BASE_DIR))
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-temporary-key-change-in-production')
@@ -506,7 +483,9 @@ TELECMI_MASTER_KEY = config('TELECMI_MASTER_KEY', default=None)
 # returned by an API response, or persisted on a model. It is read in exactly
 # one place: integrations/services/composio_client.py.
 COMPOSIO_API_KEY = config('COMPOSIO_API_KEY', default='')
-COMPOSIO_BASE_URL = config('COMPOSIO_BASE_URL', default='https://backend.composio.dev/api/v3.1')
+# Host root only. The SDK appends its own '/api/v<version>' path, so including
+# it here produces '/api/v3.1/api/v3.1/...' and every call 404s.
+COMPOSIO_BASE_URL = config('COMPOSIO_BASE_URL', default='https://backend.composio.dev')
 COMPOSIO_ENABLED = config('COMPOSIO_ENABLED', default=False, cast=bool)
 
 # Namespace prefix for Composio entity ids: "{namespace}:{tenant_id}:{user_id}".

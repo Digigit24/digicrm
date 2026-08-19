@@ -16,7 +16,7 @@ import json
 import logging
 import re
 
-from decouple import config
+from common.env import config
 from django.http import StreamingHttpResponse
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -58,7 +58,9 @@ AI_TOOLS_ENABLED = _env_bool("AI_TOOLS_ENABLED", True)
 AI_MAX_TOOL_ITERS = _env_int("AI_MAX_TOOL_ITERS", 5)
 
 NOT_CONFIGURED_MESSAGE = (
-    "AI provider not configured — add MOONSHOT_API_KEY to digicrm/.env"
+    "AI provider not configured. Set one of these in digicrm/.env.local: "
+    "HERMES_API_KEY + HERMES_API_BASE_URL (any OpenAI-compatible endpoint), "
+    "MOONSHOT_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, or XAI_API_KEY."
 )
 
 

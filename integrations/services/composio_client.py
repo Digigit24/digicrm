@@ -35,6 +35,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -48,6 +49,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
+
+
+_API_VERSION_SUFFIX = re.compile(r'/api(?:/v\d+(?:\.\d+)*)?/?$', re.IGNORECASE)
+
+
+def _strip_api_version(url: str) -> str:
+    """Reduce a Composio base URL to its host root.
+
+    ``https://backend.composio.dev/api/v3.1`` -> ``https://backend.composio.dev``
+    Idempotent, so an already-correct value passes through untouched.
+    """
+    return _API_VERSION_SUFFIX.sub('', (url or '').rstrip('/')) or url
 
 class ComposioError(Exception):
     """Base for all Composio failures surfaced to callers."""
@@ -342,7 +355,10 @@ class ComposioClient:
         kwargs = {'api_key': self._api_key}
         base_url = getattr(settings, 'COMPOSIO_BASE_URL', None)
         if base_url:
-            kwargs['base_url'] = base_url
+            # The SDK appends its own '/api/v<version>' path. Composio's docs
+            # quote the full versioned URL, so operators paste it here and every
+            # call 404s on a doubled path. Strip it rather than silently break.
+            kwargs['base_url'] = _strip_api_version(base_url)
         timeout = getattr(settings, 'COMPOSIO_HTTP_TIMEOUT', None)
         if timeout:
             kwargs['timeout'] = int(timeout)

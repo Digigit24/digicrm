@@ -5,7 +5,7 @@ import json
 import time
 import os
 try:
-    from decouple import config as _cfg
+    from common.env import config as _cfg
 except ImportError:
     _cfg = lambda k, default="": os.environ.get(k, default)
 import logging

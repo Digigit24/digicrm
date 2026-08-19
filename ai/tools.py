@@ -26,7 +26,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import requests
-from decouple import config
+from common.env import config
 
 logger = logging.getLogger(__name__)
 

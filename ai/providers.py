@@ -4,10 +4,17 @@ Multi-provider AI text-streaming router for the Celiyo copilot (Phase 1).
 Phase 1 scope: TEXT streaming only. No tool-calling (Phase 2).
 
 Providers (tried in this order, using whichever API keys are configured):
-    1. Kimi / Moonshot   — OpenAI-compatible  (MOONSHOT_API_KEY)  [PRIMARY]
-    2. OpenAI            — OpenAI-compatible   (OPENAI_API_KEY)
-    3. Gemini            — Google REST         (GEMINI_API_KEY)   [thin adapter]
-    4. Grok / xAI        — OpenAI-compatible   (XAI_API_KEY)
+    0. Hermes / self-hosted — ANY OpenAI-compatible endpoint (HERMES_API_KEY) [PRIMARY]
+    1. Kimi / Moonshot      — OpenAI-compatible  (MOONSHOT_API_KEY)
+    2. OpenAI               — OpenAI-compatible  (OPENAI_API_KEY)
+    3. Gemini               — Google REST        (GEMINI_API_KEY)   [thin adapter]
+    4. Grok / xAI           — OpenAI-compatible  (XAI_API_KEY)
+
+The Hermes slot is deliberately generic: it is not tied to any vendor, it just
+points at a base URL that speaks the standard `{base_url}/chat/completions`
+contract. Use it for a self-hosted gateway, a local runtime (Ollama, vLLM,
+LM Studio, LiteLLM), or any third party that implements the OpenAI API. It is
+tried first so a self-hosted endpoint wins over paid vendors when both are set.
 
 We deliberately use `requests` (already a dependency) instead of the `openai`
 SDK: the OpenAI-compatible providers all expose the same
@@ -23,7 +30,7 @@ import logging
 from typing import Dict, Generator, List, Optional
 
 import requests
-from decouple import config
+from common.env import config
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +46,32 @@ _GENERIC_INTERRUPTED_ERROR = "The AI assistant response was interrupted. Please 
 # Provider configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _hermes_config() -> Optional[dict]:
+    """A generic, self-hosted OpenAI-compatible endpoint.
+
+    Not vendor-specific: set HERMES_API_BASE_URL to anything that implements
+    `POST {base_url}/chat/completions` with bearer auth. The trailing `/v1` (or
+    equivalent) belongs in the base URL, exactly as the vendor documents it.
+    """
+    key = config("HERMES_API_KEY", default="")
+    base = config("HERMES_API_BASE_URL", default="")
+    if not key or not base:
+        return None
+    return {
+        "name": "hermes",
+        "base_url": base.rstrip("/"),
+        "api_key": key,
+        "model": config("HERMES_MODEL", default="hermes-agent"),
+    }
+
+
 def _provider_configs() -> List[dict]:
     """Return the ordered list of OpenAI-compatible providers that have a key."""
     configs = []
+
+    hermes = _hermes_config()
+    if hermes:
+        configs.append(hermes)
 
     moonshot_key = config("MOONSHOT_API_KEY", default="")
     if moonshot_key:
@@ -89,7 +119,8 @@ def _gemini_config() -> Optional[dict]:
 
 def any_provider_configured() -> bool:
     return bool(
-        config("MOONSHOT_API_KEY", default="")
+        (config("HERMES_API_KEY", default="") and config("HERMES_API_BASE_URL", default=""))
+        or config("MOONSHOT_API_KEY", default="")
         or config("OPENAI_API_KEY", default="")
         or config("GEMINI_API_KEY", default="")
         or config("XAI_API_KEY", default="")
@@ -240,7 +271,7 @@ def stream_chat(
         norm = [{"role": "system", "content": preamble}] + norm
 
     # Build the ordered provider chain.
-    chain = list(_provider_configs())  # kimi, openai
+    chain = list(_provider_configs())  # hermes, kimi, openai
     gem = _gemini_config()
     if gem:
         chain.append(gem)
@@ -305,7 +336,7 @@ _MAX_TOOL_ITERS_DEFAULT = 5
 
 
 def _tool_capable_chain() -> List[dict]:
-    """Ordered tool-capable providers with a key (Kimi → OpenAI → Grok).
+    """Ordered tool-capable providers with a key (Hermes → Kimi → OpenAI → Grok).
 
     Gemini is intentionally excluded — its tool-calling wire format differs, so
     it stays a text-only fallback (see stream_chat).
