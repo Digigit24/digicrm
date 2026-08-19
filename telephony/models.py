@@ -32,6 +32,18 @@ class SMSStatusEnum(models.TextChoices):
     FAILED = 'failed', 'Failed'
 
 
+# TeleCMI login tokens last 24h; refresh at 20 so a long call never straddles
+# an expiry. Shared by the per-user agent and the tenant default extension.
+TOKEN_MAX_AGE_SECONDS = 72000
+
+
+def token_is_stale(token, obtained_at):
+    """True when a cached TeleCMI login token is missing or past refresh age."""
+    if not token or not obtained_at:
+        return True
+    return (timezone.now() - obtained_at).total_seconds() > TOKEN_MAX_AGE_SECONDS
+
+
 SBC_HOST_MAP = {
     SBCRegionEnum.ASIA: 'sbcsg.telecmi.com',
     SBCRegionEnum.INDIA: 'sbcind.telecmi.com',
@@ -89,6 +101,16 @@ class TeleCMICredential(models.Model):
             'DEK — the same envelope scheme as `secret_encrypted`.'
         ),
     )
+    default_agent_token = models.TextField(
+        null=True,
+        blank=True,
+        help_text='Cached /v2/user/login token for the shared default extension.',
+    )
+    default_agent_token_obtained_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text='When default_agent_token was last obtained.',
+    )
     default_agent_verified_at = models.DateTimeField(
         null=True,
         blank=True,
@@ -132,6 +154,9 @@ class TeleCMICredential(models.Model):
         """True when this tenant has a usable shared softphone extension."""
         return bool(self.default_agent_id and self.default_agent_password_encrypted)
 
+    def is_default_token_stale(self):
+        return token_is_stale(self.default_agent_token, self.default_agent_token_obtained_at)
+
 
 class TeleCMIAgent(models.Model):
     """
@@ -173,10 +198,7 @@ class TeleCMIAgent(models.Model):
 
     def is_token_stale(self):
         """Token is considered stale after 20 hours (TeleCMI tokens last 24h)."""
-        if not self.token_obtained_at or not self.cached_token:
-            return True
-        age = timezone.now() - self.token_obtained_at
-        return age.total_seconds() > 72000  # 20 hours
+        return token_is_stale(self.cached_token, self.token_obtained_at)
 
 
 class ZataStorageCredential(models.Model):

@@ -20,28 +20,77 @@ def get_agent_token(tenant_id, user_id) -> str:
     """
     Return a valid TeleCMI token for the given CRM user.
 
-    Checks TeleCMIAgent.cached_token freshness first.
-    If stale or absent, re-authenticates with TeleCMI and caches the new token.
+    Resolution mirrors the softphone config endpoint so that every telephony
+    action agrees on which extension a user is:
 
-    Raises TokenServiceError if no agent record exists or login fails.
+      1. the user's own `TeleCMIAgent` row, using its cached token when fresh;
+      2. otherwise the tenant's shared default extension, cached on the
+         credential row.
+
+    Without step 2 a tenant that configured only a shared extension would get a
+    softphone that connects but 424s on click-to-call, SMS, caller IDs, breaks,
+    callbacks and notes — every one of those funnels through here.
+
+    Raises TokenServiceError if neither resolves or login fails.
     """
     # Import here to avoid circular imports at module load time
     from telephony.models import TeleCMIAgent
 
-    try:
-        agent = TeleCMIAgent.objects.get(tenant_id=tenant_id, user_id=user_id, is_active=True)
-    except TeleCMIAgent.DoesNotExist:
+    agent = TeleCMIAgent.objects.filter(
+        tenant_id=tenant_id, user_id=user_id, is_active=True
+    ).first()
+
+    if agent:
+        if not agent.is_token_stale():
+            logger.debug('Using cached TeleCMI token for user %s', user_id)
+            return agent.cached_token
+        logger.info('TeleCMI token stale for user %s, re-authenticating', user_id)
+        return _refresh_token(agent)
+
+    return _get_tenant_default_token(tenant_id, user_id)
+
+
+def _get_tenant_default_token(tenant_id, user_id) -> str:
+    """Token for the tenant-wide shared extension, refreshed when stale."""
+    from django.utils import timezone
+    from telephony.services.crypto import decrypt_default_agent_password
+
+    credential = get_tenant_credential(tenant_id)
+    if not credential.has_default_agent:
         raise TokenServiceError(
-            f'No active TeleCMI agent configured for user {user_id} in tenant {tenant_id}. '
-            'Ask your admin to set up telephony credentials.'
+            f'No TeleCMI extension is available for user {user_id} in tenant '
+            f'{tenant_id}. Ask your admin to set a default extension under '
+            'Settings -> TeleCMI, or to give this user their own extension '
+            'under Settings -> TeleCMI -> Agents.'
         )
 
-    if not agent.is_token_stale():
-        logger.debug('Using cached TeleCMI token for user %s', user_id)
-        return agent.cached_token
+    if not credential.is_default_token_stale():
+        logger.debug('Using cached tenant-default TeleCMI token for %s', tenant_id)
+        return credential.default_agent_token
 
-    logger.info('TeleCMI token stale for user %s, re-authenticating', user_id)
-    return _refresh_token(agent)
+    try:
+        password = decrypt_default_agent_password(credential)
+    except EncryptionError as exc:
+        raise TokenServiceError(
+            'The shared TeleCMI extension password cannot be decrypted. '
+            'Re-enter it under Settings -> TeleCMI and save.'
+        ) from exc
+
+    try:
+        token = get_user_login_token(credential.default_agent_id, password)
+    except TeleCMIError as exc:
+        raise TokenServiceError(
+            f'TeleCMI login failed for shared extension '
+            f'{credential.default_agent_id}: {exc}'
+        )
+
+    credential.default_agent_token = token
+    credential.default_agent_token_obtained_at = timezone.now()
+    credential.save(update_fields=[
+        'default_agent_token', 'default_agent_token_obtained_at', 'updated_at',
+    ])
+    logger.info('Refreshed tenant-default TeleCMI token for tenant %s', tenant_id)
+    return token
 
 
 def _refresh_token(agent) -> str:
@@ -78,6 +127,27 @@ def invalidate_token(tenant_id, user_id) -> None:
     )
     if updated:
         logger.info('Invalidated TeleCMI token for user %s in tenant %s', user_id, tenant_id)
+    else:
+        # The user is on the tenant's shared extension; that is the token that
+        # actually needs clearing.
+        invalidate_tenant_default_token(tenant_id)
+
+
+def invalidate_tenant_default_token(tenant_id) -> None:
+    """
+    Drop the cached token for a tenant's shared extension.
+
+    Called whenever the shared extension or its password changes, so a
+    just-corrected credential takes effect on the next request instead of after
+    the 20-hour refresh window.
+    """
+    from telephony.models import TeleCMICredential
+
+    updated = TeleCMICredential.objects.filter(tenant_id=tenant_id).update(
+        default_agent_token=None, default_agent_token_obtained_at=None
+    )
+    if updated:
+        logger.info('Invalidated tenant-default TeleCMI token for tenant %s', tenant_id)
 
 
 def get_tenant_credential(tenant_id):
