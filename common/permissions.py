@@ -103,6 +103,12 @@ OWNERSHIP_FIELDS = {
     },
     'tasks.Task': {
         'owner': 'owner_user_id',
+        # ``own`` is a TUPLE here, which the default single-field behaviour is
+        # not: a task your manager created and assigned to you has
+        # owner_user_id = the manager, so with ``crm.tasks.view: "own"`` the
+        # person actually doing the work could not see it.  Ownership of a task
+        # is "mine to do OR mine to have raised".
+        'own': ('owner_user_id', 'assignee_user_id'),
         'team': ('owner_user_id', 'assignee_user_id', 'reporter_user_id'),
     },
 }
@@ -145,6 +151,21 @@ def get_object_owner_id(obj):
         return value
     except Exception:
         return None
+
+
+def _own_fields_for(model_label):
+    """Fields that count as "mine" for ``own`` scope.
+
+    Most models register a single ``owner`` field.  A model may instead register
+    an ``own`` tuple when more than one column legitimately means ownership (see
+    ``tasks.Task``).  Returns a tuple either way, or ``()`` when unregistered.
+    """
+    entry = OWNERSHIP_FIELDS.get(model_label, {})
+    own = entry.get('own')
+    if own:
+        return tuple(own)
+    owner = entry.get('owner')
+    return (owner,) if owner else ()
 
 
 def _team_fields_for(obj):
@@ -288,6 +309,14 @@ def check_object_permission(request, obj, permission_key):
         return _is_team_member(obj, user_id)
 
     if permission_value == "own":
+        own_fields = _own_fields_for(_model_label(obj))
+        if len(own_fields) > 1:
+            # Multi-field ownership (tasks): any matching column makes it mine.
+            for field in own_fields:
+                value = getattr(obj, field, None)
+                if value is not None and str(value) == str(user_id):
+                    return True
+            return _permission_action(permission_key) == 'create'
         owner_id = get_object_owner_id(obj)
         if owner_id is None:
             # Allow create actions to proceed even though there is no object yet;
@@ -360,12 +389,17 @@ def get_queryset_for_permission(queryset, request, view_permission_key, owner_fi
                 filtered = filtered.distinct()
             return filtered
         elif permission_value == "own":
+            from django.db.models import Q
             model_label = _model_label(queryset)
-            registered_owner = OWNERSHIP_FIELDS.get(model_label, {}).get('owner')
-            if registered_owner:
-                owner_field = registered_owner
-            filter_kwargs = {owner_field: _actor_id(request)}
-            return base_queryset.filter(**filter_kwargs)
+            own_fields = _own_fields_for(model_label) or (owner_field,)
+            actor = _actor_id(request)
+            own_q = Q()
+            for field in own_fields:
+                own_q |= Q(**{field: actor})
+            filtered = base_queryset.filter(own_q)
+            if any('__' in field for field in own_fields):
+                filtered = filtered.distinct()
+            return filtered
 
     return queryset.none()
 
