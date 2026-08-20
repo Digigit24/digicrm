@@ -42,6 +42,34 @@ def _meeting_notification_defaults(reminder):
     }
 
 
+def _task_notification_defaults(reminder):
+    """Notification payload for a task reminder (subject_type == TASK)."""
+    task = reminder.task
+    lead = reminder.lead
+    return {
+        'tenant_id': reminder.tenant_id,
+        'recipient_user_id': reminder.recipient_user_id,
+        'reminder': reminder,
+        'lead': lead,
+        'notification_type': 'TASK_REMINDER',
+        'title': task.title[:200] if task else 'Task due',
+        'body': 'Your task is due soon.',
+        'lead_name_snapshot': (lead.name[:255] if lead else ''),
+        'action_url': ('/crm/tasks?task=%s' % task.id if task else '/crm/tasks'),
+        'payload': {
+            'task_id': task.id if task else None,
+            'related_type': task.related_type if task else None,
+            'related_id': task.related_id if task else None,
+            'lead_id': lead.id if lead else None,
+            'due_date': (task.due_date.isoformat() if task and task.due_date else None),
+            'timezone': task.timezone if task else 'UTC',
+            'offset_minutes': reminder.offset_minutes,
+            'method': reminder.method,
+            'remind_at': reminder.remind_at.isoformat(),
+        },
+    }
+
+
 def _lead_notification_defaults(reminder):
     lead = reminder.lead
     return {
@@ -67,7 +95,7 @@ def _deliver_claimed_reminder(reminder_id, now):
     with transaction.atomic():
         reminder = (
             Reminder.objects.select_for_update()
-            .select_related('lead', 'meeting')
+            .select_related('lead', 'meeting', 'task')
             .filter(pk=reminder_id)
             .first()
         )
@@ -86,14 +114,21 @@ def _deliver_claimed_reminder(reminder_id, now):
             reminder.subject_type == ReminderSubjectType.MEETING
             or reminder.meeting_id is not None
         )
+        is_task = (
+            reminder.subject_type == ReminderSubjectType.TASK
+            or reminder.task_id is not None
+        )
         if is_meeting:
             dedupe_key = 'meeting-reminder:%s' % reminder.id
             defaults = _meeting_notification_defaults(reminder)
+        elif is_task:
+            dedupe_key = 'task-reminder:%s' % reminder.id
+            defaults = _task_notification_defaults(reminder)
         elif reminder.lead_id is None:
             # Nothing addressable to deliver -- do not poison the queue.
             reminder.status = ReminderStatus.CANCELLED
             reminder.locked_at = None
-            reminder.last_error = 'Reminder has neither a lead nor a meeting.'
+            reminder.last_error = 'Reminder has no lead, meeting or task.'
             reminder.save(update_fields=['status', 'locked_at', 'last_error', 'updated_at'])
             return None
         else:
