@@ -1025,16 +1025,19 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     if name == 'create_task':
         if not OWNER_USER_ID:
             raise RuntimeError('MCP_OWNER_USER_ID env var not set')
-        # Task.lead is non-nullable; an unvalidated id would attach this
+        # Task.lead is optional now, but an id that IS supplied still has to be
+        # validated against this tenant: an unvalidated id would attach this
         # tenant's task to another tenant's lead and leak its name back through
         # list_tasks(lead__name).
-        lead = _require(Lead, args.get('lead_id'), 'Lead', tenant_id=TENANT_ID)
+        lead = None
+        if args.get('lead_id'):
+            lead = _require(Lead, args['lead_id'], 'Lead', tenant_id=TENANT_ID)
         task = Task.objects.create(
             tenant_id=TENANT_ID,
             owner_user_id=OWNER_USER_ID,
             title=args['title'],
             description=args.get('description') or '',
-            lead_id=lead.id,
+            lead_id=lead.id if lead else None,
             due_date=args.get('due_date'),
             priority=args.get('priority', 'MEDIUM'),
             assignee_user_id=args.get('assignee_user_id') or None,
