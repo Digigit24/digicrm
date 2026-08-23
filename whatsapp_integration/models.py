@@ -18,6 +18,22 @@ class SequenceEnrollmentStatusEnum(models.TextChoices):
     REPLIED = 'REPLIED', 'Replied — stopped on reply'
 
 
+class SequenceStepDeliveryStatusEnum(models.TextChoices):
+    """
+    Outcome of one attempt to send one sequence step to one lead.
+
+    ``SENDING`` is written and COMMITTED *before* the HTTP call, so a worker
+    that dies mid-send leaves evidence behind.  The stepper never re-sends a
+    row it finds stuck in ``SENDING`` -- it flips it to ``UNKNOWN`` and moves
+    on, because a duplicate WhatsApp message to a real customer is worse than
+    a skipped follow-up.
+    """
+    SENDING = 'SENDING', 'Sending — claimed, outcome not yet known'
+    SENT = 'SENT', 'Sent'
+    FAILED = 'FAILED', 'Failed — safe to retry'
+    UNKNOWN = 'UNKNOWN', 'Unknown — worker died mid-send, never retried'
+
+
 class AgentActionTypeEnum(models.TextChoices):
     SEND_WHATSAPP = 'SEND_WHATSAPP', 'Send WhatsApp'
     ENROLL_SEQUENCE = 'ENROLL_SEQUENCE', 'Enroll in Sequence'
@@ -284,6 +300,28 @@ class LeadSequenceEnrollment(models.Model):
         null=True, blank=True,
         help_text='User or agent who enrolled this lead'
     )
+    run_number = models.IntegerField(
+        default=1,
+        help_text='Incremented every time a stopped enrollment is re-enrolled. '
+                  'Part of the per-step send marker key, so a re-enrolled lead '
+                  'legitimately receives step 1 again while a single run still '
+                  'sends each step at most once.'
+    )
+    locked_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Set by the Celery stepper when it claims this row. Non-null '
+                  'means a worker owns it; a claim older than '
+                  'WHATSAPP_SEQUENCE_CLAIM_STALE_MINUTES is released.'
+    )
+    attempt_count = models.IntegerField(
+        default=0,
+        help_text='Consecutive failed send attempts for the CURRENT step. '
+                  'Reset to 0 after a successful send.'
+    )
+    last_error = models.TextField(
+        blank=True, default='',
+        help_text='Why the most recent send attempt failed.'
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -295,10 +333,121 @@ class LeadSequenceEnrollment(models.Model):
             models.Index(fields=['status'], name='idx_lse_status'),
             models.Index(fields=['next_step_at'], name='idx_lse_next_step_at'),
             models.Index(fields=['lead'], name='idx_lse_lead'),
+            # Audit item M5. The beat task polls
+            #   status = 'ACTIVE' AND next_step_at <= now() ORDER BY next_step_at
+            # every minute, forever. Without a partial index that is a full scan
+            # of every enrollment ever created, almost all of which are terminal.
+            models.Index(
+                fields=['next_step_at'],
+                name='idx_lse_due_active',
+                condition=models.Q(status='ACTIVE', next_step_at__isnull=False),
+            ),
         ]
 
     def __str__(self):
         return f"{self.lead.name} → {self.sequence.name} [{self.status}]"
+
+    def restart(self, next_step_at, enrolled_by=None):
+        """
+        Re-activate a stopped enrollment from the top of the sequence.
+
+        Bumping ``run_number`` is what lets the lead receive step 1 again
+        without tripping the per-run send marker
+        (:class:`SequenceStepDelivery`). Every re-enroll path MUST go through
+        here, otherwise the stepper finds an old ``SENT`` marker for step 1 and
+        silently skips the step instead of sending it.
+        """
+        self.status = SequenceEnrollmentStatusEnum.ACTIVE
+        self.current_step = None
+        self.next_step_at = next_step_at
+        self.completed_at = None
+        self.stopped_reason = None
+        self.run_number = (self.run_number or 1) + 1
+        self.locked_at = None
+        self.attempt_count = 0
+        self.last_error = ''
+        if enrolled_by is not None:
+            self.enrolled_by = enrolled_by
+        self.save()
+        return self
+
+
+class SequenceStepDelivery(models.Model):
+    """
+    One send marker per (enrollment, step, run) -- the idempotency key for the
+    Celery stepper.
+
+    The row is created and COMMITTED before the outbound HTTP call, inside the
+    same transaction that claims the enrollment. That ordering is the whole
+    point: if the worker is killed between the commit and Meta accepting the
+    message, the marker survives as ``SENDING`` and the next poll refuses to
+    send that step again.
+
+    The unique constraint is the hard guarantee. Two workers that somehow raced
+    past the row lock still could not both insert, so at most one of them sends.
+    """
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    enrollment = models.ForeignKey(
+        LeadSequenceEnrollment,
+        on_delete=models.CASCADE,
+        related_name='deliveries',
+        db_column='enrollment_id',
+    )
+    step = models.ForeignKey(
+        WhatsAppSequenceStep,
+        on_delete=models.CASCADE,
+        related_name='deliveries',
+        db_column='step_id',
+    )
+    run_number = models.IntegerField(
+        default=1,
+        help_text='LeadSequenceEnrollment.run_number at the time of the send.'
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=SequenceStepDeliveryStatusEnum.choices,
+        default=SequenceStepDeliveryStatusEnum.SENDING,
+    )
+    attempt = models.IntegerField(default=1)
+    template_uid = models.CharField(max_length=100, blank=True, default='')
+    wa_message_id = models.TextField(blank=True, default='')
+    send_mode = models.CharField(
+        max_length=16, blank=True, default='TEMPLATE',
+        help_text='TEMPLATE -- sequence steps are always template sends, which '
+                  'is what keeps them legal outside the 24h session window.'
+    )
+    reply_window_open = models.BooleanField(
+        null=True, blank=True,
+        help_text='Canonical reply_window.open at send time. Null = unknown '
+                  '(the window lookup itself failed).'
+    )
+    reply_window_expires_at = models.TextField(
+        blank=True, default='',
+        help_text='Canonical reply_window.expires_at (ISO-8601) at send time.'
+    )
+    last_error = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'whatsapp_sequence_step_deliveries'
+        ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['enrollment', 'step', 'run_number'],
+                name='unique_delivery_per_enrollment_step_run',
+            ),
+        ]
+        indexes = [
+            # tenant_id (db_index) and both FKs already get their own indexes.
+            # Only the status lookup -- "find markers stuck in SENDING" -- needs
+            # one adding.
+            models.Index(fields=['status'], name='idx_wssd_status'),
+        ]
+
+    def __str__(self):
+        return f"enrollment={self.enrollment_id} step={self.step_id} [{self.status}]"
 
 
 class AgentActionLog(models.Model):
