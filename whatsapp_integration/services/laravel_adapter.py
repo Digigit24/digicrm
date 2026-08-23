@@ -70,7 +70,66 @@ def _make_request(method: str, url: str, token: str, **kwargs) -> dict:
         msg = data.get('message') or data.get('error') or f"HTTP {resp.status_code}"
         raise LaravelAdapterError(f"Laravel adapter error: {msg}", status_code=resp.status_code)
 
+    _raise_on_failed_body(data, url)
+
     return data
+
+
+# Laravel's ApiVendorAccessCheckpost rejects bad credentials through
+# processExternalApiResponse(), and that helper calls response()->json() with
+# NO status argument -- so "Invalid Token", "Invalid Vendor" and "Vendor
+# account is not in active state" all come back as **HTTP 200** with a
+# {"result":"failed"} body (helpers.php:1205-1219).  Checking only
+# status_code >= 400 therefore treats a rotated or wrong vendor token as a
+# successful send: callers get {'result': 'failed'} where they expected
+# wa_message_id, and the user is told "message sent".
+_AUTH_FAILURE_MARKERS = (
+    'invalid token',
+    'invalid vendor',
+    'not in active state',
+    'unauthorized',
+    'unauthenticated',
+    'access denied',
+    'invalid api',
+)
+
+
+def _raise_on_failed_body(data, url: str = ''):
+    """Detect Laravel's ``200 {"result":"failed"}`` shape and raise properly."""
+    if not isinstance(data, dict):
+        return
+
+    result = data.get('result')
+    if not (isinstance(result, str) and result.strip().lower() == 'failed'):
+        return
+
+    message = (
+        data.get('message')
+        or data.get('error')
+        or 'Laravel adapter reported failure'
+    )
+    if not isinstance(message, str):
+        message = str(message)
+
+    lowered = message.lower()
+    if any(marker in lowered for marker in _AUTH_FAILURE_MARKERS):
+        status_code = 502
+        prefix = 'Laravel adapter rejected our vendor credentials'
+        logger.error(
+            '[WA Adapter] Laravel returned HTTP 200 with an AUTH failure body. '
+            'url=%s message=%s — the vendor API token is wrong, rotated, or the '
+            'vendor account is inactive.',
+            url, message,
+        )
+    else:
+        status_code = 502
+        prefix = 'Laravel adapter error'
+        logger.warning(
+            '[WA Adapter] Laravel returned HTTP 200 with result=failed. url=%s message=%s',
+            url, message,
+        )
+
+    raise LaravelAdapterError(f'{prefix}: {message}', status_code=status_code)
 
 
 def _unwrap_data(data):
@@ -453,15 +512,77 @@ class LaravelWhatsAppAdapter:
     def get_flow_stats(self) -> dict:
         return self.vendor_request('GET', 'flows/stats')
 
+    # ------------------------------------------------------------------
+    # CONVERSATION LIST (vendor chat routes)
+    # ------------------------------------------------------------------
+    def get_conversations(self, params: dict = None) -> dict:
+        """
+        Fetch the vendor's chat contact list (one row per conversation).
+
+        Laravel route: ``GET /api/{vendorUid}/chat/contacts``
+        (``WhatsAppServiceController::apiGetChatContacts``).
+        """
+        return self.vendor_request('GET', 'chat/contacts', params=params or {})
+
+    def get_unread_count(self) -> dict:
+        """Laravel route: ``GET /api/{vendorUid}/chat/unread-count``."""
+        return self.vendor_request('GET', 'chat/unread-count')
+
     def fetch_media(self, filename: str):
-        """Fetch public Laravel media via the configured gateway URL."""
-        url = self._vendor_url(f"media/{filename.lstrip('/')}")
+        """
+        Fetch Laravel-hosted media **server-side**.
+
+        ``filename`` must already have been validated by the caller (see
+        ``services.media``): Laravel's media route is an unauthenticated
+        ``public_path($filename)`` with no traversal guard, so a raw
+        client-controlled value here is an arbitrary file read.  This method is
+        therefore never called with anything but a path this server itself
+        signed.
+
+        Returns ``(content_bytes, content_type, upstream_headers)``.
+        """
+        safe = str(filename or '').lstrip('/')
+        # Belt-and-braces: refuse obviously hostile paths even though the
+        # caller is supposed to have verified an HMAC first.
+        if not safe or '..' in safe or '\\' in safe or '\x00' in safe or '://' in safe:
+            raise LaravelAdapterError('Invalid media path', status_code=400)
+
+        url = self._vendor_url(f'media/{safe}')
         try:
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(
+                url,
+                timeout=20,
+                # Laravel's media route ignores auth, but sending the vendor
+                # credential keeps us correct if it is ever locked down.
+                headers={'Authorization': f'Bearer {self.api_token}'},
+                stream=True,
+            )
         except requests.exceptions.Timeout:
             raise LaravelAdapterError("Laravel media request timed out", status_code=504)
         except requests.exceptions.ConnectionError as e:
             raise LaravelAdapterError(f"Cannot connect to Laravel media: {e}", status_code=503)
+
         if resp.status_code >= 400:
-            raise LaravelAdapterError(f"Laravel media error: HTTP {resp.status_code}", status_code=resp.status_code)
-        return resp.content, resp.headers.get('Content-Type', 'application/octet-stream')
+            raise LaravelAdapterError(
+                f"Laravel media error: HTTP {resp.status_code}",
+                status_code=resp.status_code,
+            )
+
+        max_bytes = 64 * 1024 * 1024
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                resp.close()
+                raise LaravelAdapterError('Media file too large', status_code=502)
+            chunks.append(chunk)
+        resp.close()
+
+        return (
+            b''.join(chunks),
+            resp.headers.get('Content-Type', 'application/octet-stream'),
+            resp.headers,
+        )
