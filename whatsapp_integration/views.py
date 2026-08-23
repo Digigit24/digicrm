@@ -38,6 +38,14 @@ from .serializers import (
     AgentActionLogSerializer,
 )
 from .services.laravel_adapter import LaravelWhatsAppAdapter, LaravelAdapterError
+from .services.media import (
+    MediaReferenceError, is_safe_media_path, resolve_media_id,
+    safe_content_type, safe_filename,
+)
+from .services.normalizer import normalize_message, normalize_messages, normalize_reply_window
+from .services.realtime import (
+    RealtimeGrantDenied, RealtimeNotConfigured, build_grant,
+)
 from .utils import normalize_msisdn
 
 logger = logging.getLogger(__name__)
@@ -1778,7 +1786,77 @@ class WhatsAppFlowActionProxyView(APIView):
         return Response(result)
 
 
+def _stream_media(request, path: str):
+    """
+    Fetch ``path`` from Laravel server-side and hand it back hardened.
+
+    ``path`` MUST already be trusted (signed id, or traversal-checked legacy
+    path).  Laravel's media route is ``public_path($filename)`` with no
+    containment, so a client-controlled value reaching here is an arbitrary
+    file read of the gateway host — including ``.env``, i.e. ``APP_KEY``, i.e.
+    every vendor's Meta access token.
+    """
+    if not is_safe_media_path(path):
+        logger.warning(
+            '[WA Media] Rejected unsafe media path. tenant=%s user=%s path=%r',
+            getattr(request, 'tenant_id', None), getattr(request, 'user_id', None), path,
+        )
+        return Response({'detail': 'Invalid media reference.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        content, upstream_type, _headers = _adapter_from_request(request).fetch_media(path)
+    except LaravelAdapterError as e:
+        return Response({'detail': str(e)}, status=e.status_code)
+
+    response = HttpResponse(content, content_type=safe_content_type(upstream_type))
+    # Never let a stored .html/.svg execute on the CRM origin.
+    response['Content-Disposition'] = f'attachment; filename="{safe_filename(path)}"'
+    response['X-Content-Type-Options'] = 'nosniff'
+    response['Content-Security-Policy'] = "default-src 'none'; sandbox"
+    response['Referrer-Policy'] = 'no-referrer'
+    response['Cache-Control'] = 'private, max-age=3600'
+    # Laravel's own route sends Access-Control-Allow-Origin: *. Do not repeat it.
+    return response
+
+
 class WhatsAppMediaProxyView(APIView):
+    """
+    GET /api/whatsapp/media/<id>/
+
+    ``<id>`` is the opaque, tenant-bound, HMAC-signed reference minted by
+    ``services.media.media_url`` and embedded in the normalised message
+    envelope.  A caller cannot construct one, so it cannot ask for a path we
+    did not choose to expose.
+    """
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'view'
+
+    def get(self, request, media_id):
+        try:
+            path = resolve_media_id(request.tenant_id, media_id)
+        except MediaReferenceError:
+            logger.warning(
+                '[WA Media] Bad media id. tenant=%s user=%s id=%r',
+                request.tenant_id, request.user_id, media_id[:120],
+            )
+            return Response({'detail': 'Invalid media reference.'}, status=status.HTTP_404_NOT_FOUND)
+        return _stream_media(request, path)
+
+
+class WhatsAppLegacyMediaProxyView(APIView):
+    """
+    GET /api/whatsapp/media/<path>/  — DEPRECATED.
+
+    Kept only so already-shipped clients keep working. Previously this passed
+    ``<path:filename>`` straight into Laravel's unguarded ``public_path()``,
+    which made the gateway's arbitrary file read reachable through DigiCRM by
+    any authenticated CRM user. It is now traversal-checked and hardened like
+    the signed route. New clients must use the ``media.url`` field from the
+    normalised message envelope.
+    """
     authentication_classes = [JWTAuthentication]
     permission_classes = [HasCRMPermission]
     permission_module = 'whatsapp'
@@ -1786,11 +1864,7 @@ class WhatsAppMediaProxyView(APIView):
     permission_action = 'view'
 
     def get(self, request, filename):
-        try:
-            content, content_type = _adapter_from_request(request).fetch_media(filename)
-        except LaravelAdapterError as e:
-            return Response({'detail': str(e)}, status=e.status_code)
-        return HttpResponse(content, content_type=content_type)
+        return _stream_media(request, (filename or '').lstrip('/'))
 
 
 # ---------------------------------------------------------------------------
@@ -1935,12 +2009,36 @@ class AITemplatesView(APIView):
         return Response({'results': templates, 'count': len(templates)})
 
 
+def _template_components(t: dict) -> list:
+    """
+    Return the Meta component array for a Laravel template row.
+
+    ``WhatsAppTemplateController::apiGetTemplates`` (:528-538) returns the raw
+    Meta object under **``template_data``**, not ``components``.  Reading
+    ``t['components']`` — as this module did — always yielded ``[]``, so every
+    template's body came back as an empty string and the AI agent could not
+    read a template before sending it.
+    """
+    if not isinstance(t, dict):
+        return []
+    candidates = (
+        (t.get('template_data') or {}).get('components') if isinstance(t.get('template_data'), dict) else None,
+        t.get('components'),
+        (t.get('template') or {}).get('components') if isinstance(t.get('template'), dict) else None,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, list) and candidate:
+            return candidate
+    return []
+
+
 def _template_body_text(t: dict) -> str:
     """Extract body text from a WhatsApp template dict."""
-    components = t.get('components') or []
-    for comp in components:
+    for comp in _template_components(t):
+        if not isinstance(comp, dict):
+            continue
         if (comp.get('type') or '').upper() == 'BODY':
-            return comp.get('text', '')
+            return comp.get('text') or ''
     return ''
 
 
@@ -2229,3 +2327,462 @@ class ContactSendTextByPhoneView(APIView):
             triggered_by=str(request.user_id),
         )
         return Response({'detail': 'Text message sent.', **(result or {})})
+
+
+# ---------------------------------------------------------------------------
+# Normalised chat surface  —  /api/whatsapp/chat/*  and  /api/whatsapp/realtime/*
+# ---------------------------------------------------------------------------
+# Everything below exists so the browser and the mobile app never have to talk
+# to the Laravel gateway directly.  Before this, the SepraCRM Inbox called
+# Laravel from the client using the tenant-wide `vendor_api_access_token` kept
+# in localStorage — a credential that authorises every vendor-scoped route on
+# the gateway (send, delete templates, dump contacts).  That token must never
+# reach a client.  These endpoints are the server-side replacement.
+# ---------------------------------------------------------------------------
+
+CHAT_PAGE_SIZE = 50
+MAX_CHAT_PAGE_SIZE = 100
+
+
+def _cursor_to_page(cursor) -> int:
+    """
+    Decode an opaque history cursor into a Laravel page number.
+
+    The cursor is deliberately opaque to the client so we can swap Laravel's
+    page/per_page pagination for a real keyset cursor later without needing
+    another frontend release.
+    """
+    if cursor in (None, '', 'null'):
+        return 1
+    text = str(cursor).strip()
+    if text.startswith('p'):
+        text = text[1:]
+    try:
+        page = int(text)
+    except (TypeError, ValueError):
+        return 1
+    return page if page >= 1 else 1
+
+
+def _page_to_cursor(page: int) -> str:
+    return f'p{page}'
+
+
+def _chat_payload(data):
+    """Laravel sometimes nests the adapter body under `data`. Flatten it."""
+    if isinstance(data, dict) and isinstance(data.get('data'), dict) and 'messages' in data['data']:
+        return data['data']
+    return data if isinstance(data, dict) else {}
+
+
+def _normalized_chat_response(request, data, page: int):
+    payload = _chat_payload(data)
+    pagination = payload.get('pagination') if isinstance(payload.get('pagination'), dict) else {}
+
+    # Laravel orders `messaged_at DESC` (newest first). The pinned contract is
+    # newest-LAST so a chat pane can append without re-sorting.
+    messages = normalize_messages(payload.get('messages'), request.tenant_id)
+    messages.reverse()
+
+    has_more = bool(pagination.get('has_more'))
+    if not has_more and pagination.get('last_page') is not None:
+        try:
+            has_more = int(pagination.get('current_page') or page) < int(pagination['last_page'])
+        except (TypeError, ValueError):
+            has_more = False
+
+    window = normalize_reply_window(payload)
+
+    return {
+        'contact': payload.get('contact'),
+        'messages': messages,
+        'reply_window': window,
+        # Compatibility aliases. Laravel emits `reply_window_expires_at`; both
+        # frontends read `window_expires_at` / `expires_at`, so the countdown
+        # has always rendered nothing. Emit every name until they converge on
+        # `reply_window`.
+        'reply_window_open': window['open'],
+        'requires_template': window['requires_template'],
+        'window_expires_at': window['expires_at'],
+        'expires_at': window['expires_at'],
+        'reply_window_expires_at': window['expires_at'],
+        'cursor': _page_to_cursor(page),
+        'next_cursor': _page_to_cursor(page + 1) if has_more else None,
+        'has_more': has_more,
+        'pagination': pagination or None,
+    }
+
+
+@extend_schema(
+    tags=['WhatsApp Chat'],
+    summary='Normalised WhatsApp chat history',
+    description=(
+        "Paginated message history for one WhatsApp contact, in DigiCRM's "
+        'normalised envelope. Messages are ordered **newest-last**. Follow '
+        '`next_cursor` to load OLDER history (prepend the result). Unknown '
+        'message types degrade to `type: "unsupported"` and are never dropped.'
+    ),
+    parameters=[
+        OpenApiParameter('contact', str, required=True, description='WhatsApp id / phone number.'),
+        OpenApiParameter('cursor', str, description='Opaque cursor from a previous `next_cursor`.'),
+        OpenApiParameter('limit', int, description='Page size (default 50, max 100).'),
+    ],
+)
+class WhatsAppChatView(APIView):
+    """GET /api/whatsapp/chat/?contact=<wa_id>&cursor="""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'view'
+
+    def get(self, request):
+        contact = _validate_phone(
+            request.query_params.get('contact') or request.query_params.get('phone')
+        )
+        if not contact:
+            return Response(
+                {'detail': 'contact query parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        page = _cursor_to_page(request.query_params.get('cursor'))
+        try:
+            limit = min(int(request.query_params.get('limit', CHAT_PAGE_SIZE)), MAX_CHAT_PAGE_SIZE)
+        except (TypeError, ValueError):
+            limit = CHAT_PAGE_SIZE
+        if limit < 1:
+            limit = CHAT_PAGE_SIZE
+
+        try:
+            data = _adapter_from_request(request).get_chat_history(contact, page, limit)
+        except LaravelAdapterError as e:
+            logger.error('[WA Chat] adapter error contact=%s status=%s error=%s',
+                         contact, e.status_code, e)
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        return Response(_normalized_chat_response(request, data, page))
+
+
+def _resolve_lead_id(request, raw):
+    """Coerce a client-supplied lead id, dropping anything not in this tenant."""
+    try:
+        lead_id = int(raw) if raw not in (None, '') else None
+    except (TypeError, ValueError):
+        return None
+    if lead_id is None:
+        return None
+    if not Lead.objects.filter(id=lead_id, tenant_id=request.tenant_id).exists():
+        return None
+    return lead_id
+
+
+@extend_schema(
+    tags=['WhatsApp Chat'],
+    summary='Send a free-form WhatsApp text message',
+    description=(
+        'Body: `{"contact": "<wa_id>", "text": "...", "name": "optional", '
+        '"lead_id": optional}`. Requires the 24-hour customer-service window '
+        'to be open — otherwise use `/chat/send-template/`.'
+    ),
+)
+class WhatsAppChatSendView(APIView):
+    """POST /api/whatsapp/chat/send/"""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'send'
+
+    def post(self, request):
+        contact = _validate_phone(request.data.get('contact') or request.data.get('phone'))
+        text = (request.data.get('text') or '').strip()
+        name = (request.data.get('name') or '').strip() or contact
+
+        if not contact:
+            return Response({'detail': 'contact is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not text:
+            return Response({'detail': 'text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        lead_id = _resolve_lead_id(request, request.data.get('lead_id'))
+
+        try:
+            result = _adapter_from_request(request).send_text_message(
+                phone=contact, name=name, text=text, digicrm_lead_id=lead_id,
+            )
+        except LaravelAdapterError as e:
+            logger.error('[WA ChatSend] adapter error contact=%s status=%s error=%s',
+                         contact, e.status_code, e)
+            _log_agent_action(
+                tenant_id=request.tenant_id,
+                action_type=AgentActionTypeEnum.SEND_WHATSAPP,
+                payload_in={'contact': contact, 'text': text, 'via': 'chat_send'},
+                status=AgentActionStatusEnum.FAILED,
+                error_message=str(e),
+            )
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        result = result or {}
+        _log_agent_action(
+            tenant_id=request.tenant_id,
+            action_type=AgentActionTypeEnum.SEND_WHATSAPP,
+            payload_in={'contact': contact, 'text': text, 'via': 'chat_send'},
+            payload_out=result,
+            triggered_by=str(request.user_id),
+        )
+
+        # Optimistic echo in the pinned envelope so the client can render the
+        # bubble immediately; the durable row arrives over Pusher / on refetch.
+        return Response({
+            'detail': 'Message sent.',
+            'message': normalize_message({
+                '_uid': result.get('message_uid') or result.get('contact_uid') or '',
+                'wamid': result.get('wa_message_id'),
+                'is_incoming_message': 0,
+                'status': 'sent',
+                'message': text,
+                'messaged_at': timezone.now().isoformat(),
+                'message_type': 'text',
+            }, request.tenant_id),
+            'result': result,
+        })
+
+
+@extend_schema(
+    tags=['WhatsApp Chat'],
+    summary='Send a WhatsApp template message',
+    description=(
+        'Body: `{"contact": "<wa_id>", "template_uid": "...", '
+        '"components": [...], "name": "optional", "lead_id": optional}`. '
+        'Use this when the 24-hour window is closed.'
+    ),
+)
+class WhatsAppChatSendTemplateView(APIView):
+    """POST /api/whatsapp/chat/send-template/"""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'send'
+
+    def post(self, request):
+        contact = _validate_phone(request.data.get('contact') or request.data.get('phone'))
+        template_uid = (request.data.get('template_uid') or '').strip()
+        components = request.data.get('components')
+        if components is None:
+            components = request.data.get('template_components')
+        if not isinstance(components, list):
+            components = []
+        name = (request.data.get('name') or '').strip() or contact
+
+        if not contact:
+            return Response({'detail': 'contact is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not template_uid:
+            return Response({'detail': 'template_uid is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        lead_id = _resolve_lead_id(request, request.data.get('lead_id'))
+
+        try:
+            result = _adapter_from_request(request).send_message(
+                phone=contact,
+                name=name,
+                template_uid=template_uid,
+                template_components=components,
+                digicrm_lead_id=lead_id,
+            )
+        except LaravelAdapterError as e:
+            logger.error('[WA ChatSendTemplate] adapter error contact=%s status=%s error=%s',
+                         contact, e.status_code, e)
+            _log_agent_action(
+                tenant_id=request.tenant_id,
+                action_type=AgentActionTypeEnum.SEND_WHATSAPP,
+                payload_in={'contact': contact, 'template_uid': template_uid,
+                            'via': 'chat_send_template'},
+                status=AgentActionStatusEnum.FAILED,
+                error_message=str(e),
+            )
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        result = result or {}
+        _log_agent_action(
+            tenant_id=request.tenant_id,
+            action_type=AgentActionTypeEnum.SEND_WHATSAPP,
+            payload_in={'contact': contact, 'template_uid': template_uid,
+                        'via': 'chat_send_template'},
+            payload_out=result,
+            triggered_by=str(request.user_id),
+        )
+
+        return Response({
+            'detail': 'Template message sent.',
+            'message': normalize_message({
+                '_uid': result.get('message_uid') or result.get('contact_uid') or '',
+                'wamid': result.get('wa_message_id'),
+                'is_incoming_message': 0,
+                'status': 'sent',
+                'messaged_at': timezone.now().isoformat(),
+                'message_type': 'template',
+                'template_components': components,
+                'template_name': result.get('template_name'),
+            }, request.tenant_id),
+            'result': result,
+        })
+
+
+def _normalize_conversation(request, row):
+    """Map one Laravel chat-contact row onto the conversation contract."""
+    if not isinstance(row, dict):
+        return None
+
+    last_message = row.get('last_message')
+    normalized_last = (
+        normalize_message(last_message, request.tenant_id)
+        if isinstance(last_message, dict) else None
+    )
+    window = normalize_reply_window(row)
+
+    try:
+        unread = int(row.get('unread_messages_count') or 0)
+    except (TypeError, ValueError):
+        unread = 0
+
+    return {
+        'id': row.get('_uid'),
+        'contact': {
+            'uid': row.get('_uid'),
+            'wa_id': row.get('wa_id'),
+            'name': row.get('full_name') or row.get('first_name') or row.get('wa_id'),
+            'first_name': row.get('first_name'),
+            'last_name': row.get('last_name'),
+            'email': row.get('email'),
+            'is_blocked': bool(row.get('is_blocked')),
+            'labels': row.get('labels') or [],
+            'assigned_user': row.get('assigned_user'),
+        },
+        'last_message': normalized_last,
+        'last_message_at': normalized_last['timestamp'] if normalized_last else None,
+        'unread_count': unread,
+        'reply_window': window,
+        # Same compatibility aliases as the chat endpoint.
+        'reply_window_open': window['open'],
+        'requires_template': window['requires_template'],
+        'window_expires_at': window['expires_at'],
+        'expires_at': window['expires_at'],
+    }
+
+
+@extend_schema(
+    tags=['WhatsApp Chat'],
+    summary='Conversation list with last message and unread count',
+    parameters=[
+        OpenApiParameter('cursor', str, description='Opaque cursor from a previous `next_cursor`.'),
+        OpenApiParameter('limit', int, description='Page size (default 50, max 100).'),
+        OpenApiParameter('search', str, description='Free-text contact search.'),
+        OpenApiParameter('unread_only', bool, description='Only conversations with unread messages.'),
+    ],
+)
+class WhatsAppConversationsView(APIView):
+    """GET /api/whatsapp/chat/conversations/"""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'view'
+
+    def get(self, request):
+        page = _cursor_to_page(request.query_params.get('cursor'))
+        try:
+            limit = min(int(request.query_params.get('limit', CHAT_PAGE_SIZE)), MAX_CHAT_PAGE_SIZE)
+        except (TypeError, ValueError):
+            limit = CHAT_PAGE_SIZE
+        if limit < 1:
+            limit = CHAT_PAGE_SIZE
+
+        params = {'page': page, 'limit': limit}
+        for key in ('search', 'unread_only', 'assigned', 'label_id'):
+            value = request.query_params.get(key)
+            if value not in (None, ''):
+                params[key] = value
+
+        try:
+            data = _adapter_from_request(request).get_conversations(params)
+        except LaravelAdapterError as e:
+            logger.error('[WA Conversations] adapter error status=%s error=%s', e.status_code, e)
+            return Response({'detail': str(e)}, status=e.status_code)
+
+        payload = data
+        if isinstance(data, dict) and isinstance(data.get('data'), dict):
+            payload = data['data']
+        payload = payload if isinstance(payload, dict) else {}
+
+        rows = payload.get('contacts')
+        if not isinstance(rows, list):
+            rows = payload.get('results') if isinstance(payload.get('results'), list) else []
+
+        conversations = [c for c in (_normalize_conversation(request, r) for r in rows) if c]
+        pagination = payload.get('pagination') if isinstance(payload.get('pagination'), dict) else {}
+        has_more = bool(pagination.get('has_more'))
+
+        return Response({
+            'results': conversations,
+            'count': pagination.get('total', len(conversations)),
+            'cursor': _page_to_cursor(page),
+            'next_cursor': _page_to_cursor(page + 1) if has_more else None,
+            'has_more': has_more,
+        })
+
+
+@extend_schema(
+    tags=['WhatsApp Realtime'],
+    summary="Short-lived Pusher grant for this tenant's WhatsApp channel",
+    description=(
+        "Returns the connection metadata for the tenant's WhatsApp realtime "
+        'channel and, when a `socket_id` is supplied, the signed Pusher '
+        'private-channel `auth` for that one socket on that one channel.\n\n'
+        'The tenant comes from the JWT and the vendor from '
+        '`WhatsAppVendorConfig` — a client-supplied vendor or channel is never '
+        'trusted. The vendor API token is never returned.\n\n'
+        'Client flow: POST with no body to get `{key, cluster, channel, event}`, '
+        'connect pusher-js, then POST `{socket_id, channel_name}` from the '
+        'authorizer callback to get `{auth}`.'
+    ),
+)
+class WhatsAppRealtimeGrantView(APIView):
+    """POST /api/whatsapp/realtime/grant/"""
+    authentication_classes = [JWTAuthentication]
+    permission_classes = [HasCRMPermission]
+    permission_module = 'whatsapp'
+    permission_resource = 'messages'
+    permission_action = 'view'
+
+    def _grant(self, request, socket_id, channel_name):
+        try:
+            grant = build_grant(
+                tenant_id=request.tenant_id,
+                socket_id=socket_id,
+                requested_channel=channel_name,
+            )
+        except RealtimeNotConfigured as e:
+            logger.warning('[WA Realtime] not configured. tenant=%s error=%s',
+                           request.tenant_id, e)
+            return Response({'detail': str(e)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except RealtimeGrantDenied as e:
+            logger.warning(
+                '[WA Realtime] grant denied. tenant=%s user=%s requested_channel=%r error=%s',
+                request.tenant_id, request.user_id, channel_name, e,
+            )
+            return Response({'detail': str(e)}, status=status.HTTP_403_FORBIDDEN)
+        return Response(grant)
+
+    def post(self, request):
+        socket_id = request.data.get('socket_id')
+        channel_name = request.data.get('channel_name') or request.data.get('channel')
+        if socket_id is not None:
+            socket_id = str(socket_id)
+        if channel_name is not None:
+            channel_name = str(channel_name)
+        return self._grant(request, socket_id, channel_name)
+
+    def get(self, request):
+        """Metadata only — no signature, so the client can build its connection."""
+        return self._grant(request, None, None)

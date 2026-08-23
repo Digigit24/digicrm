@@ -35,6 +35,13 @@ from .views import (
     WhatsAppFlowDetailProxyView,
     WhatsAppFlowActionProxyView,
     WhatsAppMediaProxyView,
+    WhatsAppLegacyMediaProxyView,
+    # Normalised chat surface + realtime grant
+    WhatsAppChatView,
+    WhatsAppChatSendView,
+    WhatsAppChatSendTemplateView,
+    WhatsAppConversationsView,
+    WhatsAppRealtimeGrantView,
     # AI support endpoints
     AIContextView,
     AITemplatesView,
@@ -84,8 +91,30 @@ urlpatterns = [
     path('flows/<str:flow_id>/', WhatsAppFlowDetailProxyView.as_view(), name='whatsapp-flow-detail-proxy'),
     path('flows/<str:flow_id>/<str:action>/', WhatsAppFlowActionProxyView.as_view(), name='whatsapp-flow-action-proxy'),
 
-    # Authenticated proxy for Laravel-hosted media
-    path('media/<path:filename>/', WhatsAppMediaProxyView.as_view(), name='whatsapp-media-proxy'),
+    # ---------------------------------------------------------------
+    # Normalised chat surface. The frontend talks to THESE, never to
+    # Laravel directly — the vendor API token stays server-side.
+    # ---------------------------------------------------------------
+    # GET  /api/whatsapp/chat/?contact=<wa_id>&cursor=  → history, newest-last
+    # POST /api/whatsapp/chat/send/                     → free-form text
+    # POST /api/whatsapp/chat/send-template/            → template + components
+    # GET  /api/whatsapp/chat/conversations/            → list + unread counts
+    path('chat/conversations/', WhatsAppConversationsView.as_view(), name='whatsapp-chat-conversations'),
+    path('chat/send/', WhatsAppChatSendView.as_view(), name='whatsapp-chat-send'),
+    path('chat/send-template/', WhatsAppChatSendTemplateView.as_view(), name='whatsapp-chat-send-template'),
+    path('chat/', WhatsAppChatView.as_view(), name='whatsapp-chat'),
+
+    # Short-lived, per-user, single-channel Pusher grant. Replaces the browser
+    # POSTing the tenant-wide vendor API token to Laravel's /broadcasting/auth.
+    path('realtime/grant/', WhatsAppRealtimeGrantView.as_view(), name='whatsapp-realtime-grant'),
+
+    # Authenticated media proxy.
+    # `<str:media_id>` is the signed, tenant-bound reference emitted in the
+    # normalised envelope — it cannot express a traversal. It must be declared
+    # BEFORE the legacy `<path:filename>` route, which is deprecated and now
+    # traversal-guarded.
+    path('media/<str:media_id>/', WhatsAppMediaProxyView.as_view(), name='whatsapp-media-proxy'),
+    path('media/<path:filename>/', WhatsAppLegacyMediaProxyView.as_view(), name='whatsapp-media-proxy-legacy'),
 
     # Enrollment update (pause/resume/cancel)
     path('enrollments/<int:pk>/', LeadSequenceEnrollmentUpdateView.as_view(), name='enrollment-update'),
