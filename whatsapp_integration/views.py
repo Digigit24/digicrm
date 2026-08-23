@@ -686,13 +686,13 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
                     {'detail': 'Lead is already actively enrolled in this sequence.'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            # Re-enroll if previously stopped
-            enrollment.status = SequenceEnrollmentStatusEnum.ACTIVE
-            enrollment.current_step = None
-            enrollment.next_step_at = timezone.now() + timedelta(days=first_step.delay_days if first_step else 0)
-            enrollment.completed_at = None
-            enrollment.stopped_reason = None
-            enrollment.save()
+            # Re-enroll if previously stopped. restart() bumps run_number so
+            # the stepper's per-step send marker does not treat step 1 as
+            # already delivered from the previous run.
+            enrollment.restart(
+                timezone.now() + timedelta(days=first_step.delay_days if first_step else 0),
+                enrolled_by=request.user_id,
+            )
 
         return Response(
             LeadSequenceEnrollmentSerializer(enrollment).data,

@@ -1695,7 +1695,7 @@ def _dispatch_tool(name: str, args: dict) -> dict:
         first_step = seq.steps.order_by('step_number').first()
         delay = first_step.delay_days if first_step else 0
         next_step_at = timezone.now() + timezone.timedelta(days=delay)
-        enrollment, created = LeadSequenceEnrollment.objects.update_or_create(
+        enrollment, created = LeadSequenceEnrollment.objects.get_or_create(
             lead_id=lead.id,
             sequence_id=seq.id,
             defaults={
@@ -1705,6 +1705,13 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                 'enrolled_by':  OWNER_USER_ID or None,
             },
         )
+        if not created:
+            # update_or_create used to reactivate the row while leaving
+            # current_step pointing at the last step already sent, so a
+            # re-enrolled lead resumed mid-sequence instead of starting over.
+            # restart() resets the cursor and bumps run_number, which is what
+            # lets the stepper send step 1 again.
+            enrollment.restart(next_step_at, enrolled_by=OWNER_USER_ID or None)
         return {'id': enrollment.id, 'created': created, 'next_step_at': str(enrollment.next_step_at)}
 
     # ── bulk_enroll_leads_in_sequence ───────────────────────────────────────────
@@ -1743,12 +1750,7 @@ def _dispatch_tool(name: str, args: dict) -> dict:
                 skipped.append({'lead_id': lead_id, 'reason': 'already enrolled'})
                 continue
             if not created:
-                enrollment.status         = SequenceEnrollmentStatusEnum.ACTIVE
-                enrollment.next_step_at   = next_step_at
-                enrollment.current_step   = None
-                enrollment.completed_at   = None
-                enrollment.stopped_reason = None
-                enrollment.save()
+                enrollment.restart(next_step_at, enrolled_by=OWNER_USER_ID or None)
             enrolled.append(lead_id)
 
         result = {
