@@ -49,6 +49,18 @@ logger = logging.getLogger(__name__)
 # (".VendorChannelBroadcast") to suppress its App\Events\ namespacing.
 BROADCAST_EVENT = 'VendorChannelBroadcast'
 
+# DigiCRM's OWN events, published from our inbound webhook by
+# ``whatsapp_integration.services.publisher``. Deliberately NOT
+# ``VendorChannelBroadcast``: Laravel owns that name and keeps firing it, so
+# reusing it would deliver two events for the same message with no way to tell
+# them apart. These carry the full normalised envelope instead of a bare
+# notification, which is what lets a mobile client render without a refetch.
+#
+# They ride on the SAME private channel, so they need no extra auth: a client
+# already authorised for the channel receives them by binding the name.
+DIGICRM_MESSAGE_EVENT = 'DigicrmMessage'
+DIGICRM_STATUS_EVENT = 'DigicrmMessageStatus'
+
 # Must match VendorChannelBroadcast::broadcastOn() -> PrivateChannel(...),
 # which puts "private-" on the wire.
 CHANNEL_PREFIX = 'private-vendor-channel.'
@@ -155,6 +167,14 @@ def build_grant(tenant_id, socket_id: str = None, requested_channel: str = None)
         'event': BROADCAST_EVENT,
         # Echo/laravel-echo users must bind the dotted form.
         'echo_event': f'.{BROADCAST_EVENT}',
+        # DigiCRM's own rich events, discovered by value for the same reason
+        # `event` is: the backend can rename them without a client release.
+        # Binding these is OPTIONAL and purely additive - a client that ignores
+        # them behaves exactly as before, on Laravel's notify-then-refetch.
+        'digicrm_event': DIGICRM_MESSAGE_EVENT,
+        'digicrm_echo_event': f'.{DIGICRM_MESSAGE_EVENT}',
+        'digicrm_status_event': DIGICRM_STATUS_EVENT,
+        'digicrm_status_echo_event': f'.{DIGICRM_STATUS_EVENT}',
     }
 
     if socket_id is not None:
