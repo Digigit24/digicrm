@@ -43,6 +43,7 @@ from .services.media import (
     safe_content_type, safe_filename,
 )
 from .services.normalizer import normalize_message, normalize_messages, normalize_reply_window
+from .services.publisher import publish_inbound_message, publish_message_status
 from .services.realtime import (
     RealtimeGrantDenied, RealtimeNotConfigured, build_grant,
 )
@@ -967,6 +968,34 @@ class WhatsAppWebhookView(APIView):
                     enrollment.completed_at = timezone.now()
                     enrollment.save(update_fields=['status', 'stopped_reason', 'completed_at', 'updated_at'])
 
+            # Broadcast the message itself, with its body, on the tenant's own
+            # realtime channel.
+            #
+            # Laravel's VendorChannelBroadcast already fires for this message,
+            # but it carries no body and no wamid, so every client has to
+            # refetch the conversation to render one reply. We have the content
+            # right here (`message_body` / `message_wamid` above) and were
+            # dropping it. Publishing under our own event name is purely
+            # additive: Laravel's event is untouched and a client that does not
+            # bind ours behaves exactly as it does today.
+            #
+            # OUTSIDE the `if lead:` block on purpose. The chat surface is keyed
+            # on the WhatsApp contact, not on a CRM lead, so an inbound message
+            # from someone who is not a lead - or whom the `phone__contains`
+            # lookup above fails to match (audit P0-6) - must still reach the
+            # open chat window.
+            #
+            # Best effort: publish_inbound_message never raises and never
+            # affects the response. The LeadActivity above is the durable record.
+            publish_inbound_message(tenant_id, data.get('data') or {})
+
+            return Response({'detail': 'ok'})
+
+        elif event_type == 'message-status':
+            # Delivery receipt (sent/delivered/read/failed). Publish-only: there
+            # is no lead state to change, and Laravel's own broadcast already
+            # carries `message_status` for clients that prefer it.
+            publish_message_status(tenant_id, data.get('data') or {})
             return Response({'detail': 'ok'})
 
         elif event_type == 'campaign-completed':
