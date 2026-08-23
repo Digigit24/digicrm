@@ -621,8 +621,46 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'tasks.tasks.materialize_task_reminders',
         'schedule': 900.0,  # Every 15 minutes
     },
+    # Audit P0-4: WhatsApp drip sequences had NO beat entry and no tasks.py, so
+    # every enrollment ever created sat at a past next_step_at and nothing was
+    # ever sent. 60s, not the 30s that dispatch-due-reminders uses: sequence
+    # steps are scheduled in whole days (WhatsAppSequenceStep.delay_days), so a
+    # sub-minute poll buys no accuracy a customer could notice, and this poll
+    # takes row locks on a table that grows without bound. The claim query is
+    # served by the idx_lse_due_active partial index and capped at
+    # WHATSAPP_SEQUENCE_BATCH_SIZE rows per tick.
+    #
+    # Gated by WHATSAPP_SEQUENCES_ENABLED (default False) — the beat entry is
+    # live from deploy, the sending is not.
+    'step-whatsapp-sequences': {
+        'task': 'whatsapp_integration.tasks.step_due_sequence_enrollments',
+        'schedule': 60.0,
+    },
 }
 
 # Due reminders older than this are marked missed instead of surfacing as stale alerts.
 REMINDER_DELIVERY_GRACE_HOURS = config('REMINDER_DELIVERY_GRACE_HOURS', default=24, cast=int)
 REMINDER_MAX_ATTEMPTS = config('REMINDER_MAX_ATTEMPTS', default=5, cast=int)
+
+# ---------------------------------------------------------------------------
+# WhatsApp drip sequences
+# ---------------------------------------------------------------------------
+# KILL SWITCH. This task sends real WhatsApp messages to real customers. It
+# defaults OFF so that deploying it cannot flush a backlog of long-overdue
+# enrollments at whoever is on the other end. Turn it on deliberately, after
+# checking how many ACTIVE enrollments already have next_step_at in the past.
+WHATSAPP_SEQUENCES_ENABLED = config('WHATSAPP_SEQUENCES_ENABLED', default=False, cast=bool)
+# Enrollments claimed per beat tick.
+WHATSAPP_SEQUENCE_BATCH_SIZE = config('WHATSAPP_SEQUENCE_BATCH_SIZE', default=100, cast=int)
+# Consecutive failed send attempts for one step before the enrollment is PAUSED
+# with a stopped_reason of max_send_attempts_exceeded. Stops a permanently
+# broken enrollment retrying every minute forever.
+WHATSAPP_SEQUENCE_MAX_ATTEMPTS = config('WHATSAPP_SEQUENCE_MAX_ATTEMPTS', default=3, cast=int)
+# Backoff pushed onto next_step_at after a retryable failure.
+WHATSAPP_SEQUENCE_RETRY_MINUTES = config('WHATSAPP_SEQUENCE_RETRY_MINUTES', default=30, cast=int)
+# A claim (locked_at) older than this belongs to a worker that died; it is
+# released so the enrollment is not stranded. Must comfortably exceed the
+# adapter's 15s HTTP timeout.
+WHATSAPP_SEQUENCE_CLAIM_STALE_MINUTES = config(
+    'WHATSAPP_SEQUENCE_CLAIM_STALE_MINUTES', default=15, cast=int
+)
