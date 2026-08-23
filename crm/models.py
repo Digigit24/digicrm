@@ -131,6 +131,25 @@ class Lead(models.Model):
             models.Index(fields=['owner_user_id'], name='idx_leads_owner_user_id'),
             models.Index(fields=['assigned_to'], name='idx_leads_assigned_to'),
             models.Index(fields=['phone'], name='idx_leads_phone'),
+            # Composite (tenant_id, ...) indexes added by migration 0005.
+            #
+            # They were written straight into that migration and never mirrored
+            # here, so `makemigrations` kept proposing to REMOVE all seven -- and
+            # applying that would have dropped them from a live `leads` table.
+            # All seven exist in production today; verified against pg_indexes.
+            # Names and field lists must match 0005 exactly: a renamed index is a
+            # drop and recreate, which is the very thing this is preventing.
+            #
+            # Every one leads with tenant_id because every lead query is tenant
+            # scoped (TenantViewSetMixin), and the trailing column is the one the
+            # API actually orders or filters by.
+            models.Index(fields=['tenant_id', '-created_at'], name='lead_tenant_created_idx'),
+            models.Index(fields=['tenant_id', 'name'], name='lead_tenant_name_idx'),
+            models.Index(fields=['tenant_id', 'phone'], name='lead_tenant_phone_idx'),
+            models.Index(fields=['tenant_id', 'email'], name='lead_tenant_email_idx'),
+            models.Index(fields=['tenant_id', 'status_id'], name='lead_tenant_status_idx'),
+            models.Index(fields=['tenant_id', 'owner_user_id'], name='lead_tenant_owner_idx'),
+            models.Index(fields=['tenant_id', 'next_follow_up_at'], name='lead_tenant_followup_idx'),
         ]
         constraints = [
             models.CheckConstraint(
