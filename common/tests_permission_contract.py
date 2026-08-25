@@ -78,6 +78,62 @@ def _view_modules():
                     continue
 
 
+# DRF's standard viewset handlers, and the permission action each implies. A
+# class only has the ones its mixins provide: ModelViewSet has all six,
+# ReadOnlyModelViewSet has two. Asking the CLASS is how we avoid inventing
+# actions a viewset does not route — an early version of this scan assumed
+# every viewset was a ModelViewSet and reported telephony.sms.edit/delete as
+# missing, when SMSLogViewSet is read-only and can never ask for them.
+_VIEWSET_HANDLERS = {
+    'list': 'view',
+    'retrieve': 'view',
+    'create': 'create',
+    'update': 'edit',
+    'partial_update': 'edit',
+    'destroy': 'delete',
+}
+
+
+def _viewset_actions(view):
+    """Actions a DRF viewset can actually route, honouring http_method_names."""
+    allowed_methods = getattr(view, 'http_method_names', None)
+    allowed = {m.lower() for m in allowed_methods} if allowed_methods else None
+
+    # `update` is PUT and `partial_update` is PATCH; restricting
+    # http_method_names to one of them removes the other.
+    handler_method = {
+        'list': 'get', 'retrieve': 'get', 'create': 'post',
+        'update': 'put', 'partial_update': 'patch', 'destroy': 'delete',
+    }
+
+    actions = set()
+    for handler, permission_action in _VIEWSET_HANDLERS.items():
+        if not callable(getattr(view, handler, None)):
+            continue
+        if allowed is not None and handler_method[handler] not in allowed:
+            continue
+        actions.add(permission_action)
+
+    # @action(detail=..., methods=[...]) routes extra verbs. Its NAME is not in
+    # ACTION_PERMISSION_MAP, so HasDigiPermission falls through to the HTTP
+    # method — UNLESS the view's own action_permission_map names it, which wins
+    # last and is the whole point of that attribute. Missing this override
+    # reported integrations.providers.create as required, when
+    # ComposioToolkitViewSet maps its POST `sync` action back to 'view'.
+    custom_map = getattr(view, 'action_permission_map', {}) or {}
+    for attr in vars(view).values():
+        mapping = getattr(attr, 'mapping', None) or {}
+        for http_method, handler_name in mapping.items():
+            if handler_name in custom_map:
+                actions.add(custom_map[handler_name])
+                continue
+            mapped = HasDigiPermission.WRITE_METHOD_ACTION_MAP.get(http_method.upper())
+            if mapped:
+                actions.add(mapped)
+
+    return actions
+
+
 def _permission_keys_a_view_can_require(view):
     """Every key this view class can ask `check_permission` about."""
     module = getattr(view, 'permission_module', 'crm')
@@ -89,19 +145,19 @@ def _permission_keys_a_view_can_require(view):
     if declared:
         actions = {declared}
     else:
-        # No fixed action: the class can produce any action its own map or the
-        # HTTP-method fallback yields, limited to the methods it implements.
+        # No fixed action: whatever the class's own map, its routed HTTP
+        # methods, or its viewset handlers can produce.
         actions = set(getattr(view, 'action_permission_map', {}).values())
         implemented = {m for m in _HTTP_METHODS if callable(getattr(view, m, None))}
         if implemented:
+            # A plain APIView: one handler per HTTP verb.
             actions |= {
                 HasDigiPermission.WRITE_METHOD_ACTION_MAP[m.upper()]
                 for m in implemented
                 if m.upper() in HasDigiPermission.WRITE_METHOD_ACTION_MAP
             }
         else:
-            # A ViewSet: DRF actions, not HTTP methods.
-            actions |= _DERIVABLE_ACTIONS
+            actions |= _viewset_actions(view)
 
     return {f'{module}.{resource}.{action}' for action in actions if action}
 
@@ -119,47 +175,18 @@ def _all_required_keys():
     return found
 
 
-# KNOWN BACKLOG — not an approval.
+# KNOWN BACKLOG — empty, and that is the point.
 #
-# Every key below is enforced by a live view and missing from the catalog, i.e.
-# admin-only today for exactly the same reason `whatsapp.contacts.*` was. They
-# are quarantined rather than fixed here because adding twenty-eight permission
-# keys across four more modules is a deliberate, security-adjacent decision per
-# module, not a drive-by on a WhatsApp ticket — and because each one needs
-# someone to confirm the action set matches what the views really expose.
+# This set existed because 23 keys were enforced by live views and missing from
+# the catalog, i.e. admin-only for the same reason `whatsapp.contacts.*` was.
+# They have since been added, so the quarantine is empty and every key a view
+# can enforce is a key a role can hold.
 #
-# The list is here, in code, so the gap is visible and so a NEW gap still fails
-# this test. Shrink it; do not grow it.
-KNOWN_MISSING_FROM_CATALOG = {
-    'crm.settings.create',
-    'crm.settings.delete',
-    'integrations.providers.create',
-    'integrations.providers.delete',
-    'integrations.providers.edit',
-    'real_estate.leads.create',
-    'real_estate.leads.delete',
-    'real_estate.leads.edit',
-    'real_estate.leads.view',
-    'real_estate.projects.create',
-    'real_estate.projects.delete',
-    'real_estate.projects.edit',
-    'real_estate.projects.view',
-    'real_estate.units.create',
-    'real_estate.units.delete',
-    'real_estate.units.edit',
-    'real_estate.units.view',
-    'telephony.analytics.view',
-    'telephony.campaigns.create',
-    'telephony.campaigns.delete',
-    'telephony.campaigns.edit',
-    'telephony.campaigns.view',
-    'telephony.sms.delete',
-    'telephony.sms.edit',
-    'whatsapp.flows.create',
-    'whatsapp.flows.delete',
-    'whatsapp.flows.edit',
-    'whatsapp.flows.view',
-}
+# If you are about to add an entry here, that is a decision to ship a permission
+# nobody can be granted. Prefer adding the key. If you genuinely must defer it,
+# say which module and why — `test_the_backlog_list_does_not_outlive_the_backlog`
+# will make sure the entry disappears once the key lands.
+KNOWN_MISSING_FROM_CATALOG: set[str] = set()
 
 
 class EnforcedPermissionsExistInCatalogTests(SimpleTestCase):
