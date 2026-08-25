@@ -83,6 +83,20 @@ def _make_request(method: str, url: str, token: str, **kwargs) -> dict:
 # status_code >= 400 therefore treats a rotated or wrong vendor token as a
 # successful send: callers get {'result': 'failed'} where they expected
 # wa_message_id, and the user is told "message sent".
+# 424 Failed Dependency: "an upstream this feature depends on is not usable".
+#
+# NOT 502/503, which is what this used to raise. Every client in this estate
+# treats 404/501/502/503 as "the backend has not deployed the WhatsApp endpoints
+# yet" (`isWhatsappEndpointUnavailable`, in both the web and mobile services), so
+# a rejected vendor token rendered as "Chat is not available yet" and sent people
+# hunting a deployment problem that did not exist. The endpoints are deployed;
+# the credential is bad, and those are different sentences.
+#
+# 424 is this codebase's established signal for exactly this — see
+# integrations/views_composio.py, where a missing Composio setup returns 424 and
+# the frontend renders a setup panel rather than an error toast.
+HTTP_424_FAILED_DEPENDENCY = 424
+
 _AUTH_FAILURE_MARKERS = (
     'invalid token',
     'invalid vendor',
@@ -113,7 +127,11 @@ def _raise_on_failed_body(data, url: str = ''):
 
     lowered = message.lower()
     if any(marker in lowered for marker in _AUTH_FAILURE_MARKERS):
-        status_code = 502
+        # A configuration fault on OUR side, not an upstream outage: the token is
+        # wrong, rotated, or the vendor account is inactive. Only fixable by
+        # replacing the credential, so it must not be reported as a transient
+        # gateway problem the client should retry or hide.
+        status_code = HTTP_424_FAILED_DEPENDENCY
         prefix = 'Laravel adapter rejected our vendor credentials'
         logger.error(
             '[WA Adapter] Laravel returned HTTP 200 with an AUTH failure body. '
@@ -122,6 +140,8 @@ def _raise_on_failed_body(data, url: str = ''):
             url, message,
         )
     else:
+        # A genuine upstream fault stays 502. Only credential rejection is
+        # reclassified; widening this would hide real outages.
         status_code = 502
         prefix = 'Laravel adapter error'
         logger.warning(

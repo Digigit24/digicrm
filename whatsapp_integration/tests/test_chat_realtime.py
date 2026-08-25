@@ -816,7 +816,10 @@ class LaravelFailedBodyTest(TestCase):
         with self.assertRaises(LaravelAdapterError) as ctx:
             _raise_on_failed_body({'result': 'failed', 'message': 'Invalid Token'})
         self.assertIn('vendor credentials', str(ctx.exception))
-        self.assertEqual(ctx.exception.status_code, 502)
+        # 424, not 502: every client treats 404/501/502/503 as "these endpoints
+        # are not deployed yet", so a rejected token used to render as "Chat is
+        # not available yet". See tests/test_adapter_failed_body.py.
+        self.assertEqual(ctx.exception.status_code, 424)
 
     def test_invalid_vendor_and_inactive_vendor_are_raised(self):
         for message in ('Invalid Vendor', 'Vendor account is not in active state'):
