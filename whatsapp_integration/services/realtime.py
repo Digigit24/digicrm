@@ -41,6 +41,9 @@ import logging
 from django.conf import settings
 
 from whatsapp_integration.models import WhatsAppVendorConfig
+from whatsapp_integration.services.tenant_credentials import (
+    TenantCredentialsError, fetch_tenant_whatsapp_credentials,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +85,38 @@ def resolve_vendor_uid(tenant_id) -> str:
     """
     Resolve the Laravel vendor uid for a tenant.
 
-    Deliberately reads ONLY ``WhatsAppVendorConfig``: never a request header,
-    never a query param, never the request body.  This is the whole point of
-    the endpoint — the caller does not get to say which tenant's realtime
-    stream it would like to listen to.
+    Reads the SAME source the chat surface authenticates with — the tenant's
+    ``whatsapp_vendor_uid`` in SuperAdmin's ``Tenant.settings`` — falling back to
+    the local ``WhatsAppVendorConfig`` row.
+
+    THIS ORDER IS LOAD-BEARING, not tidiness. Laravel broadcasts on
+    ``private-vendor-channel.{vendorUid}`` for the vendor account that owns the
+    API token. If the channel came from one source and the token from another,
+    a tenant whose two records disagree would read one vendor's history over
+    HTTP while subscribed to a different vendor's realtime stream — messages
+    would load on refresh and never arrive live, which is close to the worst
+    possible failure because it looks like a flaky socket rather than a
+    misconfiguration. Once `_adapter_from_request` prefers the SuperAdmin
+    credential, this has to prefer it too or the two drift apart by
+    construction.
+
+    Both sources are SERVER-side. Neither a request header, a query param nor
+    the request body is ever consulted — the caller does not get to say which
+    tenant's realtime stream it would like to listen to.
     """
+    try:
+        stored = fetch_tenant_whatsapp_credentials(tenant_id)
+    except TenantCredentialsError as exc:
+        # SuperAdmin unreachable is not fatal; the local row may still serve.
+        logger.warning(
+            '[WA Realtime] could not read the tenant credential from SuperAdmin, '
+            'falling back to WhatsAppVendorConfig. tenant=%s error=%s',
+            tenant_id, exc,
+        )
+        stored = None
+    if stored and stored.get('vendor_uid'):
+        return stored['vendor_uid']
+
     config = (
         WhatsAppVendorConfig.objects
         .filter(tenant_id=tenant_id, is_active=True)
@@ -95,8 +125,8 @@ def resolve_vendor_uid(tenant_id) -> str:
     )
     if config is None or not config.vendor_uid:
         raise RealtimeNotConfigured(
-            'No active WhatsApp vendor config for this tenant. '
-            'Configure it in Admin -> WhatsApp Vendor Config.'
+            'No WhatsApp vendor configured for this tenant. Set the vendor uid '
+            'and API token in Admin Settings.'
         )
     return config.vendor_uid
 

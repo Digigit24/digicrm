@@ -43,6 +43,9 @@ from .services.media import (
     safe_content_type, safe_filename,
 )
 from .services.normalizer import normalize_message, normalize_messages, normalize_reply_window
+from .services.tenant_credentials import (
+    TenantCredentialsError, fetch_tenant_whatsapp_credentials,
+)
 from .services.publisher import publish_inbound_message, publish_message_status
 from .services.realtime import (
     RealtimeGrantDenied, RealtimeNotConfigured, build_grant,
@@ -55,28 +58,66 @@ logger = logging.getLogger(__name__)
 def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
     """
     Build a LaravelWhatsAppAdapter for this request.
-    Reads vendor credentials from X-WA-Vendor-Uid / X-WA-Api-Token headers
-    (sent by the React frontend from localStorage) so we never need a
-    WhatsAppVendorConfig DB record.  Falls back to DB lookup if headers absent.
+
+    Credential priority, most specific first:
+
+      1. ``X-WA-Vendor-Uid`` / ``X-WA-Api-Token`` request headers. LEGACY and
+         effectively dead — the web app used to send these from localStorage,
+         which was removed precisely because a tenant-wide vendor token in a
+         browser is a cross-tenant primitive. Honoured for backward
+         compatibility, not invested in.
+      2. THE TENANT'S OWN credential, saved in SuperAdmin's ``Tenant.settings``
+         by the Admin Settings screen and fetched server-to-server. This is the
+         only place a tenant admin can self-serve, so it is authoritative.
+      3. The global ``WA_VENDOR_UID`` / ``WA_API_TOKEN`` env pair. LAST RESORT.
+         It used to be the primary path, which meant every tenant shared one
+         vendor account no matter what they had configured, and a single stale
+         value broke WhatsApp for all of them at once.
+
+    A failure in (2) is deliberately non-fatal: SuperAdmin being briefly
+    unreachable must not take WhatsApp down when a working env fallback exists.
     """
     vendor_uid = request.headers.get('X-WA-Vendor-Uid') or None
     api_token  = request.headers.get('X-WA-Api-Token') or None
     # Never trust a client-provided base URL for server-side adapter calls.
     base_url = None
+    credential_source = 'header' if (vendor_uid and api_token) else None
+
+    # (2) The tenant's own stored credential.
+    if not (vendor_uid and api_token):
+        try:
+            stored = fetch_tenant_whatsapp_credentials(getattr(request, 'tenant_id', None))
+        except TenantCredentialsError as exc:
+            # Never fatal here — fall through to env. Logged without the token.
+            logger.warning(
+                '[WA Adapter] could not read the tenant credential from SuperAdmin, '
+                'falling back to env. tenant=%s error=%s',
+                getattr(request, 'tenant_id', None), exc,
+            )
+            stored = None
+        if stored:
+            vendor_uid = stored['vendor_uid']
+            api_token = stored['api_token']
+            base_url = stored.get('base_url')
+            credential_source = 'tenant'
 
     # Env var fallback (read via decouple so .env is respected)
     env_vendor_uid = env_config('WA_VENDOR_UID', default=None)
     env_api_token  = env_config('WA_API_TOKEN', default=None)
     env_base_url   = env_config('WA_BASE_URL', default=None)
 
-    # Fill any missing piece from env vars
-    vendor_uid = vendor_uid or env_vendor_uid
-    api_token  = api_token  or env_api_token
-    base_url = env_base_url
+    # (3) Last resort. Only fills pieces still missing.
+    if not (vendor_uid and api_token):
+        vendor_uid = vendor_uid or env_vendor_uid
+        api_token  = api_token  or env_api_token
+        if vendor_uid and api_token:
+            credential_source = 'env'
+    base_url = base_url or env_base_url
 
     logger.info(
-        '[WA Adapter] Resolved credentials — '
+        '[WA Adapter] Resolved credentials — source=%s '
         'header_vendor=%s header_token=%s env_vendor=%s env_token=%s final_vendor=%s has_token=%s path=%s',
+        credential_source or 'none',
         bool(request.headers.get('X-WA-Vendor-Uid')),
         bool(request.headers.get('X-WA-Api-Token')),
         bool(env_vendor_uid),

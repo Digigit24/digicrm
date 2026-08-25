@@ -211,7 +211,16 @@ class RealtimeGrantTest(TestCase):
             client = _authed_client(TENANT_A, USER_A)
             self.assertEqual(client.post(self.GRANT_URL, {}, format='json').status_code, 503)
 
-    def test_resolve_vendor_uid_reads_only_the_config_table(self):
+    def test_resolve_vendor_uid_falls_back_to_the_config_table(self):
+        """
+        Renamed from ...reads_only_the_config_table: it no longer does.
+
+        The tenant's SuperAdmin-stored `whatsapp_vendor_uid` now takes
+        precedence, so that the realtime channel names the same vendor account
+        as the API token the chat surface authenticates with. This asserts the
+        FALLBACK, which is what applies when nothing is stored upstream — see
+        tests/test_tenant_credentials.py for the precedence itself.
+        """
         self.assertEqual(realtime.resolve_vendor_uid(TENANT_A), VENDOR_A)
         self.assertEqual(realtime.resolve_vendor_uid(TENANT_B), VENDOR_B)
 
