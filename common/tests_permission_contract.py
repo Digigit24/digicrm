@@ -23,6 +23,18 @@ is in `PERMISSION_CATALOG`. It is deliberately a source-level scan rather than a
 list someone has to remember to update — the failure mode being guarded against
 is precisely "someone added a view and did not update the other place".
 
+WHERE TO FIX A FAILURE, now that `generated_permissions.py` is genuinely
+generated: edit `superadmin/apps/common/permissions_catalog.yaml` and run
+`python superadmin/scripts/generate_permissions.py`. Editing the generated file
+directly will be overwritten. Being generated does NOT make this test redundant
+— it moves its target. A view can still enforce a key nobody put in the YAML,
+and that is the same silent 403 as before.
+
+Grantability is still a second step: the Roles UI renders
+`superadmin/apps/common/constants.py::PERMISSION_SCHEMA`, which is hand-written
+and not produced from the catalog. A key can therefore pass this test and still
+be ungrantable. That file is the remaining un-collapsed source of truth.
+
 Kept out of any app's `tests.py` because it is a cross-app contract, not a test
 of one app's behaviour.
 """
