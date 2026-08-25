@@ -1,4 +1,36 @@
-# GENERATED — DO NOT EDIT. Source: superadmin/apps/common/permissions_catalog.yaml
+# HAND-MAINTAINED. This file is the source of truth for its own contents.
+#
+# It used to claim "GENERATED - DO NOT EDIT. Source: superadmin/apps/common/
+# permissions_catalog.yaml". That was false, and following it would have led a
+# reader to regenerate and lose data. The facts, verified rather than assumed:
+#
+#   * superadmin/scripts/generate_permissions.py does NOT list digicrm among
+#     its OUTPUTS. It writes superadmin's own copy, dghms, and two celiyohms
+#     TypeScript files. This file has never been one of them.
+#   * The YAML it reads contains ZERO crm / whatsapp / telephony / meetings /
+#     tasks entries and yields 125 keys. This file has 214. `git log -S` on the
+#     YAML shows those keys were never there.
+#
+# So every CRM-side key below, and the CRMPermissions class at the bottom
+# (which the generator does not emit at all), was written by hand. Adding a key
+# here means editing this file. There is nothing to regenerate.
+#
+# THREE SOURCES OF TRUTH, because knowing which one to edit is the whole
+# problem:
+#
+#   1. superadmin/apps/common/permissions_catalog.yaml -> generated_permissions
+#      in superadmin + dghms + celiyohms. Covers admin and hms ONLY.
+#   2. THIS FILE. Supplies CRMPermissions to digicrm's own code.
+#   3. superadmin/apps/common/constants.py :: PERMISSION_SCHEMA. Hand-written,
+#      served by /api/roles/permissions_schema/, and the one that decides what
+#      the Roles UI can actually GRANT. A key added here but not there is
+#      enforced and ungrantable - which is exactly how whatsapp.contacts.* and
+#      whatsapp.templates.send ended up admin-only from the day they shipped.
+#
+# Adding an enforced key means touching 2 and 3 together.
+# common/tests_permission_contract.py fails if a view enforces a key this file
+# does not carry.
+#
 # Catalog version: 1
 
 PERMISSION_CATALOG = [{'action': 'enabled',
