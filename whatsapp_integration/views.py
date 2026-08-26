@@ -69,6 +69,12 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
       2. THE TENANT'S OWN credential, saved in SuperAdmin's ``Tenant.settings``
          by the Admin Settings screen and fetched server-to-server. This is the
          only place a tenant admin can self-serve, so it is authoritative.
+         Authenticated to SuperAdmin by forwarding the CALLER'S OWN
+         Authorization header (the logged-in user's own JWT) rather than a
+         separately-configured static service token — see
+         ``tenant_credentials.py``. No standing secret to rotate; this just
+         works as long as the request is itself authenticated, which every
+         caller here already is.
       3. The global ``WA_VENDOR_UID`` / ``WA_API_TOKEN`` env pair. LAST RESORT.
          It used to be the primary path, which meant every tenant shared one
          vendor account no matter what they had configured, and a single stale
@@ -83,10 +89,17 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
     base_url = None
     credential_source = 'header' if (vendor_uid and api_token) else None
 
-    # (2) The tenant's own stored credential.
+    # (2) The tenant's own stored credential. Authenticate to SuperAdmin by
+    # forwarding the CALLER'S OWN already-verified Authorization header
+    # (falls back to MCP_SERVICE_JWT only if somehow absent) — see
+    # tenant_credentials.py's module doc for why this replaced a static,
+    # manually-rotated service token.
     if not (vendor_uid and api_token):
+        auth_header = request.META.get('HTTP_AUTHORIZATION') or request.headers.get('Authorization')
         try:
-            stored = fetch_tenant_whatsapp_credentials(getattr(request, 'tenant_id', None))
+            stored = fetch_tenant_whatsapp_credentials(
+                getattr(request, 'tenant_id', None), auth_header=auth_header
+            )
         except TenantCredentialsError as exc:
             # Never fatal here — fall through to env. Logged without the token.
             logger.warning(

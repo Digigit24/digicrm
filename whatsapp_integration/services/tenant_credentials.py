@@ -12,14 +12,33 @@ shared one vendor account regardless of what they had saved.
 
 This module is the missing link. It mirrors ``crm/user_directory.py`` — the
 existing SuperAdmin server-to-server client — deliberately and closely: same
-service JWT, same short-TTL per-tenant cache, same refusal to follow redirects,
-same fail-closed posture. A second, subtly different way of calling the same
+short-TTL per-tenant cache, same refusal to follow redirects, same
+fail-closed posture. A second, subtly different way of calling the same
 service would be a second thing to get wrong.
+
+AUTHENTICATING TO SUPERADMIN — forwarded caller JWT, not a static secret
+-------------------------------------------------------------------------
+This used to authenticate with ``MCP_SERVICE_JWT``, a static, super-admin-
+scoped token that had to be manually minted and hand-installed into this
+server's env — and had no rotation story, so a forgotten/expired value
+silently broke WhatsApp for every tenant at once (that happened).
+
+DigiCRM and SuperAdmin share the same ``JWT_SECRET_KEY``/algorithm, so a JWT
+DigiCRM already verified from the logged-in caller's own request is *already*
+a valid SuperAdmin token. ``fetch_tenant_whatsapp_credentials`` now takes
+``auth_header`` — the caller's own raw ``Authorization`` header, forwarded
+verbatim — and uses that first. SuperAdmin's endpoint checks the forwarded
+token's own ``tenant_id`` claim against the URL, so this is naturally
+self-scoped: a tenant can only ever fetch its own credential this way, no
+broader access than the caller already had. ``MCP_SERVICE_JWT`` is kept as a
+fallback purely for non-HTTP callers with no request to forward (there are
+none today, but the user directory client uses the same pattern and this
+mirrors it) — an HTTP caller should never need it configured at all now.
 
 Upstream contract::
 
     GET {SUPERADMIN_URL}/api/tenants/{tenant_id}/whatsapp-credentials/
-    Authorization: Bearer <service JWT>
+    Authorization: Bearer <caller's own JWT, forwarded verbatim>
     -> {"tenant_id", "vendor_uid", "api_token", "base_url", "configured"}
 
 That endpoint exists precisely so this call does not have to use the tenant
@@ -76,7 +95,12 @@ class TenantCredentialsError(RuntimeError):
 
 
 def _service_token() -> str:
-    """The same admin-issued service JWT the user directory uses."""
+    """
+    Fallback-only static service JWT. Prefer forwarding the caller's own
+    ``Authorization`` header (see ``auth_header`` on
+    :func:`fetch_tenant_whatsapp_credentials`) — this only matters for a
+    caller with no live request to forward one from.
+    """
     return (
         getattr(settings, 'MCP_SERVICE_JWT', '')
         or os.environ.get('DIGICRM_JWT_TOKEN', '')
@@ -101,13 +125,18 @@ def _base_url() -> str:
     return str(getattr(settings, 'SUPERADMIN_URL', '') or '').rstrip('/')
 
 
-def fetch_tenant_whatsapp_credentials(tenant_id, use_cache: bool = True):
+def fetch_tenant_whatsapp_credentials(tenant_id, use_cache: bool = True, auth_header: str | None = None):
     """
     Return ``{'vendor_uid', 'api_token', 'base_url'}`` for a tenant, or None.
 
     None means "this tenant has not saved a credential" — a normal state the
     caller handles by falling back. It does NOT mean the lookup failed; that
     raises :class:`TenantCredentialsError`.
+
+    ``auth_header`` is the caller's own raw ``Authorization`` header (e.g.
+    ``request.META.get('HTTP_AUTHORIZATION')``), forwarded to SuperAdmin
+    verbatim instead of a static service token — see the module docstring.
+    Falls back to ``MCP_SERVICE_JWT`` only when no header is supplied.
     """
     tenant = str(tenant_id or '').strip()
     if not tenant:
@@ -132,12 +161,16 @@ def fetch_tenant_whatsapp_credentials(tenant_id, use_cache: bool = True):
             # be returned as if it were a credential.
             return cached if isinstance(cached, dict) else None
 
-    token = _service_token()
-    if not token:
-        raise TenantCredentialsError(
-            'No service token configured (MCP_SERVICE_JWT); refusing to call '
-            'SuperAdmin unauthenticated.'
-        )
+    authorization = (auth_header or '').strip()
+    if not authorization:
+        token = _service_token()
+        if not token:
+            raise TenantCredentialsError(
+                'No caller Authorization header to forward and no '
+                'MCP_SERVICE_JWT fallback configured; refusing to call '
+                'SuperAdmin unauthenticated.'
+            )
+        authorization = f'Bearer {token}'
 
     base = _base_url()
     if not base:
@@ -148,7 +181,7 @@ def fetch_tenant_whatsapp_credentials(tenant_id, use_cache: bool = True):
         resp = requests.get(
             url,
             headers={
-                'Authorization': f'Bearer {token}',
+                'Authorization': authorization,
                 'Accept': 'application/json',
             },
             timeout=REQUEST_TIMEOUT,

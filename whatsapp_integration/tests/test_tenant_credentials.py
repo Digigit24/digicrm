@@ -132,6 +132,32 @@ class FetchTenantCredentialsTests(TestCase):
                 fetch_tenant_whatsapp_credentials(TENANT)
         get.assert_not_called()
 
+    def test_a_forwarded_caller_auth_header_is_used_instead_of_the_service_token(self):
+        """The caller's own JWT, forwarded verbatim, wins over MCP_SERVICE_JWT."""
+        body = {'vendor_uid': 'v-1', 'api_token': 't-1', 'configured': True}
+        with patch('whatsapp_integration.services.tenant_credentials.requests.get',
+                   return_value=_Resp(body)) as get:
+            fetch_tenant_whatsapp_credentials(TENANT, auth_header='Bearer caller-own-jwt')
+        self.assertEqual(get.call_args.kwargs['headers']['Authorization'], 'Bearer caller-own-jwt')
+
+    @override_settings(MCP_SERVICE_JWT='')
+    def test_a_forwarded_auth_header_needs_no_service_token_configured_at_all(self):
+        """The whole point: this must work with MCP_SERVICE_JWT unset."""
+        body = {'vendor_uid': 'v-1', 'api_token': 't-1', 'configured': True}
+        with patch('whatsapp_integration.services.tenant_credentials.requests.get',
+                   return_value=_Resp(body)) as get, \
+             patch.dict('os.environ', {'DIGICRM_JWT_TOKEN': '', 'MCP_SERVICE_JWT': ''}, clear=False):
+            creds = fetch_tenant_whatsapp_credentials(TENANT, auth_header='Bearer caller-own-jwt')
+        self.assertEqual(creds['vendor_uid'], 'v-1')
+        self.assertEqual(get.call_args.kwargs['headers']['Authorization'], 'Bearer caller-own-jwt')
+
+    def test_falls_back_to_the_service_token_when_no_auth_header_is_forwarded(self):
+        body = {'vendor_uid': 'v-1', 'api_token': 't-1', 'configured': True}
+        with patch('whatsapp_integration.services.tenant_credentials.requests.get',
+                   return_value=_Resp(body)) as get:
+            fetch_tenant_whatsapp_credentials(TENANT)
+        self.assertEqual(get.call_args.kwargs['headers']['Authorization'], 'Bearer service-jwt')
+
     def test_the_token_never_appears_in_a_cache_key(self):
         from whatsapp_integration.services.tenant_credentials import _cache_key
         self.assertNotIn('tenant-token', _cache_key(str(TENANT)))
@@ -145,12 +171,13 @@ class AdapterCredentialPriorityTests(TestCase):
     def setUp(self):
         cache.clear()
 
-    def _build(self, headers=None, stored=None, env=('env-vendor', 'env-token')):
+    def _build(self, headers=None, stored=None, env=('env-vendor', 'env-token'), auth_header=None):
         from whatsapp_integration.views import _adapter_from_request
 
         class _Req:
-            def __init__(self, hdrs, tenant):
+            def __init__(self, hdrs, tenant, auth):
                 self.headers = hdrs or {}
+                self.META = {'HTTP_AUTHORIZATION': auth} if auth else {}
                 self.tenant_id = tenant
                 self.path = '/api/whatsapp/chat/conversations/'
 
@@ -158,32 +185,40 @@ class AdapterCredentialPriorityTests(TestCase):
             return {'WA_VENDOR_UID': env[0], 'WA_API_TOKEN': env[1], 'WA_BASE_URL': 'https://gw.example/api'}.get(key, default)
 
         with patch('whatsapp_integration.views.fetch_tenant_whatsapp_credentials',
-                   return_value=stored), \
+                   return_value=stored) as fetch, \
              patch('whatsapp_integration.views.env_config', side_effect=fake_env):
-            return _adapter_from_request(_Req(headers, TENANT))
+            adapter = _adapter_from_request(_Req(headers, TENANT, auth_header))
+            return adapter, fetch
 
     def test_the_tenant_credential_beats_the_global_env(self):
-        adapter = self._build(stored=TENANT_CREDS)
+        adapter, _fetch = self._build(stored=TENANT_CREDS)
         self.assertEqual(adapter.vendor_uid, 'tenant-vendor-uid')
         self.assertEqual(adapter.api_token, 'tenant-token')
 
     def test_env_is_used_only_when_the_tenant_has_nothing_stored(self):
-        adapter = self._build(stored=None)
+        adapter, _fetch = self._build(stored=None)
         self.assertEqual(adapter.vendor_uid, 'env-vendor')
         self.assertEqual(adapter.api_token, 'env-token')
 
     def test_headers_still_win_for_backward_compatibility(self):
-        adapter = self._build(
+        adapter, _fetch = self._build(
             headers={'X-WA-Vendor-Uid': 'hdr-vendor', 'X-WA-Api-Token': 'hdr-token'},
             stored=TENANT_CREDS,
         )
         self.assertEqual(adapter.vendor_uid, 'hdr-vendor')
+
+    def test_the_callers_own_auth_header_is_forwarded_to_the_tenant_lookup(self):
+        """This is the whole feature: no MCP_SERVICE_JWT needed, the caller's
+        own already-verified token is what SuperAdmin sees."""
+        _adapter, fetch = self._build(stored=TENANT_CREDS, auth_header='Bearer caller-own-jwt')
+        self.assertEqual(fetch.call_args.kwargs['auth_header'], 'Bearer caller-own-jwt')
 
     def test_a_superadmin_outage_falls_back_to_env_instead_of_breaking_whatsapp(self):
         from whatsapp_integration.views import _adapter_from_request
 
         class _Req:
             headers = {}
+            META = {}
             tenant_id = TENANT
             path = '/api/whatsapp/chat/conversations/'
 
