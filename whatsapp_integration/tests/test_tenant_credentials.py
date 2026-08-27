@@ -17,6 +17,7 @@ from django.test import TestCase, override_settings
 
 from whatsapp_integration.models import WhatsAppVendorConfig
 from whatsapp_integration.services import realtime
+from whatsapp_integration.services.laravel_adapter import LaravelAdapterError
 from whatsapp_integration.services.tenant_credentials import (
     TenantCredentialsError,
     fetch_tenant_whatsapp_credentials,
@@ -195,17 +196,43 @@ class AdapterCredentialPriorityTests(TestCase):
         self.assertEqual(adapter.vendor_uid, 'tenant-vendor-uid')
         self.assertEqual(adapter.api_token, 'tenant-token')
 
-    def test_env_is_used_only_when_the_tenant_has_nothing_stored(self):
-        adapter, _fetch = self._build(stored=None)
+    def test_env_is_a_debug_only_dev_escape_when_the_tenant_has_nothing_stored(self):
+        """Outside DEBUG this is a production request with no headers, no
+        stored tenant credential, and env should NOT be trusted — see
+        test_no_credential_anywhere_fails_loudly_in_production below."""
+        with override_settings(DEBUG=True):
+            adapter, _fetch = self._build(stored=None)
         self.assertEqual(adapter.vendor_uid, 'env-vendor')
         self.assertEqual(adapter.api_token, 'env-token')
 
-    def test_headers_still_win_for_backward_compatibility(self):
-        adapter, _fetch = self._build(
-            headers={'X-WA-Vendor-Uid': 'hdr-vendor', 'X-WA-Api-Token': 'hdr-token'},
-            stored=TENANT_CREDS,
-        )
+    def test_no_credential_anywhere_fails_loudly_in_production(self):
+        """Outside DEBUG, a tenant with nothing stored must not silently
+        borrow the global env credential — that is a quieter version of the
+        exact cross-tenant bug this module used to have. It must fail loudly
+        instead."""
+        with override_settings(DEBUG=False):
+            with self.assertRaises(LaravelAdapterError) as ctx:
+                self._build(stored=None)
+        self.assertEqual(ctx.exception.status_code, 424)
+
+    def test_headers_are_a_debug_only_dev_escape(self):
+        with override_settings(DEBUG=True):
+            adapter, _fetch = self._build(
+                headers={'X-WA-Vendor-Uid': 'hdr-vendor', 'X-WA-Api-Token': 'hdr-token'},
+                stored=TENANT_CREDS,
+            )
         self.assertEqual(adapter.vendor_uid, 'hdr-vendor')
+
+    def test_headers_are_ignored_outside_debug_even_if_sent(self):
+        """The tenant-stored credential must win in production regardless of
+        whatever a client sends — headers are never a production identity
+        source, so the tenant lookup is what actually resolves the vendor."""
+        with override_settings(DEBUG=False):
+            adapter, _fetch = self._build(
+                headers={'X-WA-Vendor-Uid': 'hdr-vendor', 'X-WA-Api-Token': 'hdr-token'},
+                stored=TENANT_CREDS,
+            )
+        self.assertEqual(adapter.vendor_uid, 'tenant-vendor-uid')
 
     def test_the_callers_own_auth_header_is_forwarded_to_the_tenant_lookup(self):
         """This is the whole feature: no MCP_SERVICE_JWT needed, the caller's
@@ -213,7 +240,7 @@ class AdapterCredentialPriorityTests(TestCase):
         _adapter, fetch = self._build(stored=TENANT_CREDS, auth_header='Bearer caller-own-jwt')
         self.assertEqual(fetch.call_args.kwargs['auth_header'], 'Bearer caller-own-jwt')
 
-    def test_a_superadmin_outage_falls_back_to_env_instead_of_breaking_whatsapp(self):
+    def test_a_superadmin_outage_falls_back_to_env_only_in_debug(self):
         from whatsapp_integration.views import _adapter_from_request
 
         class _Req:
@@ -225,12 +252,34 @@ class AdapterCredentialPriorityTests(TestCase):
         def fake_env(key, default=None):
             return {'WA_VENDOR_UID': 'env-vendor', 'WA_API_TOKEN': 'env-token'}.get(key, default)
 
-        with patch('whatsapp_integration.views.fetch_tenant_whatsapp_credentials',
+        with override_settings(DEBUG=True), \
+             patch('whatsapp_integration.views.fetch_tenant_whatsapp_credentials',
                    side_effect=TenantCredentialsError('superadmin down')), \
              patch('whatsapp_integration.views.env_config', side_effect=fake_env):
             adapter = _adapter_from_request(_Req())
 
         self.assertEqual(adapter.vendor_uid, 'env-vendor')
+
+    def test_a_superadmin_outage_fails_loudly_in_production_rather_than_borrowing_env(self):
+        from whatsapp_integration.views import _adapter_from_request
+
+        class _Req:
+            headers = {}
+            META = {}
+            tenant_id = TENANT
+            path = '/api/whatsapp/chat/conversations/'
+
+        def fake_env(key, default=None):
+            return {'WA_VENDOR_UID': 'env-vendor', 'WA_API_TOKEN': 'env-token'}.get(key, default)
+
+        with override_settings(DEBUG=False), \
+             patch('whatsapp_integration.views.fetch_tenant_whatsapp_credentials',
+                   side_effect=TenantCredentialsError('superadmin down')), \
+             patch('whatsapp_integration.views.env_config', side_effect=fake_env):
+            with self.assertRaises(LaravelAdapterError) as ctx:
+                _adapter_from_request(_Req())
+
+        self.assertEqual(ctx.exception.status_code, 424)
 
 
 @override_settings(**SETTINGS)

@@ -1457,15 +1457,21 @@ def _dispatch_tool(name: str, args: dict) -> dict:
             raise RuntimeError('user_uid must be a valid UUID — resolve names via list_users')
 
         # Primary: write Lead.assigned_to directly in DigiCRM
-        lead.assigned_to = user_uid
-        lead.save(update_fields=['assigned_to'])
-        LeadActivity.objects.create(
-            lead=lead,
-            tenant_id=TENANT_ID,
-            type='NOTE',
-            content='Chat assigned to user %s via MCP agent.' % user_uid,
-            created_by=OWNER_USER_ID or TENANT_ID,
-        )
+        # Both writes share one transaction: without it, a crash logging the
+        # activity (as happened here — LeadActivity has no `created_by` field)
+        # left the assignment committed with no record of who made it.
+        from django.db import transaction
+        with transaction.atomic():
+            lead.assigned_to = user_uid
+            lead.save(update_fields=['assigned_to'])
+            LeadActivity.objects.create(
+                lead=lead,
+                tenant_id=TENANT_ID,
+                type='NOTE',
+                content='Chat assigned to user %s via MCP agent.' % user_uid,
+                by_user_id=OWNER_USER_ID or None,
+                happened_at=timezone.now(),
+            )
 
         # Secondary: best-effort sync to the Laravel WhatsApp inbox panel
         adapter_result = {}

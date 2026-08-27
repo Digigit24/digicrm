@@ -2,6 +2,7 @@ import logging
 from datetime import timedelta
 from common.env import config as env_config
 
+from django.conf import settings as django_settings
 from django.utils import timezone
 from django.http import HttpResponse
 from drf_spectacular.utils import (
@@ -61,11 +62,11 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
 
     Credential priority, most specific first:
 
-      1. ``X-WA-Vendor-Uid`` / ``X-WA-Api-Token`` request headers. LEGACY and
-         effectively dead — the web app used to send these from localStorage,
-         which was removed precisely because a tenant-wide vendor token in a
-         browser is a cross-tenant primitive. Honoured for backward
-         compatibility, not invested in.
+      1. ``X-WA-Vendor-Uid`` / ``X-WA-Api-Token`` request headers. DEBUG-ONLY
+         dev escape hatch — a tenant-wide vendor token accepted from any
+         authenticated caller with no check that it belongs to
+         ``request.tenant_id`` is exactly the cross-tenant primitive this
+         module used to ship with. Never honoured outside ``settings.DEBUG``.
       2. THE TENANT'S OWN credential, saved in SuperAdmin's ``Tenant.settings``
          by the Admin Settings screen and fetched server-to-server. This is the
          only place a tenant admin can self-serve, so it is authoritative.
@@ -75,16 +76,23 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
          ``tenant_credentials.py``. No standing secret to rotate; this just
          works as long as the request is itself authenticated, which every
          caller here already is.
-      3. The global ``WA_VENDOR_UID`` / ``WA_API_TOKEN`` env pair. LAST RESORT.
-         It used to be the primary path, which meant every tenant shared one
-         vendor account no matter what they had configured, and a single stale
-         value broke WhatsApp for all of them at once.
+      3. The global ``WA_VENDOR_UID`` / ``WA_API_TOKEN`` env pair. DEBUG-ONLY
+         dev escape hatch, same reasoning as (1): it used to be the primary
+         path, which meant every tenant shared one vendor account. Silently
+         falling back to it in production would just be a quieter version of
+         the same bug — a tenant whose own credential lookup fails would have
+         its WhatsApp traffic silently routed through whoever's account the
+         env pair belongs to, with no obvious error.
 
-    A failure in (2) is deliberately non-fatal: SuperAdmin being briefly
-    unreachable must not take WhatsApp down when a working env fallback exists.
+    A failure in (2) is logged but not immediately fatal — it falls through to
+    (3), which in production has nothing to fall through to (see below): a
+    genuinely unconfigured or momentarily-unreachable tenant fails loudly with
+    424 rather than borrowing another tenant's identity.
     """
-    vendor_uid = request.headers.get('X-WA-Vendor-Uid') or None
-    api_token  = request.headers.get('X-WA-Api-Token') or None
+    debug_mode = bool(getattr(django_settings, 'DEBUG', False))
+
+    vendor_uid = (request.headers.get('X-WA-Vendor-Uid') or None) if debug_mode else None
+    api_token  = (request.headers.get('X-WA-Api-Token') or None) if debug_mode else None
     # Never trust a client-provided base URL for server-side adapter calls.
     base_url = None
     credential_source = 'header' if (vendor_uid and api_token) else None
@@ -114,12 +122,14 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
             base_url = stored.get('base_url')
             credential_source = 'tenant'
 
-    # Env var fallback (read via decouple so .env is respected)
-    env_vendor_uid = env_config('WA_VENDOR_UID', default=None)
-    env_api_token  = env_config('WA_API_TOKEN', default=None)
+    # Env var fallback (read via decouple so .env is respected). DEBUG-only —
+    # see (3) above; a production tenant with no stored credential must fail
+    # loudly, not silently borrow whichever account this env pair belongs to.
+    env_vendor_uid = env_config('WA_VENDOR_UID', default=None) if debug_mode else None
+    env_api_token  = env_config('WA_API_TOKEN', default=None) if debug_mode else None
     env_base_url   = env_config('WA_BASE_URL', default=None)
 
-    # (3) Last resort. Only fills pieces still missing.
+    # (3) Last resort, DEBUG only. Only fills pieces still missing.
     if not (vendor_uid and api_token):
         vendor_uid = vendor_uid or env_vendor_uid
         api_token  = api_token  or env_api_token
@@ -128,11 +138,12 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
     base_url = base_url or env_base_url
 
     logger.info(
-        '[WA Adapter] Resolved credentials — source=%s '
+        '[WA Adapter] Resolved credentials — source=%s debug=%s '
         'header_vendor=%s header_token=%s env_vendor=%s env_token=%s final_vendor=%s has_token=%s path=%s',
         credential_source or 'none',
-        bool(request.headers.get('X-WA-Vendor-Uid')),
-        bool(request.headers.get('X-WA-Api-Token')),
+        debug_mode,
+        bool(vendor_uid) if credential_source == 'header' else bool(request.headers.get('X-WA-Vendor-Uid')),
+        bool(api_token) if credential_source == 'header' else bool(request.headers.get('X-WA-Api-Token')),
         bool(env_vendor_uid),
         bool(env_api_token),
         vendor_uid,
@@ -141,9 +152,24 @@ def _adapter_from_request(request) -> LaravelWhatsAppAdapter:
     )
 
     if not (vendor_uid and api_token):
+        if not debug_mode:
+            # Fail loudly rather than let LaravelWhatsAppAdapter fall through to
+            # the deprecated, tenant-shared WhatsAppVendorConfig table — that
+            # fallback is a dev-only escape hatch now, not a production path.
+            logger.error(
+                '[WA Adapter] No usable WhatsApp credential for this tenant in production '
+                '(tenant lookup absent/unconfigured, DEBUG-only fallbacks disabled). '
+                'tenant=%s path=%s',
+                request.tenant_id, request.path,
+            )
+            raise LaravelAdapterError(
+                'WhatsApp is not configured for this tenant. Configure a WhatsApp '
+                'vendor account in Admin Settings.',
+                status_code=424,
+            )
         logger.warning(
-            '[WA Adapter] No credentials from headers or env vars — falling back to DB lookup. '
-            'tenant=%s path=%s',
+            '[WA Adapter] No credentials from headers or env vars — falling back to DB lookup '
+            '(DEBUG only). tenant=%s path=%s',
             request.tenant_id, request.path
         )
 
@@ -802,18 +828,24 @@ class LeadWhatsAppViewSet(TenantViewSetMixin, viewsets.ViewSet):
             return Response({'detail': 'user_uid must be a valid UUID.'}, status=status.HTTP_400_BAD_REQUEST)
 
         # ── Primary: update Lead.assigned_to in DigiCRM ──────────────────────
-        lead.assigned_to = user_uid
-        lead.save(update_fields=['assigned_to'])
-
-        # Log the assignment as a lead activity
+        # Both writes share one transaction: without it, a crash logging the
+        # activity (as happened here — LeadActivity has no `created_by` field)
+        # left the assignment committed with no record of who made it.
+        from django.db import transaction
         from crm.models import LeadActivity
-        LeadActivity.objects.create(
-            lead=lead,
-            tenant_id=request.tenant_id,
-            type='NOTE',
-            content='Chat assigned to user %s via WhatsApp agent.' % user_uid,
-            created_by=request.user_id,
-        )
+        with transaction.atomic():
+            lead.assigned_to = user_uid
+            lead.save(update_fields=['assigned_to'])
+
+            # Log the assignment as a lead activity
+            LeadActivity.objects.create(
+                lead=lead,
+                tenant_id=request.tenant_id,
+                type='NOTE',
+                content='Chat assigned to user %s via WhatsApp agent.' % user_uid,
+                by_user_id=request.user_id,
+                happened_at=timezone.now(),
+            )
 
         # ── Secondary: best-effort sync to Laravel WhatsApp inbox ────────────
         # Laravel's user system is separate; this may not find a matching user.
