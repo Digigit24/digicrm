@@ -22,7 +22,7 @@ The frontend and the mobile app both code against one shape, defined here:
       "location": {"lat","lng","name","address"}|None,
       "contacts": [...]|None,
       "interactive": {...}|None,
-      "template": {"name","components"}|None,
+      "template": {"name","components","component_values","language"}|None,
       "reply_to": str|None, "error": str|None
     }
 
@@ -303,17 +303,42 @@ def _build_interactive(interaction, other_data, raw, data):
 
 def _template_components(raw, data, template_data, proforma):
     """
-    The Meta component array.
+    The template's STRUCTURE: component definitions with ``{{n}}`` placeholder
+    text still in them, not the values that filled them in.
 
-    Laravel scatters this across five different keys depending on which code
-    path wrote the row, and ``template_data.components`` is the one the audit
-    found DigiCRM was missing (bug C1).
+    ``template_data.components``/``proforma.components`` are Meta's own
+    template definition and are checked first for that reason. The
+    submitted/value keys are last-resort fallbacks only for a row that never
+    got a definition logged (so the raw body text is at least visible),
+    since mixing a resolved parameter list in here would make
+    ``renderTemplateBody`` treat already-substituted text as a placeholder
+    template again.
     """
     for candidate in (
         _as_dict(template_data).get('components'),
         raw.get('template_components'),
         data.get('template_components'),
         _as_dict(proforma).get('components'),
+        raw.get('template_component_values'),
+        data.get('template_component_values'),
+        raw.get('submitted_template_components'),
+        data.get('submitted_template_components'),
+    ):
+        if isinstance(candidate, list) and candidate:
+            return candidate
+    return []
+
+
+def _template_component_values(raw, data):
+    """
+    The RESOLVED values a send actually used: ``[{type:'body',
+    parameters:[...]}]``. Distinct from ``_template_components`` on purpose —
+    the frontend substitutes these into the structure's ``{{n}}`` slots, so
+    collapsing the two into one field (as this used to do) meant whichever
+    list happened to be logged first silently won and the other was lost,
+    most often leaving the raw ``{{n}}`` placeholders on screen unresolved.
+    """
+    for candidate in (
         raw.get('template_component_values'),
         data.get('template_component_values'),
         raw.get('submitted_template_components'),
@@ -331,11 +356,13 @@ def _build_template(raw, data, template_data, proforma):
         _as_dict(template_data).get('name'),
     )
     components = _template_components(raw, data, template_data, proforma)
-    if not name and not components:
+    component_values = _template_component_values(raw, data)
+    if not name and not components and not component_values:
         return None
     return {
         'name': name,
         'components': components,
+        'component_values': component_values,
         'language': _first(
             _as_dict(proforma).get('language'),
             _get(raw, data, 'template_language'),
