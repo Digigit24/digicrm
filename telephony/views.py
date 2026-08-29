@@ -1242,6 +1242,7 @@ class LiveEventWebhookView(APIView):
         logger.info('Live event webhook (tenant=%s): %s', tenant_id, payload)
 
         event_name, cmiuid = _normalize_live_event(payload)
+        _record_live_event_payload(tenant_id, payload, event_name)
         if event_name:
             to_number = payload.get('to') or payload.get('to_number')
             publish_live_event(tenant_id, event_name, {
@@ -1269,6 +1270,36 @@ class LiveEventWebhookView(APIView):
             )
 
         return Response({'status': 'ok'})
+
+
+def _record_live_event_payload(tenant_id, payload, event_name) -> None:
+    """
+    Capture a live-event payload so `_normalize_live_event()` can be tightened
+    against real data instead of guesses.
+
+    Deliberately swallows everything. This is diagnostics: a webhook must never
+    fail because we could not write a log row, and TeleCMI retries on non-2xx,
+    so raising here would turn a storage hiccup into duplicate call events.
+    """
+    try:
+        from telephony.models import TeleCMIWebhookLog
+
+        raw_event = ''
+        if isinstance(payload, dict):
+            raw_event = str(payload.get('event') or payload.get('status') or '').strip().lower()[:64]
+
+        TeleCMIWebhookLog.objects.create(
+            tenant_id=tenant_id,
+            event_type=raw_event,
+            raw_payload=payload if isinstance(payload, dict) else {'_raw': str(payload)},
+            matched=bool(event_name),
+            normalized_event=event_name or '',
+        )
+    except Exception:
+        logger.exception(
+            'Could not record TeleCMI live-event payload for tenant=%s '
+            '(webhook itself is unaffected)', tenant_id,
+        )
 
 
 def _normalize_live_event(payload: dict):

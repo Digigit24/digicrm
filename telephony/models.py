@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.db import models
 from django.utils import timezone
 
@@ -650,3 +652,66 @@ class DeviceToken(models.Model):
 
     def __str__(self):
         return f'{self.platform} token for user {self.user_id} ({self.app})'
+
+
+class TeleCMIWebhookLog(models.Model):
+    """
+    Raw capture of inbound TeleCMI webhook payloads.
+
+    WHY THIS EXISTS. `_normalize_live_event()` in views.py is an explicit
+    best-effort guess at TeleCMI's live-event field names, because that payload
+    is not fully documented. Anything it cannot classify is dropped, and until
+    now the only trace was a log line that ages out. That makes the normaliser
+    impossible to tighten with confidence: nobody can say which shapes are
+    actually arriving.
+
+    So every live-event webhook is recorded here with `matched` set to whether
+    the normaliser recognised it. Query the unmatched rows to see the real
+    shapes, then widen the normaliser against evidence rather than guesswork.
+
+    This is a DIAGNOSTIC table, not a queue or an audit log. It is expected to
+    be pruned; see `prune_older_than()`.
+    """
+
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+
+    #: Whatever the payload called itself, lowercased -- '' when it named
+    #: nothing, which is itself a finding worth being able to count.
+    event_type = models.CharField(max_length=64, blank=True, default='')
+
+    #: The payload exactly as received. The point of the table.
+    raw_payload = models.JSONField(default=dict)
+
+    #: False means `_normalize_live_event()` returned (None, None) and the
+    #: event was dropped. These are the rows worth reading.
+    matched = models.BooleanField(default=False, db_index=True)
+
+    #: Populated only when matched, so a reader can confirm the classification
+    #: was right and not merely non-null.
+    normalized_event = models.CharField(max_length=32, blank=True, default='')
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'telephony_webhook_logs'
+        indexes = [
+            # The lookup this table exists to serve: unmatched payloads for one
+            # tenant, newest first.
+            models.Index(
+                fields=['tenant_id', 'matched', '-created_at'],
+                name='idx_tel_whlog_unmatched',
+            ),
+        ]
+
+    def __str__(self):
+        state = 'matched' if self.matched else 'UNMATCHED'
+        return f'{state} {self.event_type or "(no event field)"} @ {self.created_at:%Y-%m-%d %H:%M}'
+
+    @classmethod
+    def prune_older_than(cls, days: int = 30) -> int:
+        """Delete rows older than `days`. Returns the number deleted."""
+        from django.utils import timezone
+        cutoff = timezone.now() - timedelta(days=days)
+        deleted, _ = cls.objects.filter(created_at__lt=cutoff).delete()
+        return deleted

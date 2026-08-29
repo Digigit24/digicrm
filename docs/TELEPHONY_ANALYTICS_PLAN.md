@@ -1,4 +1,38 @@
 # DigiCRM Telephony Analytics & Intelligence Plan
+> ## ⚠️ PARTIALLY SUPERSEDED — read this before acting on anything below
+>
+> **Status as of 2026-08-30.** This plan is dated 2026-07-29. Several gaps it
+> describes as open have since been implemented, so the "Gap Analysis" and
+> "Critical Gap" sections below no longer describe the code. The plan is kept
+> because the parts still open are still the right plan — but do not use it as
+> a to-do list without checking against this banner first.
+>
+> ### Done since this was written — ignore these sections
+>
+> | Plan says | Reality |
+> |---|---|
+> | §2 "Critical Gap: `agent_user_id` is Never Set" | **Implemented.** Populated in `telephony/tasks.py` (`agent_user_id=user_id`) and exposed as a filter on the calls endpoint (`views.py` `filterset_fields`). |
+> | Call outcome / disposition missing | **Implemented.** `call_outcome`, `call_outcome_note` and `call_outcome_set_at` on the `Call` model, written through `PATCH /api/telephony/calls/<pk>/outcome/` (`CallOutcomeView`). |
+> | No per-agent analytics endpoint | **Implemented.** `GET /api/telephony/analytics/daily/` returns per-agent per-day stats. |
+> | No raw webhook payload capture | **Implemented 2026-08-30.** `TeleCMIWebhookLog` records every live-event payload with a `matched` flag, so `_normalize_live_event()` can be tightened against real payloads instead of guesses. |
+>
+> ### Genuinely still open — this is what the plan is still good for
+>
+> * **Agent presence / availability tracking** — nothing in `telephony/` implements it.
+> * **TeleCMI `/v2/analysis` cross-check** — our figures are still computed only from our own CDR rows; nothing reconciles them against TeleCMI's own analysis endpoint.
+> * **CSV export** of call logs and analytics.
+> * **Call transcription.**
+>
+> ### Not in this plan, but a known open security item
+>
+> Webhook authentication is weaker than it looks: a tenant with no
+> `webhook_secret` configured currently passes verification, and a payload that
+> omits `appid` passes the app-id check. See the TeleCMI hardening task — the
+> fix is deliberately staged, because enforcing it before every tenant's
+> TeleCMI dashboard URL carries the key would silently stop their call logs.
+
+---
+
 > **Date:** 2026-07-29  
 > **Repo:** `digicrm` (Django backend) + `sepratecrm` (React/TS frontend)  
 > **Telephony provider:** TeleCMI (PIOPIY WebRTC SDK + TeleCMI REST API)  
