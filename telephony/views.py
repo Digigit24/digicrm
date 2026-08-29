@@ -32,7 +32,7 @@ from common.permissions import HasDigiPermission, is_admin_request
 from telephony.models import (
     TeleCMICredential, TeleCMIAgent, ZataStorageCredential, CallLog, SMSLog,
     TeleCMICampaign, TeleCMICallingProfile, TeleCMIProfileAssignment,
-    CallDirectionEnum, SMSStatusEnum, RecordingStorageStatusEnum,
+    CallDirectionEnum, SMSStatusEnum, RecordingStorageStatusEnum, DeviceToken,
 )
 from telephony.serializers import (
     TeleCMICredentialSerializer, TeleCMIAgentSerializer, ZataStorageCredentialSerializer,
@@ -43,6 +43,7 @@ from telephony.serializers import (
     CallerIDUpdateSerializer, CDRSyncSerializer, AddNoteSerializer,
     CallOutcomeSerializer, TeleCMICampaignSerializer,
     CampaignLeadPushSerializer, CampaignGroupPushSerializer,
+    DeviceTokenSerializer,
 )
 from telephony.services import telecmi_client as client
 from telephony.services.token_service import (
@@ -67,6 +68,9 @@ from telephony.services.softphone_service import (
     SoftphoneConfigError, REASON_TENANT_NOT_CONFIGURED,
 )
 from telephony.services.realtime import publish_live_event
+from telephony.services.push_service import (
+    resolve_user_ids_for_extension, send_call_wake_push,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -893,6 +897,53 @@ class CallerIDView(APIView):
 
 
 # ──────────────────────────────────────────────────────────────
+# Mobile push registration (wake a backgrounded SIP client for an
+# incoming call — see telephony/services/push_service.py)
+# ──────────────────────────────────────────────────────────────
+
+class DeviceTokenView(APIView):
+    """
+    POST   /api/telephony/device-tokens/  — register/refresh this device's push token
+    DELETE /api/telephony/device-tokens/  — remove it (e.g. on logout)
+
+    Gated on the same 'calls' permission as click-to-call, not 'settings' —
+    any user who can place/receive calls needs to register a device, this
+    isn't an admin-only configuration surface.
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [HasDigiPermission]
+    permission_module = 'telephony'
+    permission_resource = 'calls'
+
+    def post(self, request):
+        serializer = DeviceTokenSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        data = serializer.validated_data
+        DeviceToken.objects.update_or_create(
+            tenant_id=_tenant_id(request),
+            fcm_token=data['fcm_token'],
+            defaults={
+                'user_id': _user_id(request),
+                'platform': data['platform'],
+                'app': data.get('app') or 'crmflutter',
+            },
+        )
+        return Response({'status': 'ok'})
+
+    def delete(self, request):
+        fcm_token = request.data.get('fcm_token') or request.query_params.get('fcm_token')
+        if not fcm_token:
+            return Response(
+                {'error': 'fcm_token is required'}, status=status.HTTP_400_BAD_REQUEST
+            )
+        DeviceToken.objects.filter(
+            tenant_id=_tenant_id(request), fcm_token=fcm_token,
+        ).delete()
+        return Response({'status': 'ok'})
+
+
+# ──────────────────────────────────────────────────────────────
 # Break management
 # ──────────────────────────────────────────────────────────────
 
@@ -1192,11 +1243,24 @@ class LiveEventWebhookView(APIView):
 
         event_name, cmiuid = _normalize_live_event(payload)
         if event_name:
+            to_number = payload.get('to') or payload.get('to_number')
             publish_live_event(tenant_id, event_name, {
                 'cmiuid': cmiuid,
                 'from': payload.get('from') or payload.get('from_number'),
-                'to': payload.get('to') or payload.get('to_number'),
+                'to': to_number,
             })
+            if event_name == 'ringing':
+                # 'to' on an inbound ringing event is the extension TeleCMI
+                # is ringing — resolve it back to a CRM user and wake their
+                # phone before the SBC's own ring times out. Never blocks
+                # the webhook response (see push_service's own guarantees).
+                user_ids = resolve_user_ids_for_extension(tenant_id, to_number)
+                send_call_wake_push(tenant_id, user_ids, {
+                    'event': 'ringing',
+                    'cmiuid': cmiuid or '',
+                    'from': payload.get('from') or payload.get('from_number') or '',
+                    'to': to_number or '',
+                })
         else:
             logger.warning(
                 'Live event webhook (tenant=%s): could not classify payload as '

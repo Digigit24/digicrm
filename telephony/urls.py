@@ -21,6 +21,7 @@ Authenticated endpoints:
   GET        /api/telephony/sms/                      SMS log list
   GET        /api/telephony/caller-ids/               List caller IDs
   POST       /api/telephony/caller-ids/               Set active caller ID
+  POST/DEL   /api/telephony/device-tokens/            Register/remove a push token
   GET        /api/telephony/break/                    Get break records
   GET        /api/telephony/callbacks/                List callbacks from TeleCMI
   GET        /api/telephony/webrtc-config/            PIOPIY SDK config for browser
@@ -71,6 +72,7 @@ urlpatterns = [
 
     # Settings
     path('caller-ids/', views.CallerIDView.as_view(), name='caller-ids'),
+    path('device-tokens/', views.DeviceTokenView.as_view(), name='device-tokens'),
     path('break/', views.BreakView.as_view(), name='break'),
     path('callbacks/', views.CallbackListView.as_view(), name='callbacks'),
     path('webrtc-config/', views.WebRTCConfigView.as_view(), name='webrtc-config'),

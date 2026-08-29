@@ -606,3 +606,47 @@ class TeleCMICampaign(models.Model):
 
     def __str__(self):
         return f'Campaign: {self.name} (tenant {self.tenant_id})'
+
+
+class DevicePlatformEnum(models.TextChoices):
+    ANDROID = 'android', 'Android'
+    IOS = 'ios', 'iOS'
+
+
+class DeviceToken(models.Model):
+    """
+    A push token for a mobile client, used to wake it for an incoming call.
+
+    The SIP/WebRTC socket a mobile softphone holds against the SBC does not
+    survive the OS suspending/killing the app in the background, so a
+    "waiting" live-event alone (see `LiveEventWebhookView`) cannot reach a
+    backgrounded phone. This is the address book the webhook handler
+    consults to send a wake-up push (FCM data message / iOS VoIP push)
+    before the SBC's own INVITE retransmits time out.
+
+    One user can hold multiple rows (multiple installs/devices); the most
+    recently updated one per (tenant, user, platform) is what actually
+    matters, but old rows are left to expire naturally on next login rather
+    than being pruned here.
+    """
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.UUIDField(db_index=True)
+    user_id = models.UUIDField(db_index=True)
+    platform = models.CharField(max_length=10, choices=DevicePlatformEnum.choices)
+    fcm_token = models.CharField(max_length=512)
+    app = models.CharField(
+        max_length=64, default='crmflutter',
+        help_text='Which client registered this token, e.g. crmflutter or celiyocrmmobileapp',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'telephony_device_tokens'
+        unique_together = [('tenant_id', 'fcm_token')]
+        indexes = [
+            models.Index(fields=['tenant_id', 'user_id'], name='idx_tel_devtok_user'),
+        ]
+
+    def __str__(self):
+        return f'{self.platform} token for user {self.user_id} ({self.app})'

@@ -654,3 +654,10 @@ class CampaignGroupPushSerializer(serializers.Serializer):
     group_id = serializers.IntegerField(
         help_text='CRM LeadGroup ID whose members seed this campaign',
     )
+
+
+class DeviceTokenSerializer(serializers.Serializer):
+    """POST body for /api/telephony/device-tokens/ (register/refresh a push token)."""
+    platform = serializers.ChoiceField(choices=['android', 'ios'])
+    fcm_token = serializers.CharField(max_length=512)
+    app = serializers.CharField(max_length=64, required=False, default='crmflutter')
