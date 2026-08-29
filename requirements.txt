@@ -19,6 +19,7 @@ redis>=5.0.0
 cryptography>=41.0.0
 boto3>=1.34.0
 google-auth>=2.23.0
+firebase-admin>=6.5.0  # telephony call wake-up push; no-ops until FIREBASE_CREDENTIALS_JSON is set
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.1.1
 google-api-python-client>=2.100.0

@@ -471,6 +471,12 @@ INTEGRATION_ENCRYPTION_KEY = config('INTEGRATION_ENCRYPTION_KEY', default=None)
 #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 TELECMI_MASTER_KEY = config('TELECMI_MASTER_KEY', default=None)
 
+# Path to a Firebase service-account JSON file. Enables call wake-up pushes
+# to backgrounded mobile SIP clients (telephony/services/push_service.py).
+# Unset by default — no Firebase project exists for this app yet; until one
+# is created and this is set, push_service silently no-ops.
+FIREBASE_CREDENTIALS_JSON = config('FIREBASE_CREDENTIALS_JSON', default=None)
+
 # ===========================
 # COMPOSIO (managed third-party tool auth)
 # ===========================
