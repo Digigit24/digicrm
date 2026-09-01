@@ -42,3 +42,7 @@ htmlcov/
 
 # pytest
 .pytest_cache/**/__pycache__/
+
+# Logs and local dev cache (accidentally committed 2026-09-01)
+logs/
+.cache/*.djcache
