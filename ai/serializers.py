@@ -62,10 +62,14 @@ class AIChatMessageBatchCreateSerializer(serializers.Serializer):
     """Validate a batch of messages to append to a session."""
 
     messages = serializers.ListField(
-        child=serializers.DictField(
-            child=serializers.CharField(),
-            required_keys=['role', 'content']
-        ),
+        # `required_keys` was removed here -- not a real DictField kwarg in
+        # this DRF version (`Field.__init__()` rejected it with a TypeError
+        # at import time, which meant the whole `ai` app failed to load).
+        # Required-key checking already happens for real in
+        # `validate_messages` below (`msg.get('role')`/`msg.get('content')`),
+        # so this constructor was doing nothing even before it started
+        # crashing the import.
+        child=serializers.DictField(child=serializers.CharField()),
         min_length=1,
         help_text='Array of {role, content} objects. Role must be user/assistant/tool.'
     )
