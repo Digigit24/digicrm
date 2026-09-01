@@ -258,3 +258,231 @@ class AIVoiceTranscribeView(APIView):
             )
 
         return Response({"text": text})
+
+
+class AIChatSessionListView(APIView):
+    """
+    GET /api/ai/sessions/ — list the caller's chat sessions.
+
+    Returns paginated sessions ordered by -updated_at.
+    Each item: {id, title, created_at, updated_at, message_count}
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        tenant_id = getattr(request, 'tenant_id', None)
+        user_id = getattr(request, 'user_id', None)
+        if not tenant_id or not user_id:
+            return Response(
+                {'error': 'Tenant or user scope missing'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        qs = AIChatSession.objects.filter(
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+        # Pagination (DRF default page size)
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = AIChatSessionListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = AIChatSessionListSerializer(qs, many=True)
+        return Response(serializer.data)
+
+
+class AIChatSessionCreateView(APIView):
+    """
+    POST /api/ai/sessions/ — create a new empty chat session.
+
+    Body: {title?} — optional, auto-generated from first user message if omitted.
+    Returns: {id, title, created_at, updated_at}
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        tenant_id = getattr(request, 'tenant_id', None)
+        user_id = getattr(request, 'user_id', None)
+        if not tenant_id or not user_id:
+            return Response(
+                {'error': 'Tenant or user scope missing'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = AIChatSessionCreateSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+
+        session = AIChatSession.objects.create(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            title=serializer.validated_data.get('title', ''),
+        )
+
+        out = AIChatSessionListSerializer(session)
+        return Response(out.data, status=status.HTTP_201_CREATED)
+
+
+class AIChatSessionDetailView(APIView):
+    """
+    GET /api/ai/sessions/{id}/ — get a session with all messages (for resume).
+
+    Returns: {id, title, created_at, updated_at, messages: [{id, role, content, sequence, created_at}]}
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, id):
+        tenant_id = getattr(request, 'tenant_id', None)
+        user_id = getattr(request, 'user_id', None)
+        if not tenant_id or not user_id:
+            return Response(
+                {'error': 'Tenant or user scope missing'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            session = AIChatSession.objects.get(
+                id=id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        except AIChatSession.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = AIChatSessionDetailSerializer(session)
+        return Response(serializer.data)
+
+
+class AIChatSessionUpdateView(APIView):
+    """
+    PATCH /api/ai/sessions/{id}/ — rename a session.
+
+    Body: {title} — required, non-empty.
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, id):
+        tenant_id = getattr(request, 'tenant_id', None)
+        user_id = getattr(request, 'user_id', None)
+        if not tenant_id or not user_id:
+            return Response(
+                {'error': 'Tenant or user scope missing'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            session = AIChatSession.objects.get(
+                id=id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        except AIChatSession.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = AIChatSessionUpdateSerializer(session, data=request.data or {}, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        out = AIChatSessionListSerializer(session)
+        return Response(out.data)
+
+
+class AIChatSessionDeleteView(APIView):
+    """
+    DELETE /api/ai/sessions/{id}/ — delete a session (cascades to messages).
+
+    Returns 204 on success.
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, id):
+        tenant_id = getattr(request, 'tenant_id', None)
+        user_id = getattr(request, 'user_id', None)
+        if not tenant_id or not user_id:
+            return Response(
+                {'error': 'Tenant or user scope missing'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            session = AIChatSession.objects.get(
+                id=id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        except AIChatSession.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        session.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class AIChatSessionMessagesAppendView(APIView):
+    """
+    POST /api/ai/sessions/{id}/messages/ — append messages to a session.
+
+    Body: {messages: [{role, content}, ...]} — batch append.
+    Returns created messages with assigned sequence numbers; bumps session.updated_at.
+    """
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, id):
+        tenant_id = getattr(request, 'tenant_id', None)
+        user_id = getattr(request, 'user_id', None)
+        if not tenant_id or not user_id:
+            return Response(
+                {'error': 'Tenant or user scope missing'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            session = AIChatSession.objects.get(
+                id=id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        except AIChatSession.DoesNotExist:
+            return Response(
+                {'error': 'Session not found'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        serializer = AIChatMessageBatchCreateSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+
+        messages_data = serializer.validated_data['messages']
+
+        # Determine next sequence number
+        last_seq = session.messages.order_by('-sequence').values_list('sequence', flat=True).first() or 0
+
+        created_messages = []
+        for i, msg_data in enumerate(messages_data):
+            msg = AIChatMessage.objects.create(
+                session=session,
+                role=msg_data['role'],
+                content=msg_data['content'],
+                sequence=last_seq + i + 1,
+            )
+            created_messages.append(msg)
+
+        # Bump session updated_at (auto_now handles this on save)
+        session.save(update_fields=['updated_at'])
+
+        out = AIChatMessageSerializer(created_messages, many=True)
+        return Response(out.data, status=status.HTTP_201_CREATED)
