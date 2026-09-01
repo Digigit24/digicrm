@@ -35,7 +35,7 @@ class Migration(migrations.Migration):
                 ('content', models.TextField()),
                 ('sequence', models.PositiveIntegerField()),
                 ('created_at', models.DateTimeField(auto_now_add=True)),
-                ('session', models.ForeignKey(db_column='session_id', on_delete=django.db.models.deletion.CASCADE, related_name='messages', to='ai.ai_chat_session')),
+                ('session', models.ForeignKey(db_column='session_id', on_delete=django.db.models.deletion.CASCADE, related_name='messages', to='ai.aichatsession')),
             ],
             options={
                 'db_table': 'ai_chat_messages',
