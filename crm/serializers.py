@@ -126,6 +126,15 @@ class LeadActivitySerializer(TenantMixin):
     and other interactions that explain what happened with a lead.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Without this, an activity can be attached to ANOTHER tenant's lead:
+        # the row is stamped with our tenant but points at theirs, and
+        # LeadSerializer nests `activities` unfiltered, so they see it inside
+        # their own lead. Confirmed reachable via the copilot's
+        # create_lead_activity tool; see ai/tests/test_tool_dispatch.py.
+        self.scope_related_fields_to_tenant('lead')
+
     # by_user_id is set server-side from the authenticated JWT user (see
     # LeadActivityViewSet.perform_create); clients cannot spoof it.
     by_user_id = serializers.UUIDField(
@@ -188,6 +197,14 @@ class LeadSerializer(LeadReminderRepresentationMixin, TenantMixin):
     Agents use this schema to create, inspect, update, and enrich leads from
     websites, Meta Lead Ads, manual entry, imports, and other external sources.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # A `status_id` from another tenant would otherwise bind this lead to
+        # their pipeline stage — and `status_name` reads that stage's name back
+        # out, disclosing it. Confirmed reachable via the copilot's
+        # update_lead_status tool; see ai/tests/test_tool_dispatch.py.
+        self.scope_related_fields_to_tenant('status')
     status_name = serializers.CharField(
         source='status.name',
         read_only=True,

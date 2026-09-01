@@ -79,7 +79,40 @@ class TenantMixin(serializers.ModelSerializer):
         # Remove tenant_id from validated_data if present to prevent changes
         validated_data.pop('tenant_id', None)
         return super().update(instance, validated_data)
-    
+
+    def scope_related_fields_to_tenant(self, *field_names):
+        """
+        Narrow relational fields so they can only POINT AT this tenant's rows.
+
+        Tenant filtering on a viewset controls which rows you can LIST and
+        FETCH. It says nothing about which rows you may REFERENCE. DRF builds a
+        `PrimaryKeyRelatedField` over the model's full default manager, so an
+        auto-generated FK accepts any primary key in the table — including
+        another tenant's. The new row is then stamped with YOUR tenant while
+        pointing at THEIRS, and any unfiltered reverse relation shows it to
+        them.
+
+        Opt-in per serializer rather than applied to every relation
+        automatically: not every FK target is tenant-scoped, and silently
+        filtering one that is not would empty a legitimate choice list.
+
+        Call from `__init__` AFTER `super().__init__`.
+        """
+        request = self.context.get('request')
+        tenant_id = getattr(request, 'tenant_id', None) if request else None
+        if not tenant_id:
+            # No tenant context: leave the fields alone. `create()` above
+            # already refuses to write without a tenant, so this cannot become
+            # a write path — and schema generation renders serializers with no
+            # request at all.
+            return
+
+        for name in field_names:
+            field = self.fields.get(name)
+            queryset = getattr(field, 'queryset', None)
+            if queryset is not None:
+                field.queryset = queryset.filter(tenant_id=tenant_id)
+
     class Meta:
         abstract = True
 

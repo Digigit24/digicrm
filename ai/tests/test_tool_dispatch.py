@@ -1,0 +1,537 @@
+"""
+Tests for the AI copilot's in-process tool dispatcher (`ai/tools.py`).
+
+`ai/` had no tests at all before this. The dispatcher replaced an HTTP
+self-call, and the ONLY reason that self-call was acceptable in the first place
+was that it inherited tenant isolation and per-permission scoping by running
+the real DRF stack. So the thing these tests have to prove is not "the new code
+returns data" — it is that the security properties survived the change:
+
+  * a tool call cannot see or touch another tenant's rows, at all;
+  * `own` / `team` / `all` view scope still narrows what a read returns;
+  * a user without the permission gets refused rather than served;
+  * the model cannot smuggle a tenant_id or owner_user_id in through args.
+
+Everything runs against Django's test database. Nothing here touches live
+tenant data, and no HTTP request leaves the process.
+"""
+import uuid
+from unittest.mock import patch
+
+from django.test import TestCase, override_settings
+
+from ai.tools import (
+    _AUTH_CONTEXT_ATTRS,
+    EXPOSED_TOOLS,
+    RequestScopedClient,
+    ToolError,
+    execute_tool,
+)
+from crm.models import Lead, LeadActivity, LeadStatus
+
+TENANT_A = uuid.UUID('aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa')
+TENANT_B = uuid.UUID('bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb')
+USER_A = uuid.UUID('11111111-1111-4111-8111-111111111111')
+USER_A2 = uuid.UUID('22222222-2222-4222-8222-222222222222')
+USER_B = uuid.UUID('33333333-3333-4333-8333-333333333333')
+
+
+class FakeRequest:
+    """
+    Stands in for the outer, already-authenticated `AIChatView` request.
+
+    Deliberately NOT a real HTTP request: the whole point of the dispatcher is
+    that it reads identity off the attributes `JWTAuthenticationMiddleware`
+    sets, so the tests assert against exactly that contract. If someone later
+    changes the dispatcher to re-decode a JWT instead, these tests stop
+    compiling rather than silently passing.
+    """
+
+    def __init__(self, tenant_id, user_id, permissions=None, modules=('crm',),
+                 is_super_admin=False):
+        self.user_id = str(user_id) if user_id else None
+        self.tenant_id = str(tenant_id) if tenant_id else None
+        self.email = 'copilot-test@example.com'
+        self.tenant_slug = 'test-tenant'
+        self.is_super_admin = is_super_admin
+        self.permissions = permissions if permissions is not None else _perms('all')
+        self.enabled_modules = list(modules)
+        self.roles = []
+        self.META = {}
+
+
+def _perms(view_scope='all', create=True, edit=True, delete=True):
+    return {
+        'crm': {
+            'leads': {
+                'view': view_scope,
+                'create': create,
+                'edit': edit,
+                'delete': delete,
+            },
+            'statuses': {'view': 'all', 'create': True, 'edit': True},
+            'activities': {'view': 'all', 'create': True, 'edit': True},
+        },
+    }
+
+
+def _status(tenant_id=TENANT_A, name='New', order=0):
+    return LeadStatus.objects.create(
+        tenant_id=tenant_id, name=name, order_index=order, is_active=True,
+    )
+
+
+def _lead(tenant_id=TENANT_A, owner=USER_A, name='Ada', phone='919000000001',
+          assigned_to=None):
+    return Lead.objects.create(
+        tenant_id=tenant_id,
+        name=name,
+        phone=phone,
+        owner_user_id=owner,
+        assigned_to=assigned_to,
+    )
+
+
+def _names(payload):
+    """Lead names out of a list_leads payload, paginated or not."""
+    rows = payload.get('results', payload) if isinstance(payload, dict) else payload
+    return sorted(r['name'] for r in rows)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class CrossTenantIsolationTests(TestCase):
+    """The property that must never regress, tested from several directions."""
+
+    def setUp(self):
+        _lead(TENANT_A, USER_A, name='Tenant A Lead', phone='919000000001')
+        self.b_lead = _lead(TENANT_B, USER_B, name='Tenant B Lead', phone='919000000002')
+
+    def test_a_read_returns_only_the_callers_tenant(self):
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+        self.assertEqual(_names(result), ['Tenant A Lead'])
+
+    def test_the_other_tenant_sees_only_its_own(self):
+        # The mirror case. Asserting one direction only would pass even if the
+        # dispatcher hard-coded a single tenant somewhere.
+        result = execute_tool(FakeRequest(TENANT_B, USER_B), 'list_leads', {})
+        self.assertEqual(_names(result), ['Tenant B Lead'])
+
+    def test_fetching_another_tenants_lead_by_id_is_refused(self):
+        # The direct attempt: a real, existing primary key from tenant B,
+        # requested by tenant A. This must 404, not return the row.
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A), 'get_lead', {'lead_id': self.b_lead.id},
+        )
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 404)
+
+    def test_writing_to_another_tenants_lead_is_refused(self):
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'update_lead',
+            {'lead_id': self.b_lead.id, 'name': 'Hijacked'},
+        )
+        self.assertIn('error', result)
+        self.b_lead.refresh_from_db()
+        self.assertEqual(self.b_lead.name, 'Tenant B Lead')
+
+    def test_a_tenant_id_in_the_args_cannot_redirect_the_call(self):
+        # The model is untrusted input. Even if it asks for tenant B by name,
+        # the tenant comes from the request and nowhere else.
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'list_leads',
+            {'tenant_id': str(TENANT_B)},
+        )
+        self.assertEqual(_names(result), ['Tenant A Lead'])
+
+    def test_a_created_lead_lands_in_the_callers_tenant(self):
+        execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'create_lead',
+            {'name': 'New Lead', 'phone': '919000000009', 'tenant_id': str(TENANT_B)},
+        )
+        created = Lead.objects.get(name='New Lead')
+        self.assertEqual(str(created.tenant_id), str(TENANT_A))
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class PermissionScopingTests(TestCase):
+    """`own` / `team` / `all` must still narrow reads."""
+
+    def setUp(self):
+        _lead(TENANT_A, USER_A, name='Mine', phone='919000000011')
+        _lead(TENANT_A, USER_A2, name='Someone Elses', phone='919000000012')
+
+    def test_all_scope_sees_every_lead_in_the_tenant(self):
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+        self.assertEqual(_names(result), ['Mine', 'Someone Elses'])
+
+    def test_own_scope_sees_only_the_callers_leads(self):
+        req = FakeRequest(TENANT_A, USER_A, permissions=_perms(view_scope='own'))
+        result = execute_tool(req, 'list_leads', {})
+        self.assertEqual(_names(result), ['Mine'])
+
+    def test_own_scope_is_enforced_for_the_other_user_too(self):
+        # Same data, different caller: proves the filter follows the identity
+        # rather than happening to match the first user's rows.
+        req = FakeRequest(TENANT_A, USER_A2, permissions=_perms(view_scope='own'))
+        result = execute_tool(req, 'list_leads', {})
+        self.assertEqual(_names(result), ['Someone Elses'])
+
+    def test_a_user_without_view_permission_is_refused(self):
+        perms = _perms()
+        perms['crm']['leads']['view'] = False
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A, permissions=perms), 'list_leads', {},
+        )
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 403)
+
+    def test_a_user_without_create_permission_cannot_write(self):
+        perms = _perms(create=False)
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A, permissions=perms),
+            'create_lead',
+            {'name': 'Should Not Exist', 'phone': '919000000013'},
+        )
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 403)
+        self.assertFalse(Lead.objects.filter(name='Should Not Exist').exists())
+
+    def test_a_tenant_without_the_crm_module_is_refused(self):
+        req = FakeRequest(TENANT_A, USER_A, modules=('telephony',))
+        result = execute_tool(req, 'list_leads', {})
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 403)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class WriteToolTests(TestCase):
+    """Writes go through the real serializers, not a shortcut."""
+
+    def test_create_lead_persists_and_returns_the_row(self):
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'create_lead',
+            {'name': 'Grace', 'phone': '919000000021', 'email': 'grace@example.com'},
+        )
+        self.assertNotIn('error', result)
+        lead = Lead.objects.get(phone='919000000021')
+        self.assertEqual(lead.name, 'Grace')
+        self.assertEqual(str(lead.tenant_id), str(TENANT_A))
+        # The caller owns what they create; the model does not get to choose.
+        self.assertEqual(str(lead.owner_user_id), str(USER_A))
+
+    def test_owner_user_id_in_args_cannot_reassign_ownership(self):
+        execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'create_lead',
+            {'name': 'Hedy', 'phone': '919000000022', 'owner_user_id': str(USER_A2)},
+        )
+        lead = Lead.objects.get(phone='919000000022')
+        self.assertEqual(str(lead.owner_user_id), str(USER_A))
+
+    def test_update_lead_changes_the_row(self):
+        lead = _lead(TENANT_A, USER_A, name='Before', phone='919000000023')
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'update_lead',
+            {'lead_id': lead.id, 'name': 'After'},
+        )
+        self.assertNotIn('error', result)
+        lead.refresh_from_db()
+        self.assertEqual(lead.name, 'After')
+
+    def test_a_validation_failure_reads_as_a_message_not_a_crash(self):
+        # The model has to be able to relay this back to the user in prose.
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'create_lead', {})
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 400)
+        self.assertIsInstance(result['error'], str)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class DispatcherContractTests(TestCase):
+    """The dispatcher's own behaviour, independent of any one tool."""
+
+    def test_it_makes_no_network_call(self):
+        # The entire point of the change. If `requests` ever reappears on this
+        # path, this fails rather than deadlocking in production months later.
+        _lead(TENANT_A, USER_A, name='Local', phone='919000000031')
+        with patch('socket.socket.connect', side_effect=AssertionError(
+                'the tool dispatcher must not open a socket')):
+            result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+        self.assertEqual(_names(result), ['Local'])
+
+    def test_an_unauthenticated_request_cannot_execute_tools(self):
+        result = execute_tool(FakeRequest(None, None), 'list_leads', {})
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 401)
+
+    def test_a_tool_outside_the_allow_list_is_refused(self):
+        # EXPOSED_TOOLS is a curated subset of the MCP catalog; being in the
+        # catalog is not enough to be reachable from the copilot.
+        self.assertNotIn('delete_lead', EXPOSED_TOOLS)
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'delete_lead', {})
+        self.assertIn('error', result)
+        self.assertEqual(result.get('status'), 400)
+
+    def test_an_unroutable_path_reports_404_rather_than_raising(self):
+        client = RequestScopedClient(FakeRequest(TENANT_A, USER_A))
+        with self.assertRaises(ToolError) as ctx:
+            client.call('GET', '/api/nope/does-not-exist/')
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_query_params_reach_the_view(self):
+        _lead(TENANT_A, USER_A, name='Findable', phone='919000000041')
+        _lead(TENANT_A, USER_A, name='Hidden', phone='919000000042')
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A), 'list_leads', {'search': 'Findable'},
+        )
+        self.assertEqual(_names(result), ['Findable'])
+
+    def test_the_tenant_thread_local_is_restored_after_a_call(self):
+        # The dispatcher sets it so it does not depend on a caller several
+        # frames up; it must put back whatever was there, or the outer turn
+        # continues under the wrong tenant.
+        from common.middleware import get_current_tenant_id, set_current_tenant_id
+
+        set_current_tenant_id('sentinel-value')
+        try:
+            execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+            self.assertEqual(get_current_tenant_id(), 'sentinel-value')
+        finally:
+            set_current_tenant_id(None)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class ReadToolTests(TestCase):
+    def test_get_lead_returns_the_row(self):
+        lead = _lead(TENANT_A, USER_A, name='Katherine', phone='919000000051')
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A), 'get_lead', {'lead_id': lead.id},
+        )
+        self.assertNotIn('error', result)
+        self.assertEqual(result['name'], 'Katherine')
+
+    def test_list_lead_statuses_returns_this_tenants_pipeline(self):
+        _status(TENANT_A, name='New', order=0)
+        _status(TENANT_A, name='Won', order=1)
+        _status(TENANT_B, name='Other Tenant Stage', order=0)
+
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_lead_statuses', {})
+        rows = result.get('results', result) if isinstance(result, dict) else result
+        names = sorted(r['name'] for r in rows)
+        self.assertEqual(names, ['New', 'Won'])
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class CrossTenantForeignKeyTests(TestCase):
+    """
+    Foreign keys are the isolation gap that tenant filtering does not close.
+
+    `TenantViewSetMixin` scopes which rows you can LIST and FETCH, but it says
+    nothing about which rows you may POINT AT. A serializer whose FK field is
+    an auto-generated `PrimaryKeyRelatedField` accepts any primary key in the
+    table, including another tenant's — the new row is stamped with YOUR
+    tenant and still references THEIRS.
+
+    These were reachable over the old HTTP path too; nothing about the
+    in-process dispatcher introduced them. What changed is who can reach them:
+    these are copilot tools, so the arguments now originate in a language
+    model steered by user prose.
+    """
+
+    def setUp(self):
+        self.a_lead = _lead(TENANT_A, USER_A, name='A Lead', phone='919000000061')
+        self.b_lead = _lead(TENANT_B, USER_B, name='B Lead', phone='919000000062')
+        self.b_status = _status(TENANT_B, name='B Stage', order=0)
+
+    def test_cannot_attach_an_activity_to_another_tenants_lead(self):
+        # The damaging half is the read-back: LeadSerializer nests `activities`
+        # unfiltered, so tenant B would see this row inside their own lead.
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'create_lead_activity',
+            {'lead_id': self.b_lead.id, 'type': 'NOTE', 'content': 'injected'},
+        )
+        self.assertIn('error', result)
+        self.assertFalse(
+            LeadActivity.objects.filter(lead_id=self.b_lead.id).exists(),
+            "an activity was written onto another tenant's lead",
+        )
+
+    def test_cannot_move_a_lead_onto_another_tenants_pipeline_stage(self):
+        # Milder, same shape — and it discloses the other tenant's stage name
+        # back through `status_name`.
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'update_lead_status',
+            {'lead_id': self.a_lead.id, 'status_id': self.b_status.id},
+        )
+        self.assertIn('error', result)
+        self.a_lead.refresh_from_db()
+        self.assertIsNone(self.a_lead.status_id)
+
+    def test_a_same_tenant_activity_still_works(self):
+        # The fix must scope the FK, not break it.
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'create_lead_activity',
+            {'lead_id': self.a_lead.id, 'type': 'NOTE', 'content': 'fine'},
+        )
+        self.assertNotIn('error', result)
+        self.assertTrue(LeadActivity.objects.filter(lead_id=self.a_lead.id).exists())
+
+    def test_a_same_tenant_status_change_still_works(self):
+        status = _status(TENANT_A, name='A Stage', order=0)
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'update_lead_status',
+            {'lead_id': self.a_lead.id, 'status_id': status.id},
+        )
+        self.assertNotIn('error', result)
+        self.a_lead.refresh_from_db()
+        self.assertEqual(self.a_lead.status_id, status.id)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class AuthContextContractTests(TestCase):
+    """
+    The dispatcher copies identity as a fixed list of attribute names. That
+    list is a contract with the JWT middleware, and nothing else enforces it:
+    add a ninth claim to the middleware and the dispatcher silently keeps
+    copying eight, so an inner view sees a different identity than the caller.
+
+    Every way it can go wrong is fail-closed (a missing permission set means
+    "refused", a missing tenant means "empty"), so this would not leak data —
+    it would present as the assistant mysteriously seeing nothing. That is a
+    bad afternoon, and this test is the cheap way to avoid it.
+    """
+
+    def test_the_copied_attrs_match_what_the_middleware_sets(self):
+        import inspect
+        import re
+
+        from common.middleware import JWTAuthenticationMiddleware
+
+        src = inspect.getsource(JWTAuthenticationMiddleware.process_request)
+        assigned = set(re.findall(r'^\s*request\.(\w+) = ', src, re.M))
+        self.assertEqual(
+            assigned,
+            set(_AUTH_CONTEXT_ATTRS),
+            'JWTAuthenticationMiddleware and _AUTH_CONTEXT_ATTRS have drifted: '
+            'the dispatcher would hand views a different identity than the '
+            'caller has. Update _AUTH_CONTEXT_ATTRS in ai/tools.py.',
+        )
+
+    def test_a_partially_populated_outer_request_is_refused_loudly(self):
+        req = FakeRequest(TENANT_A, USER_A)
+        del req.permissions
+        result = execute_tool(req, 'list_leads', {})
+        self.assertEqual(result.get('status'), 401)
+        self.assertIn('permissions', result['error'])
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class ObjectLevelScopeTests(TestCase):
+    """
+    `own`/`team` scope on a DETAIL route runs through
+    `has_object_permission`, which is a different code path from the queryset
+    filtering the list tests cover. Both have to hold.
+    """
+
+    def setUp(self):
+        self.mine = _lead(TENANT_A, USER_A, name='Mine', phone='919000000071')
+        self.theirs = _lead(TENANT_A, USER_A2, name='Theirs', phone='919000000072')
+
+    def test_own_scope_cannot_fetch_a_colleagues_lead(self):
+        req = FakeRequest(TENANT_A, USER_A, permissions=_perms(view_scope='own'))
+        result = execute_tool(req, 'get_lead', {'lead_id': self.theirs.id})
+        self.assertIn('error', result)
+        self.assertIn(result.get('status'), (403, 404))
+
+    def test_own_scope_can_still_fetch_your_own_lead(self):
+        req = FakeRequest(TENANT_A, USER_A, permissions=_perms(view_scope='own'))
+        result = execute_tool(req, 'get_lead', {'lead_id': self.mine.id})
+        self.assertNotIn('error', result)
+        self.assertEqual(result['name'], 'Mine')
+
+    def test_own_edit_scope_cannot_modify_a_colleagues_lead(self):
+        perms = _perms(view_scope='own')
+        perms['crm']['leads']['edit'] = 'own'
+        req = FakeRequest(TENANT_A, USER_A, permissions=perms)
+        result = execute_tool(
+            req, 'update_lead', {'lead_id': self.theirs.id, 'name': 'Taken'},
+        )
+        self.assertIn('error', result)
+        self.theirs.refresh_from_db()
+        self.assertEqual(self.theirs.name, 'Theirs')
+
+    def test_team_scope_sees_assigned_leads_as_well_as_owned(self):
+        # `team` maps to (owner_user_id, assigned_to) for leads
+        # (common/permissions.py OWNERSHIP_FIELDS), so a lead owned by a
+        # colleague but assigned to me is in scope.
+        assigned = _lead(
+            TENANT_A, USER_A2, name='Assigned To Me', phone='919000000073',
+            assigned_to=USER_A,
+        )
+        req = FakeRequest(TENANT_A, USER_A, permissions=_perms(view_scope='team'))
+        result = execute_tool(req, 'list_leads', {})
+        names = _names(result)
+        self.assertIn('Mine', names)
+        self.assertIn('Assigned To Me', names)
+        self.assertNotIn('Theirs', names)
+        self.assertTrue(assigned.pk)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class ThreadLocalTests(TestCase):
+    def test_the_tenant_is_restored_even_when_the_view_fails(self):
+        # The happy path is covered elsewhere. If the `finally` were missing,
+        # a failing tool would leave the rest of the streaming turn running
+        # under the wrong tenant — the worst possible place to leak one.
+        from common.middleware import get_current_tenant_id, set_current_tenant_id
+
+        set_current_tenant_id('sentinel-value')
+        try:
+            result = execute_tool(
+                FakeRequest(TENANT_A, USER_A), 'get_lead', {'lead_id': 99999999},
+            )
+            self.assertIn('error', result)
+            self.assertEqual(get_current_tenant_id(), 'sentinel-value')
+        finally:
+            set_current_tenant_id(None)
+
+
+@override_settings(AI_TOOLS_ENABLED=True)
+class CompositeReadTests(TestCase):
+    """`get_lead_context` bypasses `_plan`, so it needs its own coverage."""
+
+    def test_it_returns_the_lead_and_its_sections(self):
+        lead = _lead(TENANT_A, USER_A, name='Context Lead', phone='919000000081')
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A), 'get_lead_context', {'lead_id': lead.id},
+        )
+        self.assertNotIn('error', result)
+        self.assertEqual(result['lead']['name'], 'Context Lead')
+
+    def test_it_refuses_another_tenants_lead(self):
+        other = _lead(TENANT_B, USER_B, name='Not Yours', phone='919000000082')
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A), 'get_lead_context', {'lead_id': other.id},
+        )
+        self.assertIn('error', result)
+
+    def test_forbidden_args_are_stripped_for_it_too(self):
+        # It routes around `_plan`, which is where the sanitizer used to live.
+        # The filter now runs in `execute_tool`, so this tool is covered too.
+        lead = _lead(TENANT_A, USER_A, name='Sanitized', phone='919000000083')
+        result = execute_tool(
+            FakeRequest(TENANT_A, USER_A),
+            'get_lead_context',
+            {'lead_id': lead.id, 'tenant_id': str(TENANT_B)},
+        )
+        self.assertNotIn('error', result)
+        self.assertEqual(result['lead']['name'], 'Sanitized')
