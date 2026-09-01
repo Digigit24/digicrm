@@ -611,12 +611,103 @@ def stream_agent(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase-2 multimodal stubs (OpenAI image + Whisper). Not wired in Phase 1.
+# Voice transcription (OpenAI Whisper) — for the crmflutter AI Copilot's voice
+# input. Deliberately OpenAI-specific, not routed through the multi-provider
+# text chain above: Whisper is a distinct API (audio/transcriptions, not
+# chat/completions) that only OpenAI itself serves at OPENAI_BASE_URL's
+# default, so there is no meaningful "fallback provider" the way text chat has
+# Kimi/Grok/Gemini. Reuses the same OPENAI_API_KEY / OPENAI_BASE_URL already
+# configured for the chat provider chain.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def transcribe_audio(*_args, **_kwargs):  # pragma: no cover - Phase 2
-    raise NotImplementedError("Audio transcription (Whisper) lands in Phase 2.")
+# OpenAI's own limit for the transcriptions endpoint.
+TRANSCRIBE_MAX_BYTES = 25 * 1024 * 1024
+# Extensions Whisper's transcriptions endpoint documents as supported.
+TRANSCRIBE_ALLOWED_EXTENSIONS = {
+    "flac", "m4a", "mp3", "mp4", "mpeg", "mpga", "oga", "ogg", "wav", "webm",
+}
+# Connect timeout (s), read timeout (s) — audio upload + transcription is
+# slower than a text turn but should not hang the request indefinitely.
+_TRANSCRIBE_TIMEOUT = (10, 60)
 
+
+class TranscriptionError(Exception):
+    """A client-safe transcription failure.
+
+    ``message`` is safe to return verbatim to the caller (never includes
+    OpenAI's raw response body, which could leak account/billing detail).
+    ``status_code`` is the HTTP status the view should respond with.
+    """
+
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+def transcribe_audio(file_obj, filename: str, content_type: Optional[str] = None) -> str:
+    """Upload an audio file to OpenAI's Whisper transcription endpoint.
+
+    ``file_obj`` is any file-like object opened for binary read (a Django
+    ``UploadedFile`` satisfies this). Returns the transcribed text. Raises
+    ``TranscriptionError`` — never a raw ``requests`` exception — on any
+    failure, so the view can always return a clean JSON error.
+    """
+    api_key = config("OPENAI_API_KEY", default="")
+    if not api_key:
+        raise TranscriptionError(
+            "Voice transcription is not configured on this server (OPENAI_API_KEY missing).",
+            status_code=503,
+        )
+
+    base_url = config("OPENAI_BASE_URL", default="https://api.openai.com/v1")
+    url = f"{base_url.rstrip('/')}/audio/transcriptions"
+    model = config("OPENAI_TRANSCRIBE_MODEL", default="whisper-1")
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    files = {"file": (filename, file_obj, content_type or "application/octet-stream")}
+    data = {"model": model}
+
+    try:
+        resp = requests.post(
+            url, headers=headers, files=files, data=data, timeout=_TRANSCRIBE_TIMEOUT
+        )
+    except requests.RequestException as exc:
+        logger.warning(
+            "Whisper transcription request failed; error_type=%s", exc.__class__.__name__
+        )
+        raise TranscriptionError(
+            "Could not reach the transcription service. Please try again.", status_code=502
+        ) from exc
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "Whisper transcription rejected; status=%s", resp.status_code
+        )
+        # OpenAI's error body sometimes contains request-identifying detail
+        # (org/project). Keep the client message generic; the status code is
+        # already logged for debugging.
+        status_code = 400 if resp.status_code in (400, 413, 422) else 502
+        raise TranscriptionError(
+            "The transcription service could not process this audio file.",
+            status_code=status_code,
+        )
+
+    try:
+        payload = resp.json()
+        text = payload["text"]
+    except (ValueError, KeyError, TypeError) as exc:
+        logger.warning("Whisper transcription returned an unexpected response shape")
+        raise TranscriptionError(
+            "The transcription service returned an unexpected response.", status_code=502
+        ) from exc
+
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase-2 multimodal stub (OpenAI image analysis). Not wired yet.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_image(*_args, **_kwargs):  # pragma: no cover - Phase 2
     raise NotImplementedError("Image analysis lands in Phase 2.")

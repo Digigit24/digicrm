@@ -21,9 +21,20 @@ from django.http import StreamingHttpResponse
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 
+from rest_framework import status
+from rest_framework.response import Response
+
 from common.authentication import JWTRequestAuthentication
 from . import tools as ai_tools
-from .providers import any_provider_configured, stream_agent, stream_chat
+from .providers import (
+    TRANSCRIBE_ALLOWED_EXTENSIONS,
+    TRANSCRIBE_MAX_BYTES,
+    TranscriptionError,
+    any_provider_configured,
+    stream_agent,
+    stream_chat,
+    transcribe_audio,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,3 +178,83 @@ class AIChatView(APIView):
         # NOTE: do NOT set a `Connection` header here — it is a hop-by-hop header
         # that the WSGI server manages itself (Django's dev server rejects it).
         return response
+
+
+class AIVoiceTranscribeView(APIView):
+    """POST multipart file upload -> {"text": "..."} (OpenAI Whisper).
+
+    For the crmflutter AI Copilot's voice-input affordance: the client
+    records audio locally, uploads it here, and gets back plain text to seed
+    the chat composer. Non-streaming (unlike AIChatView) — record-then-upload
+    doesn't benefit from SSE, and a single JSON response is what a mobile
+    client naturally wants for one file.
+
+    Same auth pattern as AIChatView. Never raises a bare 500 for a request
+    problem or an OpenAI-side failure — every failure path returns a JSON
+    {"error": "..."} with an appropriate status code (400 for a bad
+    upload/format the client can fix, 502 for a downstream failure, 503 if
+    the server has no OPENAI_API_KEY configured).
+    """
+
+    authentication_classes = [JWTRequestAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response(
+                {"error": 'No audio file provided. Send it under the "file" field.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if uploaded_file.size > TRANSCRIBE_MAX_BYTES:
+            return Response(
+                {
+                    "error": (
+                        f"Audio file too large "
+                        f"({uploaded_file.size / (1024 * 1024):.1f}MB); "
+                        f"the limit is {TRANSCRIBE_MAX_BYTES // (1024 * 1024)}MB."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ext = uploaded_file.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file.name else ""
+        if ext not in TRANSCRIBE_ALLOWED_EXTENSIONS:
+            return Response(
+                {
+                    "error": (
+                        f"Unsupported audio format '.{ext or '?'}'. Supported: "
+                        + ", ".join(sorted(TRANSCRIBE_ALLOWED_EXTENSIONS))
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user_id = getattr(request, "user_id", None)
+        tenant_id = getattr(request, "tenant_id", None)
+        logger.info(
+            "Voice transcription request: user=%s tenant=%s filename=%s size=%s",
+            user_id, tenant_id, uploaded_file.name, uploaded_file.size,
+        )
+
+        try:
+            text = transcribe_audio(
+                uploaded_file, uploaded_file.name, uploaded_file.content_type
+            )
+        except TranscriptionError as exc:
+            logger.warning(
+                "Voice transcription failed; user=%s status=%s", user_id, exc.status_code
+            )
+            return Response({"error": exc.message}, status=exc.status_code)
+        except Exception as exc:  # noqa: BLE001 — app-wide "never bare 500" convention
+            logger.error(
+                "Voice transcription raised unexpectedly; error_type=%s",
+                exc.__class__.__name__,
+            )
+            return Response(
+                {"error": "Voice transcription failed. Please try again."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response({"text": text})
