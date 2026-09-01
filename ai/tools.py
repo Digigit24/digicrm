@@ -287,6 +287,34 @@ class RequestScopedClient:
         if auth:
             inner.META["HTTP_AUTHORIZATION"] = auth
 
+        # THE HOST. RequestFactory stamps SERVER_NAME='testserver', so an
+        # untouched synthetic request claims to be a host that is not in
+        # ALLOWED_HOSTS. Nothing notices until something calls `get_host()` --
+        # and the thing that calls it is DRF pagination building an absolute
+        # `next`/`previous` URL. So a single-page result works fine and the
+        # first paginated one raises DisallowedHost, which surfaces to the user
+        # as "Internal error: Invalid HTTP_HOST header: 'testserver'".
+        #
+        # That is exactly how this shipped broken: the local verification asked
+        # for pipeline stages (10 rows, one page, no next URL built) while
+        # production asked for leads (hundreds, paginated). Copying the outer
+        # request's host removes the whole class -- the inner request now
+        # claims to be precisely what the real one was.
+        for key in (
+            "HTTP_HOST",
+            "SERVER_NAME",
+            "SERVER_PORT",
+            "HTTP_X_FORWARDED_HOST",
+            "HTTP_X_FORWARDED_PORT",
+            "HTTP_X_FORWARDED_PROTO",
+            # Keeps absolute URIs on https behind a TLS-terminating proxy
+            # rather than silently downgrading them to http.
+            "wsgi.url_scheme",
+        ):
+            value = self._outer.META.get(key)
+            if value is not None:
+                inner.META[key] = value
+
         return inner
 
     def call(

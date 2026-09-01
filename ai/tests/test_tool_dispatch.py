@@ -57,7 +57,15 @@ class FakeRequest:
         self.permissions = permissions if permissions is not None else _perms('all')
         self.enabled_modules = list(modules)
         self.roles = []
-        self.META = {}
+        # A real outer request always carries these. The dispatcher copies
+        # them onto the synthetic request; without that it inherits
+        # RequestFactory's 'testserver' and trips ALLOWED_HOSTS.
+        self.META = {
+            'HTTP_HOST': 'crm.celiyo.com',
+            'SERVER_NAME': 'crm.celiyo.com',
+            'SERVER_PORT': '443',
+            'wsgi.url_scheme': 'https',
+        }
 
 
 def _perms(view_scope='all', create=True, edit=True, delete=True):
@@ -535,3 +543,60 @@ class CompositeReadTests(TestCase):
         )
         self.assertNotIn('error', result)
         self.assertEqual(result['lead']['name'], 'Sanitized')
+
+
+# ALLOWED_HOSTS deliberately WITHOUT 'testserver'. Django's test runner appends
+# it in `setup_test_environment()`, which is precisely why the original bug was
+# invisible to the suite: every synthetic request claiming to be 'testserver'
+# was waved through in tests and rejected in production.
+@override_settings(AI_TOOLS_ENABLED=True, ALLOWED_HOSTS=['crm.celiyo.com'])
+class HostHeaderTests(TestCase):
+    """
+    Regression guard for the live break this caused.
+
+    `RequestFactory` stamps SERVER_NAME='testserver'. Nothing notices until
+    something calls `request.get_host()`, and the thing that calls it is DRF
+    pagination building an absolute `next` URL. So a short result set passes
+    and the first paginated one raises DisallowedHost, reaching the user as
+    "Internal error: Invalid HTTP_HOST header: 'testserver'".
+
+    My own end-to-end check missed it for exactly that reason: I asked for
+    pipeline stages (10 rows, one page, no next URL) while production asked for
+    leads (hundreds, paginated). These tests pin both halves.
+    """
+
+    def setUp(self):
+        # Enough to force a second page out of the default page size.
+        for i in range(30):
+            _lead(TENANT_A, USER_A, name=f'Lead {i:02d}', phone=f'9190000{i:05d}')
+
+    def test_a_paginated_read_does_not_trip_allowed_hosts(self):
+        # THE regression test. Without the host copy this raises
+        # DisallowedHost and execute_tool returns a 500 error dict.
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+        self.assertNotIn('error', result)
+        self.assertIsInstance(result, dict)
+        self.assertGreater(result.get('count', 0), 0)
+
+    def test_the_next_url_uses_the_real_host_not_testserver(self):
+        # Stronger than "it did not crash": the URL handed back to the model
+        # has to be a real one. A `next` pointing at testserver would be a
+        # broken link even where ALLOWED_HOSTS happened to permit it.
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+        next_url = result.get('next')
+        self.assertIsNotNone(next_url, 'expected more than one page of leads')
+        self.assertNotIn('testserver', next_url)
+        self.assertIn('crm.celiyo.com', next_url)
+
+    def test_absolute_urls_stay_on_https(self):
+        # The outer request is https; a synthetic request that forgot
+        # wsgi.url_scheme would silently downgrade every absolute URL to http.
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_leads', {})
+        self.assertTrue(str(result.get('next')).startswith('https://'))
+
+    def test_a_single_page_read_also_works(self):
+        # The case that passed even while the bug was live -- kept so the
+        # pair documents why the original verification was insufficient.
+        _status(TENANT_A, name='Only Stage', order=0)
+        result = execute_tool(FakeRequest(TENANT_A, USER_A), 'list_lead_statuses', {})
+        self.assertNotIn('error', result)
