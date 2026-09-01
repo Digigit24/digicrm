@@ -25,7 +25,9 @@ from rest_framework import status
 from rest_framework.response import Response
 
 from common.authentication import JWTRequestAuthentication
+from common.pagination import StandardPagination
 from . import tools as ai_tools
+from .models import AIChatMessage, AIChatSession
 from .providers import (
     TRANSCRIBE_ALLOWED_EXTENSIONS,
     TRANSCRIBE_MAX_BYTES,
@@ -34,6 +36,14 @@ from .providers import (
     stream_agent,
     stream_chat,
     transcribe_audio,
+)
+from .serializers import (
+    AIChatMessageBatchCreateSerializer,
+    AIChatMessageSerializer,
+    AIChatSessionCreateSerializer,
+    AIChatSessionDetailSerializer,
+    AIChatSessionListSerializer,
+    AIChatSessionUpdateSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -284,27 +294,30 @@ class AIChatSessionListView(APIView):
             user_id=user_id,
         )
 
-        # Pagination (DRF default page size)
-        page = self.paginate_queryset(qs)
+        # Manual pagination: `paginate_queryset`/`get_paginated_response` are
+        # `GenericAPIView` methods (via its pagination mixin) — this is a
+        # plain `APIView`, which doesn't have them at all. Instantiating the
+        # paginator directly is the fix, not switching base classes (every
+        # other view in this file is a plain APIView too; changing just this
+        # one's inheritance would be its own inconsistency).
+        paginator = StandardPagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
         if page is not None:
             serializer = AIChatSessionListSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
+            return paginator.get_paginated_response(serializer.data)
 
         serializer = AIChatSessionListSerializer(qs, many=True)
         return Response(serializer.data)
 
-
-class AIChatSessionCreateView(APIView):
-    """
-    POST /api/ai/sessions/ — create a new empty chat session.
-
-    Body: {title?} — optional, auto-generated from first user message if omitted.
-    Returns: {id, title, created_at, updated_at}
-    """
-    authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
-
     def post(self, request):
+        # Was its own `AIChatSessionCreateView`, `POST`-only, registered on
+        # this exact same `sessions/` path in urls.py. Django/DRF route by
+        # first URL match, not by HTTP method, so that class never received
+        # a single request — every POST landed here instead and 405'd,
+        # since this class only defined `get()`. Found by actually calling
+        # the endpoint, not from reading the code. Merged in rather than
+        # re-registered as its own path, matching the one-view-per-URL shape
+        # `AIChatSessionDetailView` below now also has.
         tenant_id = getattr(request, 'tenant_id', None)
         user_id = getattr(request, 'user_id', None)
         if not tenant_id or not user_id:
@@ -329,17 +342,28 @@ class AIChatSessionCreateView(APIView):
 class AIChatSessionDetailView(APIView):
     """
     GET /api/ai/sessions/{id}/ — get a session with all messages (for resume).
+    PATCH /api/ai/sessions/{id}/ — rename a session. Body: {title}.
+    DELETE /api/ai/sessions/{id}/ — delete a session (cascades to messages).
 
-    Returns: {id, title, created_at, updated_at, messages: [{id, role, content, sequence, created_at}]}
+    Returns (GET): {id, title, created_at, updated_at, messages: [{id, role, content, sequence, created_at}]}
+
+    One view class for all three verbs on this path — was three
+    (`AIChatSessionDetailView`/`Update`/`Delete`), each registered on the
+    exact same `sessions/<id>/` URL. Same first-match-wins bug as the list
+    endpoint above: PATCH/DELETE both 405'd against the GET-only class that
+    actually owned the route, and the other two classes were unreachable
+    dead code.
     """
     authentication_classes = [JWTRequestAuthentication]
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, id):
+    def _get_session(self, request, id):
+        """Shared tenant/user-scoped lookup for all three verbs below.
+        Returns `(session, None)` or `(None, error_response)`."""
         tenant_id = getattr(request, 'tenant_id', None)
         user_id = getattr(request, 'user_id', None)
         if not tenant_id or not user_id:
-            return Response(
+            return None, Response(
                 {'error': 'Tenant or user scope missing'},
                 status=status.HTTP_403_FORBIDDEN,
             )
@@ -351,83 +375,33 @@ class AIChatSessionDetailView(APIView):
                 user_id=user_id,
             )
         except AIChatSession.DoesNotExist:
-            return Response(
+            return None, Response(
                 {'error': 'Session not found'},
                 status=status.HTTP_404_NOT_FOUND,
             )
+        return session, None
 
+    def get(self, request, id):
+        session, error = self._get_session(request, id)
+        if error:
+            return error
         serializer = AIChatSessionDetailSerializer(session)
         return Response(serializer.data)
 
-
-class AIChatSessionUpdateView(APIView):
-    """
-    PATCH /api/ai/sessions/{id}/ — rename a session.
-
-    Body: {title} — required, non-empty.
-    """
-    authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
-
     def patch(self, request, id):
-        tenant_id = getattr(request, 'tenant_id', None)
-        user_id = getattr(request, 'user_id', None)
-        if not tenant_id or not user_id:
-            return Response(
-                {'error': 'Tenant or user scope missing'},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        try:
-            session = AIChatSession.objects.get(
-                id=id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-            )
-        except AIChatSession.DoesNotExist:
-            return Response(
-                {'error': 'Session not found'},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
+        session, error = self._get_session(request, id)
+        if error:
+            return error
         serializer = AIChatSessionUpdateSerializer(session, data=request.data or {}, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
-
         out = AIChatSessionListSerializer(session)
         return Response(out.data)
 
-
-class AIChatSessionDeleteView(APIView):
-    """
-    DELETE /api/ai/sessions/{id}/ — delete a session (cascades to messages).
-
-    Returns 204 on success.
-    """
-    authentication_classes = [JWTRequestAuthentication]
-    permission_classes = [IsAuthenticated]
-
     def delete(self, request, id):
-        tenant_id = getattr(request, 'tenant_id', None)
-        user_id = getattr(request, 'user_id', None)
-        if not tenant_id or not user_id:
-            return Response(
-                {'error': 'Tenant or user scope missing'},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        try:
-            session = AIChatSession.objects.get(
-                id=id,
-                tenant_id=tenant_id,
-                user_id=user_id,
-            )
-        except AIChatSession.DoesNotExist:
-            return Response(
-                {'error': 'Session not found'},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
+        session, error = self._get_session(request, id)
+        if error:
+            return error
         session.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
